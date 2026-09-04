@@ -39,6 +39,11 @@ const HUE_DEG_PER_SEC: f64 = 10.0;
 /// end-of-track detection until it has had a chance to fill.
 const END_OF_TRACK_GRACE: Duration = Duration::from_millis(750);
 
+/// The status line is refreshed on a timer rather than every tick: it is only
+/// read by a human, and rebuilding it 60 times a second repaints the overlay
+/// for nothing.
+const STATUS_INTERVAL: Duration = Duration::from_millis(200);
+
 struct State {
     map: Rc<RefCell<MapLibre>>,
     audio: AudioPlayer,
@@ -56,6 +61,7 @@ struct State {
     frames: u32,
     fps_window: Instant,
     fps: f32,
+    status_shown: Instant,
 }
 
 impl State {
@@ -96,6 +102,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         frames: 0,
         fps_window: now,
         fps: 0.0,
+        status_shown: now,
     }));
 
     map::init(&ui, &map);
@@ -164,12 +171,13 @@ thread_local! {
     static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
 }
 
-fn with_state(f: impl FnOnce(&mut State)) {
+/// Runs `f` against the application state, returning whatever it produced, or
+/// `None` if the state is gone (only during shutdown).
+fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
     STATE.with(|slot| {
-        if let Some(state) = slot.borrow().as_ref() {
-            f(&mut state.borrow_mut());
-        }
-    });
+        let state = slot.borrow().clone()?;
+        Some(f(&mut state.borrow_mut()))
+    })
 }
 
 fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
@@ -260,6 +268,7 @@ fn select_release(ui: &AppWindow, index: usize) {
                     with_state(|state| {
                         state.audio.stop();
                         state.playing = false;
+                        state.busy = false;
                         state.generation += 1;
                         state.release = Some(release);
                         state.track_index = 0;
@@ -270,7 +279,7 @@ fn select_release(ui: &AppWindow, index: usize) {
                 }
                 Err(error) => {
                     eprintln!("fetching release {id} failed: {error}");
-                    ui.set_track_title(format!("Could not load release {id}.").into());
+                    ui.set_track_title(format!("Could not load release {id}: {error}").into());
                 }
             }
         });
@@ -304,28 +313,37 @@ fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     std::thread::spawn(move || {
         let result = otherman::download(&url);
         let _ = ui_handle.upgrade_in_event_loop(move |ui| {
-            with_state(|state| {
+            let outcome = with_state(|state| {
                 if state.generation != generation {
-                    // Superseded by a newer request while downloading.
-                    return;
+                    // Superseded while downloading: the newer request owns the
+                    // busy flag and the UI, so leave both alone.
+                    return None;
                 }
                 state.busy = false;
-                match result {
+                state.playing = false;
+                let failure = match result {
                     Ok(bytes) => match state.audio.play(bytes) {
                         Ok(()) => {
                             state.playing = true;
                             state.track_started = Instant::now();
+                            None
                         }
-                        Err(error) => eprintln!("decoding {url} failed: {error}"),
+                        Err(error) => Some(format!("Could not play this track: {error}")),
                     },
-                    Err(error) => eprintln!("downloading {url} failed: {error}"),
-                }
+                    Err(error) => Some(format!("Could not download this track: {error}")),
+                };
+                Some((state.playing, failure))
             });
-            let playing = STATE
-                .with(|slot| slot.borrow().clone())
-                .is_some_and(|state| state.borrow().playing);
+
+            let Some(Some((playing, failure))) = outcome else {
+                return;
+            };
             ui.set_busy(false);
             ui.set_playing(playing);
+            if let Some(failure) = failure {
+                eprintln!("{failure} ({url})");
+                ui.set_track_title(failure.into());
+            }
         });
     });
 }
@@ -394,21 +412,24 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             state.frames = 0;
             state.fps_window = Instant::now();
         }
-        let camera = map.borrow().camera();
-        // The still renderer only redraws on change, so frames per second is
-        // only meaningful while the animation is running.
-        let rate = if state.playing {
-            format!(" · {:.0} fps", state.fps)
-        } else {
-            String::new()
-        };
-        ui.set_status(
-            format!(
-                "{:.4}, {:.4} · z{:.1}{rate} · drag to pan, scroll to zoom",
-                camera.lat, camera.lon, camera.zoom
-            )
-            .into(),
-        );
+        if state.status_shown.elapsed() >= STATUS_INTERVAL {
+            state.status_shown = Instant::now();
+            let camera = map.borrow().camera();
+            // The still renderer only redraws on change, so frames per second
+            // is only meaningful while the animation is running.
+            let rate = if state.playing {
+                format!(" · {:.0} fps", state.fps)
+            } else {
+                String::new()
+            };
+            ui.set_status(
+                format!(
+                    "{:.4}, {:.4} · z{:.1}{rate} · drag to pan, scroll to zoom",
+                    camera.lat, camera.lon, camera.zoom
+                )
+                .into(),
+            );
+        }
 
         // Auto-advance at the end of a track, like the web demo's `ended` event.
         let ended = state.playing
