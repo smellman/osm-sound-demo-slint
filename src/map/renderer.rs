@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
@@ -65,9 +65,14 @@ const HUE_EPSILON: f64 = 4.0;
 /// the map's own speed.
 ///
 /// The interval has to clear the frame time to do anything: at 8 fps a pass
-/// arrives every 125 ms, so anything under that lets every pass rewrite.
-/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overrides it, `0` rewriting on every pass.
-const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(250);
+/// arrives every 125 ms, so anything under that lets every pass rewrite. At
+/// 1920x1200 the band load cost 7.0 fps on every pass, 9.8 at this interval,
+/// and 11.4 at 400 ms — but 400 ms leaves the skyline stepping 2.5 times a
+/// second, which for something following music reads as broken. This is the
+/// point where most of the frame rate is back and the animation still moves.
+///
+/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overrides it, `0` rewriting every pass.
+const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(150);
 
 /// How long the map keeps rendering after the last change. Tiles arrive
 /// asynchronously, so stopping at the first frame after a move would leave
@@ -942,7 +947,33 @@ fn cache_path() -> PathBuf {
 }
 
 fn safe_size(size: Size) -> (u32, u32) {
-    ((size.width as u32).max(1), (size.height as u32).max(1))
+    let scale = render_scale();
+    (
+        ((size.width as f64 * scale) as u32).max(1),
+        ((size.height as f64 * scale) as u32).max(1),
+    )
+}
+
+/// What fraction of the map's on-screen size to render at, before Slint scales
+/// the frame back up to fill it.
+///
+/// Everything the map costs scales with the pixels it covers, and on a large
+/// display that dominates. At 1920x1200 the map ran at 9.8 fps under the band
+/// animation; at 0.67 (1280x800) the same work ran at 20.4, and the tile layout
+/// a rewrite triggers got cheaper too, since it follows the viewport. The frame
+/// is upscaled, so the map goes soft — which is why this is off by default and
+/// left to whoever knows what their display and GPU are worth.
+///
+/// `OSM_SOUND_DEMO_RENDER_SCALE`, clamped to something sane.
+fn render_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("OSM_SOUND_DEMO_RENDER_SCALE")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.25, 1.0)
+    })
 }
 
 fn resource_options(cache: &Path) -> ResourceOptions {

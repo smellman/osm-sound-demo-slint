@@ -49,6 +49,8 @@ CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
 | `OSM_SOUND_DEMO_RUN_LOOP_TICKS` | Run-loop turns per render pass (default 1). Raising it measures worse — see the comment on `RUN_LOOP_TICKS_PER_FRAME` |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
+| `OSM_SOUND_DEMO_RENDER_SCALE` | Render the map at this fraction of its on-screen size and let Slint scale it up (default 1.0, floor 0.25). The single biggest thing you can trade for frame rate — see [Frame rate](#frame-rate) |
+| `OSM_SOUND_DEMO_BAND_INTERVAL_MS` | Shortest gap between rewrites of the band layers (default 150). `0` rewrites on every pass, which is what the map used to do |
 
 ## Controls
 
@@ -167,7 +169,52 @@ reads a GL context that is no longer current.
 
 The map runs in MapLibre Native's **continuous** mode, not still (`renderStill`) mode.
 That matters a lot here: still mode re-lays out the building tiles on every change to the
-layer set, and this demo changes sixteen layers per frame.
+layer set, and this demo changes sixteen layers at a time.
+
+### Frame rate
+
+Two things cost this demo its frame rate, and both are measurable with
+`report_playing_frame_rate` (see the environment table above for how to run it). Numbers
+are Vulkan, release, on an AMD RENOIR integrated GPU.
+
+**The pixels.** Everything the map does scales with the area it covers, tile layout
+included, and on a large display that dominates:
+
+| Render size | camera only | camera + 16 bands |
+| --- | --- | --- |
+| 1920x1200 | 14.0 fps | 8.2 fps |
+| 1440x900 | 19.4 fps | 11.3 fps |
+| 1280x800 | 23.9 fps | 14.8 fps |
+| 960x600 | 33.6 fps | 28.2 fps |
+
+`OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate here at the cost of a soft, upscaled map.
+It is 1.0 by default: a Mac on Metal does not need it, and nobody should have the map go
+blurry without asking.
+
+**The band layers.** Rewriting one makes MapLibre Native re-run tile layout for the
+building source. What matters is how often a pass touches the layer set at all, not how
+many layers it touches — rewriting a single band per pass and rewriting all sixteen
+measured the same, 8.3 fps against 8.1, because either way the whole source is laid out
+again. So the bands move together, no more often than `OSM_SOUND_DEMO_BAND_INTERVAL_MS`;
+passes in between render at the map's own speed. At 1920x1200:
+
+| Interval | camera + 16 bands | Skyline updates |
+| --- | --- | --- |
+| 0 (every pass) | 7.0 fps | every pass |
+| 150 ms (default) | 9.8 fps | 6.7 / sec |
+| 250 ms | 10.4 fps | 4 / sec |
+| 400 ms | 11.4 fps | 2.5 / sec |
+
+Past 150 ms the frame rate stops improving much and the skyline starts to step visibly,
+which for something that follows music reads as broken.
+
+Together, at 1280x800 with the default interval, the same load runs at **20.4 fps against
+the 7.0 fps it started at**.
+
+Things that turned out not to be the problem, in case they look tempting: turning
+MapLibre Native's run loop more times per pass (worse — 21 fps at one turn, 6 at eight,
+3 at thirty-two), and dropping frames at the render-thread channel (never happened;
+`OSM_SOUND_DEMO_FPS` shows `shown` and `rendered` matching).
 
 ### Differences from the web demo
 
