@@ -41,6 +41,14 @@ const MAX_BUILDING_HEIGHT: f64 = 200.0;
 const HEIGHT_EPSILON: f64 = 2.0;
 const HUE_EPSILON: f64 = 4.0;
 
+/// Any change to the layer set makes MapLibre Native re-lay out the building
+/// tiles, and that costs the same whether one band moves or all sixteen do
+/// (measured at roughly 40 ms against a 6 ms plain render, see
+/// `report_frame_costs`). So bands are always swapped in one batch, and a batch
+/// is held back until the bands have accumulated this much movement — in metres
+/// summed over all of them — to be worth a re-layout.
+const SWAP_DRIFT_THRESHOLD: f64 = 24.0;
+
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
 const MIN_PITCH: f64 = 0.0;
@@ -415,8 +423,8 @@ impl Engine {
         }
     }
 
-    /// Renders one frame, first syncing any band whose target moved far enough
-    /// to be worth rebuilding its layer.
+    /// Renders one frame, first syncing the bands whose targets moved far
+    /// enough to be worth rebuilding their layers.
     fn render(&mut self) -> Option<Frame> {
         self.ensure_renderer()?;
         self.sync_bands();
@@ -460,12 +468,33 @@ impl Engine {
         Some(())
     }
 
+    /// Rebuilds every band whose layer has fallen behind, but only once their
+    /// combined movement is worth the re-layout it triggers.
     fn sync_bands(&mut self) {
+        let mut stale = Vec::new();
+        let mut total_drift = 0.0;
         for band in 0..BINS {
             let target = self.bands[band];
-            if self.applied[band].is_some_and(|applied| applied.close_to(target)) {
-                continue;
+            match self.applied[band] {
+                Some(applied) if applied.close_to(target) => {}
+                Some(applied) => {
+                    total_drift += drift(applied, target);
+                    stale.push(band);
+                }
+                // A band with no layer yet has to be created regardless.
+                None => {
+                    total_drift = f64::INFINITY;
+                    stale.push(band);
+                }
             }
+        }
+        if stale.is_empty() || total_drift < SWAP_DRIFT_THRESHOLD {
+            // Skipping is safe: the UI posts fresh bands every tick, so the
+            // next command marks the map dirty again.
+            return;
+        }
+        for band in stale {
+            let target = self.bands[band];
             if self.set_building_layer(band, target) {
                 self.applied[band] = Some(target);
             }
@@ -526,6 +555,13 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
             let _ = frames.try_send(frame);
         }
     }
+}
+
+/// How far a band's applied layer has drifted from its target, in metres, with
+/// hue folded in so a colour-only change still eventually gets rebuilt.
+fn drift(applied: Band, target: Band) -> f64 {
+    let hue_delta = (applied.hue - target.hue).abs();
+    (applied.height - target.height).abs() + hue_delta.min(360.0 - hue_delta)
 }
 
 fn building_layer_id(band: usize) -> String {
@@ -742,5 +778,112 @@ mod tests {
             ..base
         }));
         assert!(!base.close_to(Band { hue: 40.0, ..base }));
+    }
+
+    /// Opt-in: drives the real renderer to confirm that swapping a band's
+    /// extrusion layer actually changes the rendered image. Needs the network
+    /// for tiles, and a graphics device.
+    #[test]
+    fn band_heights_change_the_rendered_image() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_RENDERER_TESTS=1 to run");
+            return;
+        }
+
+        let mut engine = Engine::new((480, 360));
+        let started = std::time::Instant::now();
+        let flat = engine.render().expect("the flat frame renders");
+        eprintln!("first frame took {:?}", started.elapsed());
+
+        engine.apply(Command::Bands(
+            [Band {
+                height: 220.0,
+                hue: 200.0,
+                level: 1.0,
+            }; BINS],
+        ));
+        let started = std::time::Instant::now();
+        let tall = engine.render().expect("the extruded frame renders");
+        eprintln!("second frame took {:?}", started.elapsed());
+
+        assert_eq!((flat.width, flat.height), (tall.width, tall.height));
+        let changed = flat
+            .rgba
+            .iter()
+            .zip(tall.rgba.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        let ratio = changed as f64 / flat.rgba.len() as f64;
+        eprintln!("{:.1}% of the subpixels changed", ratio * 100.0);
+        assert!(
+            ratio > 0.05,
+            "raising every band barely changed the image ({ratio})"
+        );
+    }
+
+    /// Opt-in timing probe: isolates the cost of a still render from the cost
+    /// of swapping extrusion layers, and of how many are swapped at once.
+    #[test]
+    fn report_frame_costs() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        let mut engine = Engine::new((960, 640));
+        // Warm up so every band has a layer and the tiles are cached.
+        for _ in 0..3 {
+            engine.render().expect("warm-up frame");
+        }
+
+        let time = |engine: &mut Engine| {
+            let started = std::time::Instant::now();
+            engine.render().expect("frame");
+            started.elapsed()
+        };
+
+        let mut camera_only = std::time::Duration::ZERO;
+        let mut one_band = std::time::Duration::ZERO;
+        let mut all_bands = std::time::Duration::ZERO;
+        const ROUNDS: u32 = 5;
+        for step in 1..=ROUNDS {
+            let nudge = f64::from(step);
+            engine.apply(Command::Camera(MapCamera {
+                bearing: nudge * 2.0,
+                ..MapCamera::default()
+            }));
+            camera_only += time(&mut engine);
+
+            let mut bands = engine.bands;
+            bands[0].height += 40.0;
+            engine.apply(Command::Bands(bands));
+            one_band += time(&mut engine);
+
+            let bands = [Band {
+                height: 20.0 * nudge,
+                hue: 30.0 * nudge,
+                level: 0.5,
+            }; BINS];
+            engine.apply(Command::Bands(bands));
+            all_bands += time(&mut engine);
+        }
+        eprintln!(
+            "960x640 per frame — camera only: {:?}, 1 band swapped: {:?}, {} bands swapped: {:?}",
+            camera_only / ROUNDS,
+            one_band / ROUNDS,
+            BINS,
+            all_bands / ROUNDS,
+        );
+    }
+
+    #[test]
+    fn drift_folds_in_hue_and_wraps_around_the_colour_wheel() {
+        let base = Band {
+            height: 100.0,
+            hue: 10.0,
+            level: 0.5,
+        };
+        assert_eq!(drift(base, base), 0.0);
+        assert_eq!(drift(base, Band { height: 130.0, ..base }), 30.0);
+        // 350° is 20° away from 10°, not 340°.
+        assert_eq!(drift(base, Band { hue: 350.0, ..base }), 20.0);
     }
 }

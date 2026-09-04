@@ -386,19 +386,28 @@ mod tests {
         let decoder = Decoder::try_from(Cursor::new(encoded)).expect("decoding the track");
         let spectrum = Arc::new(Spectrum::new());
         let mut tap = Tap::new(decoder, Arc::clone(&spectrum));
-        // Skip the lead-in silence, then fill the analysis window.
-        for _ in 0..(TEST_RATE as usize * 2) {
-            assert!(tap.next().is_some(), "the track ended early");
+        let mut analyzer = Analyzer::new(Arc::clone(&spectrum));
+
+        // The track has near-silent gaps, so sample the analyser repeatedly and
+        // take the loudest reading over the first few seconds.
+        let mut loudest = [0.0f32; BINS];
+        for chunk in 0..200 {
+            for _ in 0..WINDOW {
+                assert!(tap.next().is_some(), "the track ended after {chunk} chunks");
+            }
+            let levels = analyzer.poll();
+            for (peak, level) in loudest.iter_mut().zip(levels.iter()) {
+                *peak = peak.max(*level);
+            }
         }
 
-        let mut analyzer = Analyzer::new(spectrum);
-        let mut levels = [0.0; BINS];
-        for _ in 0..64 {
-            levels = analyzer.poll();
-        }
         assert!(
-            levels.iter().any(|level| *level > 0.2),
-            "no audible band: {levels:?}"
+            loudest.iter().any(|level| *level > 0.4),
+            "no audible band: {loudest:?}"
+        );
+        assert!(
+            loudest[0] > 0.0 && loudest[BINS - 1] > 0.0,
+            "bands at the edges never moved: {loudest:?}"
         );
     }
 }
