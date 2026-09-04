@@ -20,9 +20,9 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use maplibre_native::tile_server_options::TileServerOptions;
@@ -1350,7 +1350,7 @@ mod tests {
             let mut last = None;
             for _ in 0..TEST_SETTLE_FRAMES {
                 engine.mark_dirty();
-                    last = engine.render();
+                last = engine.render();
             }
             last.expect("a frame renders")
         };

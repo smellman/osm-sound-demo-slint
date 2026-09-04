@@ -173,6 +173,11 @@ impl State {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
+    // Full screen by default; `OSM_SOUND_DEMO_WINDOWED` is for running it
+    // alongside other work.
+    if std::env::var_os("OSM_SOUND_DEMO_WINDOWED").is_some() {
+        ui.set_windowed(true);
+    }
     let map = map::create_map(ui.get_map_size());
     let (audio, analyzer) = AudioPlayer::new().map_err(|e| format!("audio device: {e}"))?;
 
@@ -474,8 +479,11 @@ fn refresh_title(ui: &AppWindow) {
     ui.set_track_title(title.into());
 }
 
-/// Starts (or restarts) the current track: the encoded audio is fetched on a
-/// worker thread and handed back to the UI thread, which owns the player.
+/// Starts (or restarts) the current track.
+///
+/// A worker thread opens the stream and waits only for the first few
+/// kilobytes, then hands the reader to the UI thread, which owns the player.
+/// The rest of the track keeps arriving while it plays.
 fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     let (url, generation) = {
         let mut state = state.borrow_mut();
@@ -491,7 +499,7 @@ fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     ui.set_busy(true);
     let ui_handle = ui.as_weak();
     std::thread::spawn(move || {
-        let result = otherman::download(&url);
+        let result = otherman::stream(&url);
         let _ = ui_handle.upgrade_in_event_loop(move |ui| {
             let outcome = with_state(|state| {
                 if state.generation != generation {
@@ -502,7 +510,7 @@ fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 state.busy = false;
                 state.playing = false;
                 let failure = match result {
-                    Ok(bytes) => match state.audio.play(bytes) {
+                    Ok(reader) => match state.audio.play(reader) {
                         Ok(()) => {
                             state.playing = true;
                             state.track_started = Instant::now();
@@ -510,7 +518,7 @@ fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                         }
                         Err(error) => Some(format!("Could not play this track: {error}")),
                     },
-                    Err(error) => Some(format!("Could not download this track: {error}")),
+                    Err(error) => Some(format!("Could not stream this track: {error}")),
                 };
                 Some((state.playing, failure))
             });

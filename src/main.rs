@@ -7,6 +7,7 @@ mod audio;
 mod gamepad;
 mod map;
 mod otherman;
+mod stream;
 
 slint::include_modules!();
 

@@ -44,6 +44,7 @@ CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
 | --- | --- |
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
+| `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). `0` restores the old behaviour — see [Why the skyline pauses](#why-the-skyline-pauses-after-a-fly-to) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RUN_LOOP_TICKS` | Run-loop turns per render pass (default 1). Raising it measures worse — see the comment on `RUN_LOOP_TICKS_PER_FRAME` |
@@ -104,8 +105,8 @@ the animation. Reaching for the volume does not.
 
 ```
 Otherman Records API ──► release list & tracklist          (ureq, background threads)
-MP3 from archive.org ──► rodio Decoder ──► device
-                                └──► Tap ──► ring buffer ──► FFT ──► 16 band levels
+MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► device
+                         (still arriving)          └──► Tap ──► FFT ──► 16 band levels
                                                                         │
                             camera bearing + band heights/hues ◄────────┘
                                               │
@@ -121,6 +122,10 @@ MP3 from archive.org ──► rodio Decoder ──► device
   and colour.
 - `src/otherman.rs` — the release API client. The native build talks to
   otherman-records.com and archive.org directly; the web demo needed a CORS proxy.
+- `src/stream.rs` — tracks are streamed, not downloaded first. rodio's decoder needs
+  `Read + Seek`, so `StreamingRead` keeps what has arrived in memory and blocks a read
+  that runs past the write head. Playback opens on a 256 KB prebuffer: measured against a
+  6.8 MB track, that is 2.5 s to first sound instead of waiting for the lot.
 - `src/gamepad.rs` — controller input. [gilrs](https://gitlab.com/gilrs-project/gilrs)
   carries the SDL_GameControllerDB mappings, so `Button::Start` really is Start on
   whatever pad is plugged in. Reading raw HID instead would give button *indices* that
@@ -254,6 +259,22 @@ of the drop: a sweep rather than an impact.
 Both are transient offsets (`CameraBoost`) kept separate from the camera the user controls,
 so an effect can never strand the map somewhere once it decays. Both fire whether or not a
 track is playing, and they simply add if you hit them together.
+
+### Streaming, not downloading
+
+The decoder is pulled from the audio device's callback thread, which is why `StreamingRead`
+does two things that a plain buffer would not:
+
+- It reports the stream as **not seekable**, even though it can seek. With `is_seekable`
+  set, symphonia seeks to the end to measure the stream — on a partially arrived download
+  that means blocking until the whole track is in, exactly what streaming avoids. The
+  `Content-Length` is still passed through, so duration is known without a seek.
+- A read waits at most ten seconds. Blocking the audio callback is what a dropout sounds
+  like, so a stalled download ends the track — and the app moves to the next — rather than
+  wedging playback. The buffer normally runs far ahead of the playhead, since the body is
+  fetched as fast as the network allows rather than in real time.
+
+Dropping the reader stops the download, so skipping tracks does not leave fetches running.
 
 ### Why the skyline pauses after a fly-to
 

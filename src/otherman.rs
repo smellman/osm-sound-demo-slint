@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::stream::{self, StreamingRead};
+
 const BASE_URL: &str = "https://www.otherman-records.com/index.php/api/releases";
 pub const RELEASE_LINK_BASE: &str = "https://www.otherman-records.com/releases/";
 
@@ -18,10 +20,16 @@ const PAGE_SIZE: usize = 12;
 /// leaves the UI showing "Loading…" indefinitely.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
-const TRACK_TIMEOUT: Duration = Duration::from_secs(120);
-/// Track downloads are held in memory before decoding; archive.org MP3s are a
-/// few MB, so this is a generous ceiling rather than an expected size.
-const MAX_TRACK_BYTES: u64 = 96 * 1024 * 1024;
+/// Covers a whole track fetch. The body is streamed, but it is still pulled as
+/// fast as the network allows rather than in real time, so a few megabytes
+/// should be well inside this.
+const TRACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How much of a track to buffer before handing it to the player.
+///
+/// Roughly six seconds of a 320 kbps MP3, which is the cushion the playhead has
+/// if the network briefly falls behind. Tiny next to a whole track, and the
+/// request itself costs far more than fetching it.
+const PREBUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListItem {
@@ -142,13 +150,33 @@ pub fn absolute_url(url: &str) -> String {
     }
 }
 
-/// Downloads a track into memory so rodio can decode it from a seekable cursor.
-pub fn download(url: &str) -> Result<Vec<u8>, Error> {
-    Ok(agent(TRACK_TIMEOUT)
-        .get(url)
-        .call()?
-        .body_mut()
-        .with_config()
-        .limit(MAX_TRACK_BYTES)
-        .read_to_vec()?)
+/// Starts streaming a track and returns a reader the decoder can begin on
+/// straight away.
+///
+/// The body is pumped on a thread of its own, so this returns once
+/// [`PREBUFFER_BYTES`] have landed rather than once the whole track has. The
+/// download stops by itself when the reader is dropped.
+pub fn stream(url: &str) -> Result<StreamingRead, Error> {
+    let response = agent(TRACK_TIMEOUT).get(url).call()?;
+    let byte_len = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok());
+
+    let (reader, writer) = stream::channel(byte_len);
+    // An owned reader, so the pump thread can outlive this call. The default
+    // read limit is meant for whole-body reads; `crate::stream` caps the buffer
+    // itself.
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(u64::MAX)
+        .reader();
+    std::thread::Builder::new()
+        .name("track-download".to_owned())
+        .spawn(move || writer.pump(body))?;
+
+    reader.wait_for(PREBUFFER_BYTES)?;
+    Ok(reader)
 }

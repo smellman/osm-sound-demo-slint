@@ -5,11 +5,13 @@
 //! sample stream on its way to the device and running an FFT over the most
 //! recent window on the UI thread.
 
-use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
+use rodio::decoder::DecoderBuilder;
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
+
+use crate::stream::StreamingRead;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
@@ -224,10 +226,22 @@ impl AudioPlayer {
         ))
     }
 
-    /// Replaces whatever is queued with the given encoded audio and starts it.
-    pub fn play(&self, encoded: Vec<u8>) -> Result<(), Error> {
+    /// Replaces whatever is queued with the given stream and starts it.
+    ///
+    /// The decoder is told the stream is not seekable even though the reader
+    /// can seek: with `is_seekable` set, symphonia seeks to the end to measure
+    /// the stream, which on a partially arrived download means blocking until
+    /// the whole track is in — exactly what streaming is meant to avoid. The
+    /// declared length is still passed on, so duration is known without it.
+    pub fn play(&self, stream: StreamingRead) -> Result<(), Error> {
         self.stop();
-        let decoder = Decoder::try_from(Cursor::new(encoded))?;
+        let byte_len = stream.byte_len();
+        let mut builder = DecoderBuilder::new().with_hint("mp3").with_data(stream);
+        if let Some(len) = byte_len {
+            builder = builder.with_byte_len(len);
+        }
+        // `with_byte_len` turns seeking on, so this has to come after it.
+        let decoder = builder.with_seekable(false).build()?;
         self.player
             .append(Tap::new(decoder, Arc::clone(&self.spectrum)));
         self.player.play();
@@ -368,9 +382,9 @@ mod tests {
         }
     }
 
-    /// End-to-end check against the real catalogue: download a track, decode it
-    /// and confirm the tap produces band levels. Opt-in, because it needs the
-    /// network.
+    /// End-to-end check against the real catalogue: open a track's stream,
+    /// decode it and confirm the tap produces band levels. Opt-in, because it
+    /// needs the network.
     #[test]
     fn a_real_track_produces_band_levels() {
         if std::env::var_os("OSM_SOUND_DEMO_NETWORK_TESTS").is_none() {
@@ -381,9 +395,32 @@ mod tests {
         let release = crate::otherman::fetch_release("OTMN001").expect("fetching OTMN001");
         let track = release.tracklist.first().expect("OTMN001 has tracks");
         let url = crate::otherman::absolute_url(&track.url);
-        let encoded = crate::otherman::download(&url).expect("downloading the track");
 
-        let decoder = Decoder::try_from(Cursor::new(encoded)).expect("decoding the track");
+        let opened = std::time::Instant::now();
+        let stream = crate::otherman::stream(&url).expect("opening the stream");
+        let byte_len = stream.byte_len();
+        let buffered = stream.buffered();
+        eprintln!(
+            "stream opened in {:?} with {buffered} of {byte_len:?} bytes buffered",
+            opened.elapsed()
+        );
+
+        // The point of streaming: playback may begin long before the last byte
+        // lands. Only asserted for a track big enough that the whole thing
+        // could not plausibly have arrived during the prebuffer wait.
+        if let Some(len) = byte_len.filter(|len| *len > 4 * 1024 * 1024) {
+            assert!(
+                (buffered as u64) < len,
+                "waited for the whole {len}-byte track before returning"
+            );
+        }
+
+        let decoder = DecoderBuilder::new()
+            .with_hint("mp3")
+            .with_data(stream)
+            .with_seekable(false)
+            .build()
+            .expect("decoding the track");
         let spectrum = Arc::new(Spectrum::new());
         let mut tap = Tap::new(decoder, Arc::clone(&spectrum));
         let mut analyzer = Analyzer::new(Arc::clone(&spectrum));

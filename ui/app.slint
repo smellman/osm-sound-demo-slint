@@ -15,7 +15,9 @@ export component AppWindow inherits Window {
     // Opens full screen: this is something to stand in front of, driven from a
     // gamepad, not a window to keep alongside other work. Escape leaves it and
     // F toggles, since a full-screen window has no title bar to click.
-    full-screen: true;
+    // Rust sets `windowed` before the window opens when asked to.
+    in-out property <bool> windowed: false;
+    full-screen: !root.windowed;
     // Used when it leaves full screen.
     preferred-width: 1024px;
     preferred-height: 720px;
@@ -57,11 +59,11 @@ export component AppWindow inherits Window {
     keys := FocusScope {
         key-pressed(event) => {
             if event.text == Key.Escape {
-                root.full-screen = false;
+                root.windowed = true;
                 return accept;
             }
             if event.text == "f" || event.text == "F" {
-                root.full-screen = !root.full-screen;
+                root.windowed = !root.windowed;
                 return accept;
             }
             return reject;
