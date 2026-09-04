@@ -30,6 +30,8 @@ export component AppWindow inherits Window {
     in property <bool> playing: false;
     in property <bool> busy: false;
     in property <bool> has-release: false;
+    // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
+    in-out property <int> place-index: 0;
 
     // --- callbacks: UI -> Rust ---
     callback release-selected(/* index */ int);
@@ -90,6 +92,7 @@ export component AppWindow inherits Window {
                     width: 100%;
                     height: 100%;
                     model: root.places;
+                    current-index <=> root.place-index;
                     selected => {
                         root.place-selected(self.current-index);
                     }
@@ -134,7 +137,8 @@ export component AppWindow inherits Window {
                         + "Map data © OpenStreetMap contributors, tiles by tile.openstreetmap.jp (© OpenMapTiles).\n"
                         + "All music by Otherman Records (CC BY-NC 2.1 JP).\n"
                         + "Original sound example by Mapbox (dancing buildings).\n"
-                        + "Developed by Taro Matsuzawa (smellman).";
+                        + "Developed by Taro Matsuzawa (smellman).\n\n"
+                        + "Gamepad: Start plays, Select stops, L1/R1 fly between cities, A fires the drop.";
                 }
             }
         }

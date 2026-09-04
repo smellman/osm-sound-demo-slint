@@ -9,6 +9,7 @@ edition = "2024"
 linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
 
 [dependencies]
+gilrs = "0.11"
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-mp3"] }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

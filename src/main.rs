@@ -4,6 +4,7 @@
 
 mod app;
 mod audio;
+mod gamepad;
 mod map;
 mod otherman;
 

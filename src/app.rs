@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::audio::{Analyzer, AudioPlayer};
-use crate::map::{self, MapLibre};
+use crate::gamepad::{Action, Gamepads};
+use crate::map::{self, CameraBoost, MapLibre};
 use crate::otherman::{self, ListItem, Release};
 use crate::{AppWindow, MMapAdapter};
 
@@ -44,10 +45,40 @@ const END_OF_TRACK_GRACE: Duration = Duration::from_millis(750);
 /// for nothing.
 const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 
+/// The gamepad's A button fires a "drop": the camera recoils and whips round
+/// while the skyline shoots up, then everything settles back. All of it decays
+/// from a hard hit, so the effect reads as an impact rather than a wobble.
+const DROP_LENGTH: Duration = Duration::from_millis(2200);
+/// Zoom levels pulled back at the moment of impact.
+const DROP_ZOOM_OUT: f64 = 2.5;
+/// Degrees of pitch flattened at the moment of impact.
+const DROP_PITCH: f64 = 30.0;
+/// Peak extra bearing, swung out and back over the drop.
+const DROP_BEARING: f64 = 220.0;
+/// Extra building height and hue speed at the moment of impact, as multipliers.
+const DROP_HEIGHT_GAIN: f64 = 1.4;
+const DROP_HUE_GAIN: f64 = 9.0;
+
+/// Gamepad sensitivity. Panning is expressed in screen pixels per second so it
+/// feels the same at every zoom level, exactly as a drag does.
+const STICK_PAN_PX_PER_SEC: f64 = 700.0;
+/// Zoom levels per second while the D-pad is held.
+const STICK_ZOOM_PER_SEC: f64 = 1.2;
+/// Degrees per second at full right-stick deflection.
+const STICK_TURN_DEG_PER_SEC: f64 = 120.0;
+
 struct State {
     map: Rc<RefCell<MapLibre>>,
     audio: AudioPlayer,
     analyzer: Analyzer,
+    gamepads: Gamepads,
+    /// Which entry of `PLACES` L1/R1 steps through.
+    place: usize,
+    /// When the current drop effect started, if one is running.
+    drop_started: Option<Instant>,
+    /// Accumulated hue rotation, so the drop can speed it up without the phase
+    /// jumping when it decays.
+    hue: f64,
     releases: Vec<ListItem>,
     release: Option<Release>,
     track_index: usize,
@@ -57,7 +88,6 @@ struct State {
     generation: u64,
     busy: bool,
     track_started: Instant,
-    started: Instant,
     last_tick: Instant,
     frames: u32,
     fps_window: Instant,
@@ -92,6 +122,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         map: Rc::clone(&map),
         audio,
         analyzer,
+        gamepads: Gamepads::new(),
+        place: 0,
+        drop_started: None,
+        hue: 0.0,
         releases: Vec::new(),
         release: None,
         track_index: 0,
@@ -99,7 +133,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         generation: 0,
         busy: false,
         track_started: now,
-        started: now,
         last_tick: now,
         frames: 0,
         fps_window: now,
@@ -127,19 +160,64 @@ fn setup_places(ui: &AppWindow) {
     ui.on_place_selected({
         let ui_handle = ui.as_weak();
         move |index| {
-            let Some(ui) = ui_handle.upgrade() else {
-                return;
-            };
-            let Some((_, lat, lon)) = PLACES.get(index.max(0) as usize) else {
-                return;
-            };
-            ui.global::<MMapAdapter>().invoke_request_fly_to(
-                *lat as f32,
-                *lon as f32,
-                FLY_TO_ZOOM as f32,
-            );
+            if let Some(ui) = ui_handle.upgrade() {
+                fly_to_place(&ui, index.max(0) as usize);
+            }
         }
     });
+}
+
+/// Flies to one of `PLACES` and keeps the dropdown in step, so the map and the
+/// UI agree however the choice was made.
+fn fly_to_place(ui: &AppWindow, index: usize) {
+    let Some((_, lat, lon)) = PLACES.get(index) else {
+        return;
+    };
+    let _ = with_state(|state| state.place = index);
+    ui.set_place_index(index as i32);
+    ui.global::<MMapAdapter>()
+        .invoke_request_fly_to(*lat as f32, *lon as f32, FLY_TO_ZOOM as f32);
+}
+
+/// Steps through `PLACES` for the gamepad's L1 / R1 bumpers.
+fn step_place(ui: &AppWindow, delta: isize) {
+    let Some(current) = with_state(|state| state.place) else {
+        return;
+    };
+    let next = (current as isize + delta).rem_euclid(PLACES.len() as isize) as usize;
+    fly_to_place(ui, next);
+}
+
+/// Dispatches one gamepad action.
+fn run_action(ui: &AppWindow, state: &Rc<RefCell<State>>, action: Action) {
+    match action {
+        Action::Play => {
+            if !state.borrow().playing {
+                start(ui, state);
+            }
+        }
+        Action::Stop => {
+            if state.borrow().playing {
+                stop(ui, state);
+            }
+        }
+        Action::PreviousPlace => step_place(ui, -1),
+        Action::NextPlace => step_place(ui, 1),
+        Action::Drop => state.borrow_mut().drop_started = Some(Instant::now()),
+    }
+}
+
+/// The drop envelope: how hard the effect is hitting right now, and how far
+/// through it is. Returns `None` once it has finished.
+fn drop_envelope(started: Instant) -> Option<(f64, f64)> {
+    let elapsed = started.elapsed();
+    if elapsed >= DROP_LENGTH {
+        return None;
+    }
+    let t = elapsed.as_secs_f64() / DROP_LENGTH.as_secs_f64();
+    // Cubic decay from a hard hit, so it lands and then settles.
+    let punch = (1.0 - t).powi(3);
+    Some((punch, t))
 }
 
 /// Fetches the release catalogue in the background and fills the dropdown.
@@ -392,14 +470,34 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         let Some(ui) = ui_handle.upgrade() else {
             return;
         };
+        // Button presses are dispatched outside the state borrow below, since
+        // they re-enter through the same transport helpers the UI uses.
+        let actions = state.borrow_mut().gamepads.poll();
+        for action in actions {
+            run_action(&ui, &state, action);
+        }
+
         let mut state = state.borrow_mut();
 
         let now = Instant::now();
         let delta = now.duration_since(state.last_tick);
         state.last_tick = now;
-        let elapsed = state.started.elapsed().as_secs_f64();
+        let seconds = delta.as_secs_f64();
         let levels = state.analyzer.poll();
         let map = Rc::clone(&state.map);
+
+        // Sticks and D-pad, held rather than pressed.
+        let sticks = state.gamepads.sample();
+        if sticks.active() {
+            let mut map = map.borrow_mut();
+            let travel = STICK_PAN_PX_PER_SEC * seconds;
+            map.pan_by(
+                f64::from(sticks.pan.0) * travel,
+                f64::from(sticks.pan.1) * travel,
+            );
+            map.nudge_zoom(f64::from(sticks.zoom) * STICK_ZOOM_PER_SEC * seconds);
+            map.nudge_bearing(f64::from(sticks.turn) * STICK_TURN_DEG_PER_SEC * seconds);
+        }
 
         let flying = {
             let mut map = map.borrow_mut();
@@ -407,12 +505,27 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             map.flying()
         };
 
+        // The drop is applied whether or not a track is playing, so the A
+        // button always does something.
+        let envelope = state.drop_started.and_then(drop_envelope);
+        if envelope.is_none() {
+            state.drop_started = None;
+        }
+        let (punch, drop_t) = envelope.unwrap_or((0.0, 0.0));
+        map.borrow_mut().set_boost(CameraBoost {
+            zoom: -DROP_ZOOM_OUT * punch,
+            pitch: -DROP_PITCH * punch,
+            bearing: DROP_BEARING * (std::f64::consts::PI * drop_t).sin(),
+        });
+
         // The web demo froze the animation during a fly-to. Keeping it means
         // fighting the camera for tiles at the moment the map needs them most.
         if state.playing && !flying {
             let mut map = map.borrow_mut();
-            map.set_bearing(elapsed * BEARING_DEG_PER_SEC);
-            map.apply_levels(&levels, elapsed * HUE_DEG_PER_SEC);
+            map.nudge_bearing(seconds * BEARING_DEG_PER_SEC);
+            state.hue += seconds * HUE_DEG_PER_SEC * (1.0 + DROP_HUE_GAIN * punch);
+            let gain = 1.0 + DROP_HEIGHT_GAIN * punch;
+            map.apply_levels(&levels, state.hue, gain);
         }
 
         if map::push_state(&ui, &mut map.borrow_mut()) {
@@ -435,9 +548,14 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             } else {
                 String::new()
             };
+            // Naming the pad is the only feedback that it was picked up at all.
+            let input = match state.gamepads.name() {
+                Some(name) => format!("🎮 {name}"),
+                None => "drag to pan, scroll to zoom".to_owned(),
+            };
             ui.set_status(
                 format!(
-                    "{:.4}, {:.4} · z{:.1}{rate} · drag to pan, scroll to zoom",
+                    "{:.4}, {:.4} · z{:.1}{rate} · {input}",
                     camera.lat, camera.lon, camera.zoom
                 )
                 .into(),

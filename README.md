@@ -39,6 +39,8 @@ takes a while. Debug builds work but render the map at a few frames per second �
 
 ## Controls
 
+### Mouse
+
 | | |
 | --- | --- |
 | Drag | Pan |
@@ -49,6 +51,24 @@ takes a while. Debug builds work but render the map at a few frames per second �
 | Vol | Output volume |
 | Release dropdown | Load a release; the first one loads on startup |
 | Go To Release | Open the release page in your browser |
+
+### Gamepad
+
+Plug in a controller and it is picked up automatically — its name appears in the
+status line. Anything the pad does, the mouse can still do.
+
+| | |
+| --- | --- |
+| Start | Play |
+| Select | Stop |
+| L1 / R1 | Fly to the previous / next city (the dropdown follows) |
+| A | The drop — see below |
+| Left stick | Pan |
+| Right stick (x) | Turn |
+| D-pad | Zoom in / out |
+
+Panning, turning and zooming all cancel a fly-to in progress, so the pad always wins over
+the animation.
 
 ## How it works
 
@@ -71,6 +91,10 @@ MP3 from archive.org ──► rodio Decoder ──► device
   and colour.
 - `src/otherman.rs` — the release API client. The native build talks to
   otherman-records.com and archive.org directly; the web demo needed a CORS proxy.
+- `src/gamepad.rs` — controller input. [gilrs](https://gitlab.com/gilrs-project/gilrs)
+  carries the SDL_GameControllerDB mappings, so `Button::Start` really is Start on
+  whatever pad is plugged in. Reading raw HID instead would give button *indices* that
+  only line up on XInput-style controllers.
 - `ui/app.slint` — the window. `MMapView` and `MMapAdapter` are imported as
   `@maplibre-native-slint/maplibre.slint` from the
   [maplibre-native-slint](https://github.com/maplibre/maplibre-native-slint) submodule in
@@ -113,6 +137,16 @@ Some of these are deliberate, some are limits of the current Rust bindings.
   `pmtiles://` protocol to register on the native side.
 - **No VJ mode and no "Locate Me"** yet. Both need platform work rodio does not cover
   (input capture, CoreLocation).
+
+### The drop
+
+The A button fires a two-second "drop", built out of one decaying envelope
+(`(1 - t)³`, so it lands hard and settles) driving four things at once: the camera pulls
+back two and a half zoom levels, the pitch flattens by 30°, the bearing whips 220° out and
+back, and the skyline shoots up 40% taller with its hue racing ten times faster. The camera
+part is a transient offset (`CameraBoost`) kept separate from the camera the user controls,
+so the effect can never strand the map somewhere once it decays — and it fires whether or
+not a track is playing.
 
 ### Frame cost
 

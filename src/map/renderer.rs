@@ -167,16 +167,38 @@ struct Flight {
     duration: Duration,
 }
 
+/// Transient camera offsets, currently driven by the drop effect. Kept apart
+/// from the user's camera so an effect can never leave the map somewhere
+/// unexpected once it decays.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CameraBoost {
+    pub zoom: f64,
+    pub pitch: f64,
+    pub bearing: f64,
+}
+
 /// Camera state and the pointer interactions that change it. Kept free of any
 /// rendering so it can be exercised in tests.
 #[derive(Debug, Default)]
 struct CameraController {
     camera: MapCamera,
+    boost: CameraBoost,
     drag_state: Option<DragState>,
     flight: Option<Flight>,
 }
 
 impl CameraController {
+    /// The camera as it appears on screen: the base camera plus any boost.
+    fn effective(&self) -> MapCamera {
+        MapCamera {
+            lat: self.camera.lat,
+            lon: self.camera.lon,
+            zoom: clamp_zoom(self.camera.zoom + self.boost.zoom),
+            bearing: normalize_bearing(self.camera.bearing + self.boost.bearing),
+            pitch: clamp_pitch(self.camera.pitch + self.boost.pitch),
+        }
+    }
+
     /// Starts an eased fly to the given camera.
     fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
         let to = MapCamera {
@@ -245,16 +267,30 @@ impl CameraController {
         last.x = x;
         last.y = y;
 
-        // Screen-space drag has to be un-rotated by the current bearing,
+        // Screen-space drag has to be un-rotated by the bearing on screen,
         // otherwise the map runs off sideways while the demo spins the camera.
-        let bearing = self.camera.bearing.to_radians();
+        let view = self.effective();
+        let bearing = view.bearing.to_radians();
         let east = dx * bearing.cos() - dy * bearing.sin();
         let north = -dx * bearing.sin() - dy * bearing.cos();
 
-        let (lon_per_px, lat_per_px) = degrees_per_pixel(self.camera.zoom, self.camera.lat);
+        let (lon_per_px, lat_per_px) = degrees_per_pixel(view.zoom, view.lat);
         self.camera.lon = normalize_lon(self.camera.lon - east * lon_per_px);
         self.camera.lat = clamp_lat(self.camera.lat - north * lat_per_px);
         true
+    }
+
+    /// Pans by a screen-space delta in pixels, as a drag would.
+    fn pan_by(&mut self, dx: f64, dy: f64) {
+        self.flight = None;
+        let view = self.effective();
+        let bearing = view.bearing.to_radians();
+        let east = dx * bearing.cos() - dy * bearing.sin();
+        let north = -dx * bearing.sin() - dy * bearing.cos();
+
+        let (lon_per_px, lat_per_px) = degrees_per_pixel(view.zoom, view.lat);
+        self.camera.lon = normalize_lon(self.camera.lon - east * lon_per_px);
+        self.camera.lat = clamp_lat(self.camera.lat - north * lat_per_px);
     }
 
     fn wheel_zoomed(&mut self, delta: f32) -> bool {
@@ -316,11 +352,22 @@ impl MapLibre {
     }
 
     fn push_camera(&self) {
-        self.send(Command::Camera(self.controller.camera));
+        self.send(Command::Camera(self.controller.effective()));
     }
 
+    /// The camera as it appears on screen, boost included.
     pub fn camera(&self) -> MapCamera {
-        self.controller.camera
+        self.controller.effective()
+    }
+
+    /// Applies transient camera offsets. Passing [`CameraBoost::default`]
+    /// returns the camera to the user's own position.
+    pub fn set_boost(&mut self, boost: CameraBoost) {
+        if self.controller.boost == boost {
+            return;
+        }
+        self.controller.boost = boost;
+        self.push_camera();
     }
 
     pub fn style_loaded(&self) -> bool {
@@ -424,6 +471,36 @@ impl MapLibre {
         self.push_camera();
     }
 
+    /// Pans by a screen-space delta in pixels. Used by the gamepad's left
+    /// stick, which drives the map the same way a drag does.
+    pub fn pan_by(&mut self, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        self.controller.pan_by(dx, dy);
+        self.push_camera();
+    }
+
+    /// Adds to the zoom level. Used by the gamepad's D-pad.
+    pub fn nudge_zoom(&mut self, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        self.controller.flight = None;
+        self.controller.camera.zoom = clamp_zoom(self.controller.camera.zoom + delta);
+        self.push_camera();
+    }
+
+    /// Adds to the bearing. Both the demo's own spin and the gamepad's right
+    /// stick go through here, so they compose instead of overwriting each other.
+    pub fn nudge_bearing(&mut self, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        self.controller.camera.bearing = normalize_bearing(self.controller.camera.bearing + delta);
+        self.push_camera();
+    }
+
     pub fn mouse_pressed(&mut self, x: f32, y: f32) {
         self.controller.drag_state = Some(DragState { x, y });
     }
@@ -455,12 +532,14 @@ impl MapLibre {
     /// `hue_offset` rotates the colour wheel over time — the native API exposes
     /// neither light settings nor paint-property setters, so the hue of the
     /// buildings themselves stands in for the web demo's animated `setLight`.
-    pub fn apply_levels(&mut self, levels: &[f32; BINS], hue_offset: f64) {
+    /// `height_gain` scales the whole skyline, which the drop effect uses to
+    /// make it jump.
+    pub fn apply_levels(&mut self, levels: &[f32; BINS], hue_offset: f64, height_gain: f64) {
         let mut bands = [Band::default(); BINS];
         for (band, (slot, level)) in bands.iter_mut().zip(levels.iter()).enumerate() {
             let level = f64::from(*level);
             *slot = Band {
-                height: 10.0 + 4.0 * band as f64 + level * 255.0,
+                height: (10.0 + 4.0 * band as f64 + level * 255.0) * height_gain,
                 hue: (hue_offset + band as f64 * 6.0).rem_euclid(360.0),
                 level,
             };
@@ -873,6 +952,71 @@ mod tests {
         let mut controller = controller_at(0.0, 0.0, 1.0);
         assert!(!controller.mouse_moved(110.0, 90.0));
         assert_eq!(controller.camera, controller_at(0.0, 0.0, 1.0).camera);
+    }
+
+    #[test]
+    fn stick_pan_matches_a_drag_of_the_same_delta() {
+        let mut dragged = controller_at(35.0, 139.0, 12.0);
+        dragged.drag_state = Some(DragState { x: 0.0, y: 0.0 });
+        dragged.mouse_moved(12.0, -7.0);
+
+        let mut panned = controller_at(35.0, 139.0, 12.0);
+        panned.pan_by(12.0, -7.0);
+
+        assert_eq!(dragged.camera, panned.camera);
+    }
+
+    #[test]
+    fn stick_pan_follows_the_bearing_on_screen() {
+        let mut controller = controller_at(0.0, 0.0, 4.0);
+        controller.boost = CameraBoost {
+            bearing: 90.0,
+            ..CameraBoost::default()
+        };
+        controller.pan_by(10.0, 0.0);
+        // A quarter turn on screen sends a sideways pan north/south instead.
+        assert!(controller.camera.lat > 0.0, "{:?}", controller.camera);
+        assert!(
+            controller.camera.lon.abs() < 1e-9,
+            "{:?}",
+            controller.camera
+        );
+    }
+
+    #[test]
+    fn stick_pan_cancels_a_fly_to() {
+        let mut controller = controller_at(0.0, 0.0, 4.0);
+        controller.fly_to(35.0, 139.0, 16.0);
+        controller.pan_by(5.0, 5.0);
+        assert!(controller.flight.is_none());
+    }
+
+    #[test]
+    fn a_boost_shifts_the_camera_on_screen_without_moving_the_base() {
+        let mut controller = controller_at(35.0, 139.0, 16.0);
+        controller.camera.bearing = 10.0;
+        controller.boost = CameraBoost {
+            zoom: -2.0,
+            pitch: -30.0,
+            bearing: 100.0,
+        };
+        let view = controller.effective();
+        assert_eq!(view.zoom, 14.0);
+        assert_eq!(view.pitch, 30.0);
+        assert_eq!(view.bearing, 110.0);
+        // The user's own camera is untouched, so the effect decays cleanly.
+        assert_eq!(controller.camera.zoom, 16.0);
+        assert_eq!(controller.camera.bearing, 10.0);
+
+        // Boosts are clamped to what the map can actually show.
+        controller.boost = CameraBoost {
+            zoom: 50.0,
+            pitch: 50.0,
+            bearing: 0.0,
+        };
+        let view = controller.effective();
+        assert_eq!(view.zoom, MAX_ZOOM);
+        assert_eq!(view.pitch, MAX_PITCH);
     }
 
     #[test]
