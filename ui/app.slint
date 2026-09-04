@@ -13,8 +13,9 @@ export struct Size {
 export component AppWindow inherits Window {
     title: "OpenStreetMap Sound Demo";
     // Opens full screen: this is something to stand in front of, driven from a
-    // gamepad, not a window to keep alongside other work. Escape leaves it and
-    // F toggles, since a full-screen window has no title bar to click.
+    // gamepad, not a window to keep alongside other work. Escape leaves it, F
+    // toggles and Q quits, since a full-screen window has no title bar to
+    // click.
     // Rust sets `windowed` before the window opens when asked to.
     in-out property <bool> windowed: false;
     full-screen: !root.windowed;
@@ -53,6 +54,7 @@ export component AppWindow inherits Window {
     callback prev-track();
     callback volume-changed(/* 0.0 - 1.0 */ float);
     callback open-release();
+    callback quit();
 
     property <bool> about-open: false;
 
@@ -64,6 +66,10 @@ export component AppWindow inherits Window {
             }
             if event.text == "f" || event.text == "F" {
                 root.windowed = !root.windowed;
+                return accept;
+            }
+            if event.text == "q" || event.text == "Q" {
+                root.quit();
                 return accept;
             }
             return reject;
@@ -165,7 +171,7 @@ export component AppWindow inherits Window {
                             + "Developed by Taro Matsuzawa (smellman).\n\n"
                             + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
                             + "A drops, B orbits, D-pad picks track and release, L2/R2 set volume.\n"
-                            + "Escape leaves full screen, F toggles it.";
+                            + "Escape leaves full screen, F toggles it, Q quits.";
                     }
                 }
             }

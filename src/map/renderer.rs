@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use maplibre_native::tile_server_options::TileServerOptions;
@@ -358,7 +359,10 @@ impl CameraController {
 /// UI-thread handle to the map. Every mutation is forwarded to the render
 /// thread; finished frames are picked up with [`MapLibre::take_frame`].
 pub struct MapLibre {
-    commands: Sender<Command>,
+    /// `None` once shutdown has started, which is what tells the render thread
+    /// to return.
+    commands: Option<Sender<Command>>,
+    render_thread: Option<JoinHandle<()>>,
     frames: Receiver<Frame>,
     /// Frames the render thread has finished, whether or not the UI picked them
     /// up. Compared against the UI's own count, this says which side of the
@@ -377,7 +381,7 @@ impl MapLibre {
         // frames, the newest one is always the one worth showing.
         let (frame_tx, frames) = sync_channel(1);
         let rendered = Arc::new(AtomicU64::new(0));
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("maplibre-render".to_owned())
             .spawn({
                 let rendered = Arc::clone(&rendered);
@@ -386,7 +390,8 @@ impl MapLibre {
             .expect("spawning the map render thread");
 
         Self {
-            commands,
+            commands: Some(commands),
+            render_thread: Some(handle),
             frames,
             rendered,
             controller: CameraController::default(),
@@ -398,7 +403,9 @@ impl MapLibre {
 
     fn send(&self, command: Command) {
         // The render thread only goes away when the app is shutting down.
-        let _ = self.commands.send(command);
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(command);
+        }
     }
 
     fn push_camera(&self) {
@@ -607,6 +614,19 @@ impl MapLibre {
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
         self.send(Command::Bands(Box::new([Band::default(); BINS])));
+    }
+}
+
+impl Drop for MapLibre {
+    fn drop(&mut self) {
+        // Dropping the sender is what ends the render thread's loop; waiting
+        // for it means MapLibre Native tears down its renderer and closes the
+        // tile cache properly instead of being cut off mid-write. It parks on a
+        // 16 ms timeout, so this returns promptly.
+        self.commands = None;
+        if let Some(handle) = self.render_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

@@ -57,7 +57,11 @@ CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
 
 The window opens **full screen**: this is something to stand in front of and drive from a
 gamepad, not a window to keep alongside other work. A full-screen window has no title bar,
-so **Escape** leaves full screen and **F** toggles it.
+so **Escape** leaves full screen, **F** toggles it, and **Q** quits.
+
+Q, Cmd+Q and the close button all shut down the same way: playback stops, any download
+still in flight is abandoned, and the render thread is waited for so MapLibre Native closes
+its tile cache properly rather than being cut off mid-write.
 
 ### Mouse
 
@@ -67,6 +71,7 @@ so **Escape** leaves full screen and **F** toggles it.
 | Scroll | Zoom |
 | Double-click | Zoom in |
 | Escape / F | Leave full screen / toggle it |
+| Q | Quit |
 | Fly To | Fly to one of twelve cities |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |

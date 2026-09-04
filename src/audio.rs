@@ -212,7 +212,9 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     pub fn new() -> Result<(Self, Analyzer), Error> {
-        let sink = DeviceSinkBuilder::open_default_sink()?;
+        let mut sink = DeviceSinkBuilder::open_default_sink()?;
+        // Quitting drops this on purpose; rodio's warning about it is noise.
+        sink.log_on_drop(false);
         let player = Player::connect_new(sink.mixer());
         let spectrum = Arc::new(Spectrum::new());
         let analyzer = Analyzer::new(Arc::clone(&spectrum));

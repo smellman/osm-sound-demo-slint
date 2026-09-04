@@ -216,6 +216,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     load_release_list(&ui);
 
     ui.run()?;
+
+    // The event loop has returned, whether from Q, Cmd+Q or the close button.
+    // Release everything here rather than leaving it to process exit: dropping
+    // the state stops the audio device, and dropping the last handle to the map
+    // waits for the render thread, which is what lets MapLibre Native close its
+    // tile cache properly.
+    STATE.with(|slot| *slot.borrow_mut() = None);
+    drop(ui);
+    drop(state);
+    drop(map);
     Ok(())
 }
 
@@ -414,6 +424,23 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             let mut state = state.borrow_mut();
             state.volume = volume;
             state.audio.set_volume(volume);
+        }
+    });
+
+    ui.on_quit({
+        let state = Rc::clone(state);
+        move || {
+            // Silence the output before the window goes, so quitting does not
+            // leave a tail of audio playing through the teardown.
+            let mut state = state.borrow_mut();
+            state.audio.stop();
+            state.playing = false;
+            // Any download still in flight is now nobody's track.
+            state.generation += 1;
+            drop(state);
+            if let Err(error) = slint::quit_event_loop() {
+                eprintln!("could not quit cleanly: {error}");
+            }
         }
     });
 
