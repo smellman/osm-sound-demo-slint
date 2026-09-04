@@ -32,6 +32,10 @@ export component AppWindow inherits Window {
     in property <bool> has-release: false;
     // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
     in-out property <int> place-index: 0;
+    // Two-way so the gamepad's D-pad moves the release dropdown too.
+    in-out property <int> release-index: 0;
+    // Two-way so L2/R2 move the slider as well as the output level.
+    in-out property <float> volume: 100;
 
     // --- callbacks: UI -> Rust ---
     callback release-selected(/* index */ int);
@@ -138,7 +142,8 @@ export component AppWindow inherits Window {
                         + "All music by Otherman Records (CC BY-NC 2.1 JP).\n"
                         + "Original sound example by Mapbox (dancing buildings).\n"
                         + "Developed by Taro Matsuzawa (smellman).\n\n"
-                        + "Gamepad: Start plays, Select stops, L1/R1 fly between cities, A fires the drop.";
+                        + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
+                        + "A drops, B orbits, D-pad picks track and release, L2/R2 set volume.";
                 }
             }
         }
@@ -190,7 +195,7 @@ export component AppWindow inherits Window {
                     width: 96px;
                     minimum: 0;
                     maximum: 100;
-                    value: 100;
+                    value <=> root.volume;
                     changed value => {
                         root.volume-changed(self.value / 100);
                     }
@@ -215,6 +220,7 @@ export component AppWindow inherits Window {
                 ComboBox {
                     horizontal-stretch: 3;
                     model: root.releases;
+                    current-index <=> root.release-index;
                     selected => {
                         root.release-selected(self.current-index);
                     }

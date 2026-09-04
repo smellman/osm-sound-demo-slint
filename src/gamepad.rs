@@ -4,6 +4,11 @@
 //! SDL_GameControllerDB mappings: `Button::Start` is the Start button on
 //! whatever pad is plugged in, instead of an index that only lines up on
 //! XInput-style controllers.
+//!
+//! The layout below is an Xbox controller's. gilrs names the action pad by
+//! compass point, so A is `South` and B is `East`; on a pad whose face buttons
+//! sit elsewhere — a Nintendo layout swaps A/B and X/Y — the same physical
+//! positions still fire, but the printed letters will not match.
 
 use gilrs::{Axis, Button, EventType, Gilrs};
 
@@ -22,38 +27,56 @@ pub enum Action {
     PreviousPlace,
     /// R1 — fly to the next place.
     NextPlace,
-    /// A — fire the drop effect.
+    /// A — the drop effect.
     Drop,
+    /// B — the orbit effect.
+    Orbit,
+    /// D-pad left — previous track.
+    PreviousTrack,
+    /// D-pad right — next track.
+    NextTrack,
+    /// D-pad up — previous release.
+    PreviousRelease,
+    /// D-pad down — next release.
+    NextRelease,
 }
 
 fn action_for(button: Button) -> Option<Action> {
     match button {
         Button::Start => Some(Action::Play),
         Button::Select => Some(Action::Stop),
-        // `LeftTrigger` is the L1 / LB bumper; `LeftTrigger2` would be L2 / LT.
+        // `LeftTrigger` is the L1 / LB bumper; `LeftTrigger2` is L2 / LT, which
+        // works the volume instead.
         Button::LeftTrigger => Some(Action::PreviousPlace),
         Button::RightTrigger => Some(Action::NextPlace),
-        // Cardinal naming: South is A on an Xbox pad, cross on a PlayStation one.
         Button::South => Some(Action::Drop),
+        Button::East => Some(Action::Orbit),
+        Button::DPadLeft => Some(Action::PreviousTrack),
+        Button::DPadRight => Some(Action::NextTrack),
+        Button::DPadUp => Some(Action::PreviousRelease),
+        Button::DPadDown => Some(Action::NextRelease),
         _ => None,
     }
 }
 
-/// Continuous stick and D-pad state, sampled once per frame. Each field is in
-/// `-1.0..=1.0`.
+/// Continuous stick and trigger state, sampled once per frame. Each field is
+/// in `-1.0..=1.0`.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Sticks {
     /// Left stick: pans the map. Positive y is down the screen.
     pub pan: (f32, f32),
-    /// Right stick's x axis: turns the map.
+    /// Right stick, left/right: turns the map.
     pub turn: f32,
-    /// D-pad: changes the zoom level. Positive zooms in.
+    /// Right stick, up/down: changes the zoom level. Positive zooms in.
     pub zoom: f32,
+    /// R2 minus L2: raises or lowers the volume.
+    pub volume: f32,
 }
 
 impl Sticks {
-    /// Whether anything is being held, so a fly-to knows to give way.
-    pub fn active(&self) -> bool {
+    /// Whether anything that moves the map is being held, so a fly-to knows to
+    /// give way. Volume is not a camera control, so it does not count.
+    pub fn moves_map(&self) -> bool {
         self.pan != (0.0, 0.0) || self.turn != 0.0 || self.zoom != 0.0
     }
 }
@@ -144,21 +167,23 @@ impl Gamepads {
             -shape(pad.value(Axis::LeftStickY)),
         );
 
-        // The D-pad comes through as buttons on some pads and as an axis pair on
-        // others, so read both. Up and right zoom in, down and left zoom out —
-        // whichever direction gets pressed does something sensible.
-        let mut zoom = shape(pad.value(Axis::DPadY)) + shape(pad.value(Axis::DPadX));
-        if pad.is_pressed(Button::DPadUp) || pad.is_pressed(Button::DPadRight) {
-            zoom += 1.0;
-        }
-        if pad.is_pressed(Button::DPadDown) || pad.is_pressed(Button::DPadLeft) {
-            zoom -= 1.0;
-        }
+        // Triggers are analog, and gilrs surfaces them either as a button
+        // carrying a value or as an axis, depending on the pad. The button form
+        // already reads 0..1; the axis form rests at -1 and reads +1 fully
+        // pressed, so it is rescaled. A resting trigger must read 0 — reading
+        // it as pressed would run the volume away on its own.
+        let trigger = |button: Button, axis: Axis| match pad.button_data(button) {
+            Some(data) => data.value(),
+            None => (pad.value(axis) + 1.0) / 2.0,
+        };
+        let left = shape(trigger(Button::LeftTrigger2, Axis::LeftZ));
+        let right = shape(trigger(Button::RightTrigger2, Axis::RightZ));
 
         Sticks {
             pan,
             turn: shape(pad.value(Axis::RightStickX)),
-            zoom: zoom.clamp(-1.0, 1.0),
+            zoom: shape(pad.value(Axis::RightStickY)),
+            volume: right - left,
         }
     }
 
@@ -183,6 +208,20 @@ mod tests {
         assert_eq!(action_for(Button::LeftTrigger), Some(Action::PreviousPlace));
         assert_eq!(action_for(Button::RightTrigger), Some(Action::NextPlace));
         assert_eq!(action_for(Button::South), Some(Action::Drop));
+        assert_eq!(action_for(Button::East), Some(Action::Orbit));
+        assert_eq!(action_for(Button::DPadLeft), Some(Action::PreviousTrack));
+        assert_eq!(action_for(Button::DPadRight), Some(Action::NextTrack));
+        assert_eq!(action_for(Button::DPadUp), Some(Action::PreviousRelease));
+        assert_eq!(action_for(Button::DPadDown), Some(Action::NextRelease));
+    }
+
+    #[test]
+    fn a_resting_trigger_reads_as_untouched() {
+        // The axis form rests at -1, which must map to 0 and then fall inside
+        // the deadzone; halfway is a half press.
+        assert_eq!(shape((-1.0 + 1.0) / 2.0), 0.0);
+        assert!(shape((0.0 + 1.0) / 2.0) > 0.4);
+        assert_eq!(shape((1.0 + 1.0) / 2.0), 1.0);
     }
 
     #[test]
@@ -199,36 +238,50 @@ mod tests {
     }
 
     #[test]
-    fn a_centred_pad_is_not_active() {
-        assert!(!Sticks::default().active());
+    fn only_the_camera_controls_count_as_moving_the_map() {
+        assert!(!Sticks::default().moves_map());
         assert!(
             Sticks {
                 turn: 0.5,
                 ..Sticks::default()
             }
-            .active()
+            .moves_map()
         );
         assert!(
             Sticks {
                 pan: (0.0, -0.3),
                 ..Sticks::default()
             }
-            .active()
+            .moves_map()
+        );
+        assert!(
+            Sticks {
+                zoom: 0.4,
+                ..Sticks::default()
+            }
+            .moves_map()
+        );
+        // Reaching for the volume must not cancel a fly-to.
+        assert!(
+            !Sticks {
+                volume: 1.0,
+                ..Sticks::default()
+            }
+            .moves_map()
         );
     }
 
     #[test]
     fn other_buttons_are_ignored() {
-        // L2/R2 are deliberately not L1/R1, and the D-pad is read as held
-        // state by `sample` rather than as discrete presses.
+        // L2/R2 work the volume as analog axes, not as presses.
         for button in [
             Button::LeftTrigger2,
             Button::RightTrigger2,
             Button::North,
-            Button::East,
             Button::West,
             Button::Mode,
-            Button::DPadUp,
+            Button::LeftThumb,
+            Button::RightThumb,
             Button::Unknown,
         ] {
             assert_eq!(action_for(button), None, "{button:?}");

@@ -36,6 +36,7 @@ takes a while. Debug builds work but render the map at a few frames per second �
 | --- | --- |
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
+| `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). `0` restores the old behaviour — see [Why the skyline pauses](#why-the-skyline-pauses-after-a-fly-to) |
 
 ## Controls
 
@@ -54,21 +55,31 @@ takes a while. Debug builds work but render the map at a few frames per second �
 
 ### Gamepad
 
-Plug in a controller and it is picked up automatically — its name appears in the
-status line. Anything the pad does, the mouse can still do.
+Plug in a controller and it is picked up automatically — its name appears in the status
+line. Anything the pad does, the mouse can still do.
 
 | | |
 | --- | --- |
 | Start | Play |
 | Select | Stop |
+| A | The drop — see [the effects](#the-effects) |
+| B | The orbit |
 | L1 / R1 | Fly to the previous / next city (the dropdown follows) |
-| A | The drop — see below |
+| L2 / R2 | Volume down / up (the slider follows) |
 | Left stick | Pan |
-| Right stick (x) | Turn |
-| D-pad | Zoom in / out |
+| Right stick, left/right | Turn |
+| Right stick, up/down | Zoom |
+| D-pad left / right | Previous / next track |
+| D-pad up / down | Previous / next release |
+
+> **The layout above is an Xbox controller's.** gilrs maps whatever is plugged in onto that
+> layout through the SDL_GameControllerDB mappings, so the *positions* are what is fixed,
+> not the printed letters. On a Nintendo-style pad, A and B are physically swapped, so the
+> drop sits under the button marked B. Pads without an entry in the mapping database may
+> land buttons somewhere else entirely.
 
 Panning, turning and zooming all cancel a fly-to in progress, so the pad always wins over
-the animation.
+the animation. Reaching for the volume does not.
 
 ## How it works
 
@@ -138,15 +149,36 @@ Some of these are deliberate, some are limits of the current Rust bindings.
 - **No VJ mode and no "Locate Me"** yet. Both need platform work rodio does not cover
   (input capture, CoreLocation).
 
-### The drop
+### The effects
 
-The A button fires a two-second "drop", built out of one decaying envelope
-(`(1 - t)³`, so it lands hard and settles) driving four things at once: the camera pulls
-back two and a half zoom levels, the pitch flattens by 30°, the bearing whips 220° out and
-back, and the skyline shoots up 40% taller with its hue racing ten times faster. The camera
-part is a transient offset (`CameraBoost`) kept separate from the camera the user controls,
-so the effect can never strand the map somewhere once it decays — and it fires whether or
-not a track is playing.
+**A — the drop.** Two seconds built out of one decaying envelope (`(1 - t)³`, so it lands
+hard and settles) driving four things at once: the camera pulls back two and a half zoom
+levels, the pitch flattens by 30°, the bearing whips 220° out and back, and the skyline
+shoots up 40% taller with its hue racing ten times faster.
+
+**B — the orbit.** Three seconds of a full 360° turn on a smoothstep, with a gentle push in
+at the midpoint and the hue running two and a half times faster. Deliberately the opposite
+of the drop: a sweep rather than an impact.
+
+Both are transient offsets (`CameraBoost`) kept separate from the camera the user controls,
+so an effect can never strand the map somewhere once it decays. Both fire whether or not a
+track is playing, and they simply add if you hit them together.
+
+### Why the skyline pauses after a fly-to
+
+Each of the sixteen band layers is rewritten by removing and re-adding it, because the Rust
+bindings expose no paint-property setters. Every change to the layer set makes MapLibre
+Native re-run tile layout for the building source — which restarts the tiles still in
+flight. Sixteen rewrites a frame at 60 Hz therefore keep a *loading* map permanently at the
+start line: flying while a track played left the map blank until the music was stopped.
+
+So the animation gives way while a fly-to is in the air and for
+`OSM_SOUND_DEMO_BAND_HOLD_MS` after it lands, and the rewrites are rate capped to one batch
+per 50 ms the rest of the time.
+
+Only a fly-to counts as a move. Keying this on "the camera changed" instead does not work:
+the demo spins the bearing on every tick while a track plays, so the window never expires
+and the buildings stop moving altogether.
 
 ### Frame cost
 

@@ -18,10 +18,10 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maplibre_native::tile_server_options::TileServerOptions;
 use maplibre_native::{
@@ -44,15 +44,25 @@ const BUILDING_SOURCE_LAYER: &str = "building";
 /// frequency band drives its own slice of the skyline.
 const MAX_BUILDING_HEIGHT: f64 = 200.0;
 
-/// Re-adding a layer is not free, so a band is only rebuilt once its target
-/// moved by more than this many metres, or this many degrees of hue.
+/// Rewriting the layer is not free, so a band counts as unchanged until its
+/// target moves by more than this many metres, or this many degrees of hue.
 const HEIGHT_EPSILON: f64 = 2.0;
 const HUE_EPSILON: f64 = 4.0;
 
-/// Tiles arrive asynchronously in continuous mode, so the map keeps rendering
-/// for a while after the last change instead of stopping at the first frame —
-/// otherwise a tile that lands late never shows up.
-const SETTLE_FRAMES: u32 = 90;
+/// Floor on how often the band layers are rewritten. At the UI's 60 Hz tick
+/// this turns 960 layer-set changes a second into at most 320, which the tile
+/// pipeline can live with.
+const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long the map keeps rendering after the last change. Tiles arrive
+/// asynchronously, so stopping at the first frame after a move would leave
+/// whatever landed later undrawn.
+const SETTLE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Run-loop turns per render pass. Draining harder does not help — on Darwin
+/// `RunLoop::runOnce` waits rather than returning straight away, so 32 turns
+/// cost about 100 ms a frame against 4 ms for one, and it fixed nothing.
+const RUN_LOOP_TICKS_PER_FRAME: u32 = 1;
 
 /// How long the render thread waits for a command before ticking MapLibre
 /// Native's run loop anyway, so in-flight tile requests keep progressing while
@@ -564,28 +574,45 @@ struct Engine {
     /// loop of the thread that owns the map, so it has to be turned for a
     /// render to pick up anything new.
     run_loop: RunLoopHandle,
+    /// How many run-loop turns each pass takes. One turn dispatches one queued
+    /// task, and a moving camera plus per-frame layer swaps queue far more than
+    /// that, so the loop is drained rather than nudged.
+    ticks_per_frame: u32,
+    cache: PathBuf,
     size: (u32, u32),
     style_url: String,
     camera: MapCamera,
     bands: [Band; BINS],
     applied: [Option<Band>; BINS],
+    /// When the layers were last rewritten, for the rate cap.
+    bands_written: Instant,
     dirty: bool,
-    /// Frames still owed to the map so late-arriving tiles get drawn.
-    settling: u32,
+    /// Until when the map keeps rendering so late-arriving tiles get drawn.
+    settling_until: Instant,
 }
 
 impl Engine {
+    /// Clears the rate cap, so a probe rendering back to back actually
+    /// rewrites the layers on the frame it is timing.
+    #[cfg(test)]
+    fn force_band_rewrite(&mut self) {
+        self.bands_written = Instant::now() - BAND_REWRITE_INTERVAL;
+    }
+
     fn new(size: (u32, u32)) -> Self {
         Self {
             renderer: None,
             run_loop: RunLoopHandle::current(),
+            ticks_per_frame: RUN_LOOP_TICKS_PER_FRAME,
+            cache: cache_path(),
             size,
             style_url: DEFAULT_STYLE_URL.to_owned(),
             camera: MapCamera::default(),
             bands: [Band::default(); BINS],
             applied: [None; BINS],
+            bands_written: Instant::now() - BAND_REWRITE_INTERVAL,
             dirty: true,
-            settling: SETTLE_FRAMES,
+            settling_until: Instant::now() + SETTLE_WINDOW,
         }
     }
 
@@ -627,17 +654,24 @@ impl Engine {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
-        self.settling = SETTLE_FRAMES;
+        self.settling_until = Instant::now() + SETTLE_WINDOW;
     }
 
-    /// Whether another frame is worth rendering: either something changed, or
-    /// the map is still settling after the last change.
+    /// Whether another frame is worth rendering: something changed, or the map
+    /// is still settling after the last change.
+    ///
+    /// MapLibre Native's own signals are no help here: in continuous mode
+    /// `needs_repaint` never clears, and `onDidBecomeIdle` never fires (checked
+    /// against 0.8.7). So the settle window is a timer.
     fn wants_frame(&self) -> bool {
-        self.dirty || self.settling > 0
+        self.dirty || self.settling_until > Instant::now()
     }
 
+    /// Turns the run loop, dispatching up to `ticks_per_frame` queued tasks.
     fn tick(&self) {
-        self.run_loop.tick();
+        for _ in 0..self.ticks_per_frame {
+            self.run_loop.tick();
+        }
     }
 
     /// Renders one frame, first syncing any band whose layer has fallen behind.
@@ -656,7 +690,6 @@ impl Engine {
         let buffer = image.buffer();
 
         self.dirty = false;
-        self.settling = self.settling.saturating_sub(1);
 
         // Slint builds the pixel buffer from the reported dimensions, so a
         // short buffer would panic the UI thread rather than show a bad frame.
@@ -689,7 +722,7 @@ impl Engine {
                 return None;
             }
         };
-        let mut renderer = build_renderer(self.size);
+        let mut renderer = build_renderer(self.size, &self.cache);
         if let Err(error) = renderer.load_style_from_url(&url).wait() {
             eprintln!("style load failed: {error}");
         }
@@ -697,23 +730,39 @@ impl Engine {
         Some(())
     }
 
-    /// Rebuilds every band whose layer has fallen behind its target. In
-    /// continuous mode a layer swap is cheap, so this runs every frame.
+    /// Rewrites the band layers that have fallen behind their targets.
+    ///
+    /// Every change to the layer set makes MapLibre Native re-run tile layout
+    /// for the layer's source, which restarts whatever tiles are still in
+    /// flight. Sixteen changes a frame kept a loading map permanently at the
+    /// start line: flying while a track played left the map blank until the
+    /// music stopped. So rewrites give way after a camera move, and are rate
+    /// capped the rest of the time.
     fn sync_bands(&mut self) {
+        let may_update = may_rewrite_bands(self.bands_written.elapsed());
+        let mut wrote = false;
         for band in 0..BINS {
             let target = self.bands[band];
-            if self.applied[band].is_some_and(|applied| applied.close_to(target)) {
-                continue;
+            match self.applied[band] {
+                Some(applied) if applied.close_to(target) => continue,
+                // Holding an update is fine; never having created the layer is
+                // not, so a missing one is always built.
+                Some(_) if !may_update => continue,
+                _ => {}
             }
             if self.set_building_layer(band, target) {
                 self.applied[band] = Some(target);
+                wrote = true;
             }
+        }
+        if wrote {
+            self.bands_written = Instant::now();
         }
     }
 
-    /// Replaces one building layer. There is no paint-property setter in the
-    /// Rust bindings, so the layer is removed and re-added from JSON; either way
-    /// the demo's layers stay on top of the style.
+    /// Replaces one band's layer. There is no paint-property setter in the Rust
+    /// bindings, so the layer is removed and re-added from JSON; either way the
+    /// demo's layers stay on top of the style.
     fn set_building_layer(&mut self, band: usize, spec: Band) -> bool {
         let id = building_layer_id(band);
         let json = building_layer_json(band, &id, spec);
@@ -772,6 +821,18 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
     }
 }
 
+/// Whether the band layers may be rewritten now: a rate cap, because each
+/// rewrite re-runs tile layout for the building source. Layers that do not
+/// exist yet are created regardless — that is handled by the caller.
+///
+/// Giving way for longer than this, while tiles from a move are still landing,
+/// is [`crate::app`]'s job: it knows when a fly-to is in flight, whereas the
+/// engine only sees a stream of camera updates and cannot tell a fly-to from
+/// the demo's own bearing spin.
+fn may_rewrite_bands(since_write: Duration) -> bool {
+    since_write >= BAND_REWRITE_INTERVAL
+}
+
 fn building_layer_id(band: usize) -> String {
     format!("3d-buildings-{band}")
 }
@@ -779,13 +840,11 @@ fn building_layer_id(band: usize) -> String {
 /// Builds the style-spec JSON for one band's extrusion layer. Each band filters
 /// buildings by their true height so the skyline is split into `BINS` slices,
 /// exactly as the web demo did.
+///
 fn building_layer_json(band: usize, id: &str, spec: Band) -> serde_json::Value {
     let bin_width = MAX_BUILDING_HEIGHT / BINS as f64;
     let low = band as f64 * bin_width;
     let high = (band + 1) as f64 * bin_width;
-    // Silent bands stay neutral grey (the web demo used a flat "#aaa");
-    // saturation and lightness rise with the band level.
-    let color = hsl_to_hex(spec.hue, spec.level * 80.0, 50.0 + spec.level * 15.0);
     serde_json::json!({
         "id": id,
         "type": "fill-extrusion",
@@ -793,11 +852,17 @@ fn building_layer_json(band: usize, id: &str, spec: Band) -> serde_json::Value {
         "source-layer": BUILDING_SOURCE_LAYER,
         "filter": ["all", [">", "render_height", low], ["<=", "render_height", high]],
         "paint": {
-            "fill-extrusion-color": color,
+            "fill-extrusion-color": band_color(spec),
             "fill-extrusion-height": spec.height,
             "fill-extrusion-opacity": 0.6,
         },
     })
+}
+
+/// Silent bands stay neutral grey (the web demo used a flat "#aaa");
+/// saturation and lightness rise with the band level.
+fn band_color(spec: Band) -> String {
+    hsl_to_hex(spec.hue, spec.level * 80.0, 50.0 + spec.level * 15.0)
 }
 
 /// `h` in degrees, `s` and `l` in percent.
@@ -828,10 +893,10 @@ fn safe_size(size: Size) -> (u32, u32) {
     ((size.width as u32).max(1), (size.height as u32).max(1))
 }
 
-fn resource_options() -> ResourceOptions {
+fn resource_options(cache: &Path) -> ResourceOptions {
     ResourceOptions::default()
         .with_tile_server_options(&TileServerOptions::default())
-        .with_cache_path(cache_path())
+        .with_cache_path(cache.to_path_buf())
 }
 
 fn camera_update(camera: MapCamera) -> CameraUpdate {
@@ -845,14 +910,14 @@ fn camera_update(camera: MapCamera) -> CameraUpdate {
         .pitch(camera.pitch)
 }
 
-fn build_renderer(size: (u32, u32)) -> ImageRenderer<Continuous> {
+fn build_renderer(size: (u32, u32), cache: &Path) -> ImageRenderer<Continuous> {
     ImageRendererBuilder::new()
         .with_size(
             NonZeroU32::new(size.0).unwrap_or(NonZeroU32::MIN),
             NonZeroU32::new(size.1).unwrap_or(NonZeroU32::MIN),
         )
         .with_pixel_ratio(1.0)
-        .with_resource_options(resource_options())
+        .with_resource_options(resource_options(cache))
         .build_continuous_renderer()
 }
 
@@ -907,6 +972,10 @@ fn degrees_per_pixel(zoom: f64, lat: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames a test renders to let tiles arrive; the production settle window
+    /// is a timer, which a test cannot wait on frame by frame.
+    const TEST_SETTLE_FRAMES: u32 = 90;
 
     fn controller_at(lat: f64, lon: f64, zoom: f64) -> CameraController {
         let mut controller = CameraController::default();
@@ -1040,11 +1109,7 @@ mod tests {
 
     #[test]
     fn silent_bands_render_grey() {
-        let json = building_layer_json(0, "a", Band::default());
-        assert_eq!(
-            json["paint"]["fill-extrusion-color"],
-            serde_json::json!("#808080")
-        );
+        assert_eq!(band_color(Band::default()), "#808080");
     }
 
     #[test]
@@ -1053,6 +1118,34 @@ mod tests {
         let last = building_layer_json(BINS - 1, "b", Band::default());
         assert_eq!(first["filter"][1][2], serde_json::json!(0.0));
         assert_eq!(last["filter"][2][2], serde_json::json!(MAX_BUILDING_HEIGHT));
+    }
+
+    #[test]
+    fn the_building_layers_use_constant_paint() {
+        let json = building_layer_json(3, "a", Band::default());
+        let paint = &json["paint"];
+        // Data-driven paint (a `step` / `get` expression) would be re-evaluated
+        // per building every frame and costs about twenty times as much.
+        assert!(paint["fill-extrusion-height"].is_number(), "{paint}");
+        assert!(paint["fill-extrusion-color"].is_string(), "{paint}");
+    }
+
+    #[test]
+    fn band_rewrites_are_rate_capped() {
+        assert!(!may_rewrite_bands(Duration::ZERO));
+        assert!(!may_rewrite_bands(Duration::from_millis(16)));
+        assert!(may_rewrite_bands(BAND_REWRITE_INTERVAL));
+        assert!(may_rewrite_bands(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_rate_cap_holds_rewrites_well_below_the_tick_rate() {
+        // The UI posts bands every 16 ms; the cap must let through far fewer.
+        let ticks_per_rewrite = BAND_REWRITE_INTERVAL.as_millis() / 16;
+        assert!(
+            ticks_per_rewrite >= 3,
+            "{ticks_per_rewrite} ticks per rewrite"
+        );
     }
 
     #[test]
@@ -1072,6 +1165,7 @@ mod tests {
         }));
         assert!(!base.close_to(Band { hue: 40.0, ..base }));
     }
+
     #[test]
     fn shortest_longitude_delta_crosses_the_antimeridian() {
         assert_eq!(shortest_lon_delta(170.0, -170.0), 20.0);
@@ -1145,8 +1239,9 @@ mod tests {
         // arrive before comparing anything.
         let settle = |engine: &mut Engine| {
             let mut last = None;
-            for _ in 0..SETTLE_FRAMES {
+            for _ in 0..TEST_SETTLE_FRAMES {
                 engine.mark_dirty();
+                engine.force_band_rewrite();
                 last = engine.render();
             }
             last.expect("a frame renders")
@@ -1190,12 +1285,14 @@ mod tests {
         }
         let mut engine = Engine::new((960, 640));
         // Warm up so every band has a layer and the tiles are cached.
-        for _ in 0..SETTLE_FRAMES {
+        for _ in 0..TEST_SETTLE_FRAMES {
             engine.mark_dirty();
+            engine.force_band_rewrite();
             engine.render().expect("warm-up frame");
         }
 
         let time = |engine: &mut Engine| {
+            engine.force_band_rewrite();
             let started = std::time::Instant::now();
             engine.render().expect("frame");
             started.elapsed()
@@ -1227,7 +1324,7 @@ mod tests {
             all_bands += time(&mut engine);
         }
         eprintln!(
-            "960x640 per frame — camera only: {:?}, 1 band swapped: {:?}, {} bands swapped: {:?}",
+            "960x640 per frame — camera only: {:?}, one band moved: {:?}, all {} moved: {:?}",
             camera_only / ROUNDS,
             one_band / ROUNDS,
             BINS,
@@ -1259,7 +1356,7 @@ mod tests {
                 NonZeroU32::new(SIZE.1).unwrap(),
             )
             .with_pixel_ratio(1.0)
-            .with_resource_options(resource_options())
+            .with_resource_options(resource_options(&cache_path()))
             .build_static_renderer();
         still.load_style_from_url(&url).wait().expect("style loads");
         for (band, spec) in bands.iter().enumerate() {
@@ -1301,8 +1398,9 @@ mod tests {
 
         // --- Continuous: the path the app uses ---
         let mut engine = Engine::new(SIZE);
-        for _ in 0..SETTLE_FRAMES {
+        for _ in 0..TEST_SETTLE_FRAMES {
             engine.mark_dirty();
+            engine.force_band_rewrite();
             engine.render().expect("warm-up frame");
         }
         let mut continuous_bands = std::time::Duration::ZERO;
