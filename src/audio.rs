@@ -106,7 +106,8 @@ impl<S: Source> Iterator for Tap<S> {
         self.frame_sum += sample;
         self.frame_len += 1;
         if self.frame_len >= channels {
-            self.spectrum.push(self.frame_sum / f32::from(self.frame_len));
+            self.spectrum
+                .push(self.frame_sum / f32::from(self.frame_len));
             self.frame_sum = 0.0;
             self.frame_len = 0;
         }
@@ -151,8 +152,7 @@ impl Analyzer {
         // Hann window, to keep leakage from smearing across the coarse bands.
         let window = (0..WINDOW)
             .map(|i| {
-                let phase =
-                    std::f32::consts::TAU * i as f32 / (WINDOW as f32 - 1.0);
+                let phase = std::f32::consts::TAU * i as f32 / (WINDOW as f32 - 1.0);
                 0.5 * (1.0 - phase.cos())
             })
             .collect();
@@ -192,8 +192,7 @@ impl Analyzer {
                 / half as f32;
             let db = 20.0 * magnitude.max(1e-10).log10();
             let level = ((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
-            self.levels[band] =
-                SMOOTHING * self.levels[band] + (1.0 - SMOOTHING) * level;
+            self.levels[band] = SMOOTHING * self.levels[band] + (1.0 - SMOOTHING) * level;
         }
         self.levels
     }
@@ -229,7 +228,8 @@ impl AudioPlayer {
     pub fn play(&self, encoded: Vec<u8>) -> Result<(), Error> {
         self.stop();
         let decoder = Decoder::try_from(Cursor::new(encoded))?;
-        self.player.append(Tap::new(decoder, Arc::clone(&self.spectrum)));
+        self.player
+            .append(Tap::new(decoder, Arc::clone(&self.spectrum)));
         self.player.play();
         Ok(())
     }
@@ -286,7 +286,7 @@ mod tests {
             self.remaining -= 1;
             let value = self.phase.sin();
             // Advance once per frame so both channels carry the same sample.
-            if self.remaining % self.channels as usize == 0 {
+            if self.remaining.is_multiple_of(self.channels as usize) {
                 self.phase += self.step;
             }
             Some(value)

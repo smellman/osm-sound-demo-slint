@@ -57,24 +57,42 @@ export component AppWindow inherits Window {
             }
 
             // --- overlay: top-left "About" ---
-            Button {
+            // The overlays sit on the map, whose brightness varies with the
+            // style and the animation, so each gets its own dark backing.
+            Rectangle {
                 x: 12px;
                 y: 12px;
                 width: 88px;
-                text: "About";
-                clicked => {
-                    root.about-open = !root.about-open;
+                height: 32px;
+                background: #0d0f13cc;
+                border-radius: 6px;
+
+                Button {
+                    width: 100%;
+                    height: 100%;
+                    text: "About";
+                    clicked => {
+                        root.about-open = !root.about-open;
+                    }
                 }
             }
 
             // --- overlay: top-right "Fly To" ---
-            ComboBox {
+            Rectangle {
                 x: parent.width - self.width - 12px;
                 y: 12px;
                 width: 220px;
-                model: root.places;
-                selected => {
-                    root.place-selected(self.current-index);
+                height: 32px;
+                background: #0d0f13cc;
+                border-radius: 6px;
+
+                ComboBox {
+                    width: 100%;
+                    height: 100%;
+                    model: root.places;
+                    selected => {
+                        root.place-selected(self.current-index);
+                    }
                 }
             }
 
@@ -133,7 +151,7 @@ export component AppWindow inherits Window {
 
                 Button {
                     width: 44px;
-                    text: "|<";
+                    text: "◀◀";
                     enabled: root.has-release;
                     clicked => {
                         root.prev-track();
@@ -142,7 +160,7 @@ export component AppWindow inherits Window {
 
                 Button {
                     width: 44px;
-                    text: root.playing ? "[]" : ">";
+                    text: root.playing ? "■" : "▶";
                     enabled: root.has-release && !root.busy;
                     clicked => {
                         root.toggle-play();
@@ -151,7 +169,7 @@ export component AppWindow inherits Window {
 
                 Button {
                     width: 44px;
-                    text: ">|";
+                    text: "▶▶";
                     enabled: root.has-release;
                     clicked => {
                         root.next-track();

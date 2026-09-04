@@ -354,8 +354,7 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
         if len == 0 {
             return;
         }
-        state.track_index =
-            (state.track_index as isize + delta).rem_euclid(len as isize) as usize;
+        state.track_index = (state.track_index as isize + delta).rem_euclid(len as isize) as usize;
         state.playing
     };
 
@@ -439,7 +438,10 @@ fn open_in_browser(url: &str) {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let command = ("xdg-open", vec![url]);
 
-    if let Err(error) = std::process::Command::new(command.0).args(command.1).spawn() {
+    if let Err(error) = std::process::Command::new(command.0)
+        .args(command.1)
+        .spawn()
+    {
         eprintln!("could not open {url}: {error}");
     }
 }

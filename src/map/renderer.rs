@@ -119,7 +119,7 @@ enum Command {
     Resize(u32, u32),
     Style(String),
     Camera(MapCamera),
-    Bands([Band; BINS]),
+    Bands(Box<[Band; BINS]>),
 }
 
 #[derive(Debug)]
@@ -241,11 +241,8 @@ impl MapLibre {
     /// the last call.
     pub fn take_frame(&mut self) -> Option<Frame> {
         let mut newest = None;
-        loop {
-            match self.frames.try_recv() {
-                Ok(frame) => newest = Some(frame),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(frame) = self.frames.try_recv() {
+            newest = Some(frame);
         }
         if newest.is_some() {
             self.style_loaded = true;
@@ -352,12 +349,12 @@ impl MapLibre {
                 level,
             };
         }
-        self.send(Command::Bands(bands));
+        self.send(Command::Bands(Box::new(bands)));
     }
 
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
-        self.send(Command::Bands([Band::default(); BINS]));
+        self.send(Command::Bands(Box::new([Band::default(); BINS])));
     }
 }
 
@@ -415,8 +412,8 @@ impl Engine {
                 }
             }
             Command::Bands(bands) => {
-                if self.bands != bands {
-                    self.bands = bands;
+                if self.bands != *bands {
+                    self.bands = *bands;
                     self.dirty = true;
                 }
             }
@@ -795,13 +792,13 @@ mod tests {
         let flat = engine.render().expect("the flat frame renders");
         eprintln!("first frame took {:?}", started.elapsed());
 
-        engine.apply(Command::Bands(
+        engine.apply(Command::Bands(Box::new(
             [Band {
                 height: 220.0,
                 hue: 200.0,
                 level: 1.0,
             }; BINS],
-        ));
+        )));
         let started = std::time::Instant::now();
         let tall = engine.render().expect("the extruded frame renders");
         eprintln!("second frame took {:?}", started.elapsed());
@@ -854,7 +851,7 @@ mod tests {
 
             let mut bands = engine.bands;
             bands[0].height += 40.0;
-            engine.apply(Command::Bands(bands));
+            engine.apply(Command::Bands(Box::new(bands)));
             one_band += time(&mut engine);
 
             let bands = [Band {
@@ -862,7 +859,7 @@ mod tests {
                 hue: 30.0 * nudge,
                 level: 0.5,
             }; BINS];
-            engine.apply(Command::Bands(bands));
+            engine.apply(Command::Bands(Box::new(bands)));
             all_bands += time(&mut engine);
         }
         eprintln!(
@@ -882,7 +879,16 @@ mod tests {
             level: 0.5,
         };
         assert_eq!(drift(base, base), 0.0);
-        assert_eq!(drift(base, Band { height: 130.0, ..base }), 30.0);
+        assert_eq!(
+            drift(
+                base,
+                Band {
+                    height: 130.0,
+                    ..base
+                }
+            ),
+            30.0
+        );
         // 350° is 20° away from 10°, not 340°.
         assert_eq!(drift(base, Band { hue: 350.0, ..base }), 20.0);
     }
