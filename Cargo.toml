@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-metal = ["maplibre_native/metal"]
-opengl = ["maplibre_native/opengl"]
-vulkan = ["maplibre_native/vulkan"]
 # Enable Slint's linuxkms backend (libseat-free variant) for console /
 # embedded Linux KMS targets (no X11/Wayland).
 linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
@@ -19,8 +16,13 @@ serde_json = "1"
 slint = "1.16"
 ureq = { version = "3", features = ["json"] }
 
+# Rendering backend, one per platform. `maplibre_native`'s backend features are
+# mutually exclusive, so they are selected per target rather than through our
+# own feature flags. The `wgpu` feature is the crate's WebGPU backend: it
+# configures MapLibre Native with `MLN_WITH_WEBGPU=ON` and wgpu-native as the
+# implementation.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-maplibre_native = { version = "0.8.2", features = ["opengl"] }
+maplibre_native = { version = "0.8.2", features = ["wgpu"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 maplibre_native = { version = "0.8.2", features = ["metal"] }

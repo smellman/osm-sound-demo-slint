@@ -11,6 +11,17 @@ press play, and the buildings around you rise and fall with the music.
 
 ## How to run
 
+The reusable Slint map components come from a submodule, so clone with it:
+
+```bash
+git clone --recurse-submodules <this repo>
+# or, in an existing clone:
+git submodule update --init vendor/maplibre-native-slint
+```
+
+Only that submodule's `.slint` files are used, so `--recursive` is not needed — its own
+submodules (maplibre-native and friends) stay unfetched.
+
 ```bash
 cargo run --release
 ```
@@ -19,6 +30,13 @@ The first build compiles MapLibre Native from source through `maplibre_native`, 
 takes a while. Debug builds work but render the map at a few frames per second — use
 `--release` for anything you actually want to look at.
 
+### Environment
+
+| Variable | Effect |
+| --- | --- |
+| `MAPLIBRE_STYLE_URL` | Override the initial style URL |
+| `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
+
 ## Controls
 
 | | |
@@ -26,7 +44,7 @@ takes a while. Debug builds work but render the map at a few frames per second �
 | Drag | Pan |
 | Scroll | Zoom |
 | Double-click | Zoom in |
-| Fly To | Jump to one of twelve cities |
+| Fly To | Fly to one of twelve cities |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |
 | Release dropdown | Load a release; the first one loads on startup |
@@ -41,7 +59,7 @@ MP3 from archive.org ──► rodio Decoder ──► device
                                                                         │
                             camera bearing + band heights/hues ◄────────┘
                                               │
-                            render thread ──► MapLibre Native still render ──► Slint Image
+                            render thread ──► MapLibre Native (continuous) ──► Slint Image
 ```
 
 - `src/audio.rs` — playback plus the spectrum analysis. A `Tap` source sits between the
@@ -53,21 +71,43 @@ MP3 from archive.org ──► rodio Decoder ──► device
   and colour.
 - `src/otherman.rs` — the release API client. The native build talks to
   otherman-records.com and archive.org directly; the web demo needed a CORS proxy.
-- `ui/app.slint` — the window. `ui/maplibre/` is a vendored copy of the reusable Slint
-  components from [maplibre-native-slint](https://github.com/maplibre/maplibre-native-slint).
+- `ui/app.slint` — the window. `MMapView` and `MMapAdapter` are imported as
+  `@maplibre-native-slint/maplibre.slint` from the
+  [maplibre-native-slint](https://github.com/maplibre/maplibre-native-slint) submodule in
+  `vendor/`; `build.rs` wires that alias up.
+
+### Rendering backend
+
+The backend is chosen per platform in `Cargo.toml`, because `maplibre_native`'s backend
+features are mutually exclusive:
+
+| Platform | Feature | MapLibre Native backend |
+| --- | --- | --- |
+| macOS | `metal` | `MLN_WITH_METAL` |
+| Linux, others | `wgpu` | `MLN_WITH_WEBGPU` + wgpu-native |
+
+The map runs in MapLibre Native's **continuous** mode, not still (`renderStill`) mode.
+That matters a lot here: still mode re-lays out the building tiles on every change to the
+layer set, and this demo changes sixteen layers per frame.
 
 ### Differences from the web demo
 
 Some of these are deliberate, some are limits of the current Rust bindings.
 
-- **Rendering runs on its own thread.** MapLibre Native finishes a still render by pumping
-  its own run loop, which on macOS is the process CoreFoundation run loop; doing that from
+- **Rendering runs on its own thread.** MapLibre Native drives its work through its own
+  run loop, which on macOS is the process CoreFoundation run loop; pumping that from
   inside a Slint callback re-enters winit's event handling and aborts. The UI thread only
   posts camera and band updates and picks up finished frames.
 - **The buildings carry the colour, not the light.** The web demo animated
   `map.setLight({ color, intensity })`. The Rust bindings expose no light settings and no
   paint-property setters, so each band's layer is rebuilt from style-spec JSON with a
   rotating hue instead.
+- **Fly-to is eased here, not by MapLibre.** The Rust bindings expose only `jumpTo`, so
+  `Fly To` interpolates the camera itself, easing the position and arcing the zoom out at
+  the midpoint. A jump would land on a blank map: the camera outruns tile loading, which is
+  the same reason the [Raspberry Pi port](https://github.com/yuiseki/pi-maplibre-native-slint-touch/tree/main/hdmi)
+  defaults its `MAPLIBRE_FLY_MS` to six seconds. As in the web demo, the building animation
+  pauses during a fly.
 - **Pitch tops out at 60°**, not the web demo's 70°: MapLibre Native clamps the camera there.
 - **Vector tiles come from the style's own source**, not from `planet.pmtiles` — there is no
   `pmtiles://` protocol to register on the native side.
@@ -76,18 +116,21 @@ Some of these are deliberate, some are limits of the current Rust bindings.
 
 ### Frame cost
 
-Changing the layer set makes MapLibre Native re-lay out the building tiles, and that costs
-the same whether one band moves or all sixteen do. Measured in a release build at 960×640:
+Measured in a release build at 960×640 on an Apple Silicon Mac, one frame carrying both a
+camera change and all sixteen band layers being swapped:
 
-| | per frame |
+| Renderer mode | per frame |
 | --- | --- |
-| Camera change only | ~7 ms |
-| Any number of bands swapped | ~44 ms |
+| Still (`render_static`) | ~58 ms |
+| Continuous (`render_once`) | ~15 ms |
 
-So bands are always swapped in one batch, and a batch is held back until the bands have
-moved enough to be worth the re-layout (`SWAP_DRIFT_THRESHOLD`). In practice the app runs
-at around 40 fps at 1024×720 while playing. `report_frame_costs` re-measures this on your
-machine.
+In continuous mode the layer swaps are effectively free — a steady frame costs about 4 ms
+whether zero, one or sixteen bands moved, so the bands are simply synced every frame. In
+still mode any change to the layer set cost a fixed ~40 ms re-layout, which capped the demo
+at roughly 22 fps and needed a batching heuristic to hide. The app now holds 60 fps at
+1024×720 while playing.
+
+`report_frame_costs` and `report_static_vs_continuous` re-measure both on your machine.
 
 ## Tests
 

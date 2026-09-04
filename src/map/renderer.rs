@@ -4,21 +4,29 @@
 //! <https://github.com/maplibre/maplibre-native-slint>, extended with the
 //! sound-reactive 3D building layers of the original web demo.
 //!
-//! MapLibre Native completes a still render by pumping its own run loop, which
-//! on macOS is the process CoreFoundation run loop. Doing that from inside a
-//! Slint callback re-enters winit's event handling and aborts the process, so
-//! the renderer lives on its own thread: the UI thread only posts commands and
+//! The map runs in MapLibre Native's *continuous* mode, which keeps the map
+//! alive between frames. The still (`renderStill`) mode re-renders from scratch
+//! and re-lays out the building tiles on every change to the layer set, which
+//! costs about 40 ms a frame here; continuous mode does the same work in under
+//! 8 ms (see `report_static_vs_continuous`).
+//!
+//! MapLibre Native drives its work through its own run loop, which on macOS is
+//! the process CoreFoundation run loop. Pumping that from inside a Slint
+//! callback re-enters winit's event handling and aborts the process, so the
+//! renderer lives on its own thread: the UI thread only posts commands and
 //! picks up finished frames.
 
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
+use std::time::Duration;
 
 use maplibre_native::tile_server_options::TileServerOptions;
 use maplibre_native::{
-    AnyLayer, CameraUpdate, ImageRenderer, ImageRendererBuilder, LatLng, ResourceOptions,
+    AnyLayer, CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng,
+    ResourceOptions, RunLoopHandle,
 };
 
 use crate::Size;
@@ -41,13 +49,15 @@ const MAX_BUILDING_HEIGHT: f64 = 200.0;
 const HEIGHT_EPSILON: f64 = 2.0;
 const HUE_EPSILON: f64 = 4.0;
 
-/// Any change to the layer set makes MapLibre Native re-lay out the building
-/// tiles, and that costs the same whether one band moves or all sixteen do
-/// (measured at roughly 40 ms against a 6 ms plain render, see
-/// `report_frame_costs`). So bands are always swapped in one batch, and a batch
-/// is held back until the bands have accumulated this much movement — in metres
-/// summed over all of them — to be worth a re-layout.
-const SWAP_DRIFT_THRESHOLD: f64 = 24.0;
+/// Tiles arrive asynchronously in continuous mode, so the map keeps rendering
+/// for a while after the last change instead of stopping at the first frame —
+/// otherwise a tile that lands late never shows up.
+const SETTLE_FRAMES: u32 = 90;
+
+/// How long the render thread waits for a command before ticking MapLibre
+/// Native's run loop anyway, so in-flight tile requests keep progressing while
+/// the map is otherwise idle.
+const IDLE_TICK: Duration = Duration::from_millis(16);
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
@@ -58,6 +68,22 @@ const MAX_PITCH: f64 = 60.0;
 const MAX_ABS_LAT: f64 = 85.0;
 const WHEEL_STEP: f64 = 0.5;
 const DOUBLE_CLICK_STEP: f64 = 1.0;
+
+/// Fly-to duration bounds, and how much duration each degree of travel adds.
+///
+/// The Rust bindings expose only `jumpTo`, so a fly-to is eased here. It is not
+/// merely cosmetic: jumping outruns tile loading and lands on a blank map, the
+/// same problem the Raspberry Pi port describes when it defaults `MAPLIBRE_FLY_MS`
+/// to six seconds. `MAPLIBRE_FLY_MS` overrides the whole duration here too, for
+/// machines that need longer.
+const FLY_MIN: Duration = Duration::from_millis(1500);
+const FLY_MAX: Duration = Duration::from_millis(6000);
+const FLY_MS_PER_DEGREE: f64 = 45.0;
+
+/// How far a long fly-to zooms out at its midpoint, so the trip passes over
+/// coarse tiles that are already cached instead of streaming a whole city.
+const FLY_ARC_MAX_ZOOM_OUT: f64 = 3.0;
+const FLY_ARC_DEGREES_PER_LEVEL: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapCamera {
@@ -128,26 +154,92 @@ struct DragState {
     y: f32,
 }
 
+/// A fly-to in progress.
+#[derive(Debug)]
+struct Flight {
+    from: MapCamera,
+    to: MapCamera,
+    /// Signed shortest-path longitude delta, so a fly can cross the antimeridian.
+    lon_delta: f64,
+    /// Zoom levels to pull back at the midpoint.
+    arc: f64,
+    elapsed: Duration,
+    duration: Duration,
+}
+
 /// Camera state and the pointer interactions that change it. Kept free of any
 /// rendering so it can be exercised in tests.
 #[derive(Debug, Default)]
 struct CameraController {
     camera: MapCamera,
     drag_state: Option<DragState>,
+    flight: Option<Flight>,
 }
 
 impl CameraController {
+    /// Starts an eased fly to the given camera.
     fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
+        let to = MapCamera {
+            lat: clamp_lat(lat),
+            lon: normalize_lon(lon),
+            zoom: clamp_zoom(zoom),
+            ..self.camera
+        };
+        let lon_delta = shortest_lon_delta(self.camera.lon, to.lon);
+        let travel = (to.lat - self.camera.lat).hypot(lon_delta);
+        self.drag_state = None;
+        self.flight = Some(Flight {
+            from: self.camera,
+            to,
+            lon_delta,
+            arc: (travel / FLY_ARC_DEGREES_PER_LEVEL).min(FLY_ARC_MAX_ZOOM_OUT),
+            elapsed: Duration::ZERO,
+            duration: fly_duration(travel),
+        });
+    }
+
+    /// Advances an in-progress fly-to by `delta`, returning whether the camera
+    /// moved.
+    fn advance_flight(&mut self, delta: Duration) -> bool {
+        let Some(flight) = self.flight.as_mut() else {
+            return false;
+        };
+        flight.elapsed += delta;
+        if flight.elapsed >= flight.duration {
+            let to = flight.to;
+            self.flight = None;
+            self.camera.lat = to.lat;
+            self.camera.lon = to.lon;
+            self.camera.zoom = to.zoom;
+            return true;
+        }
+
+        let t = flight.elapsed.as_secs_f64() / flight.duration.as_secs_f64();
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.camera.lat = clamp_lat(flight.from.lat + (flight.to.lat - flight.from.lat) * eased);
+        self.camera.lon = normalize_lon(flight.from.lon + flight.lon_delta * eased);
+        let target = flight.from.zoom + (flight.to.zoom - flight.from.zoom) * eased;
+        self.camera.zoom = clamp_zoom(target - flight.arc * (std::f64::consts::PI * t).sin());
+        true
+    }
+
+    fn cancel_flight(&mut self) {
+        self.flight = None;
+    }
+
+    #[cfg(test)]
+    fn jump_for_test(&mut self, lat: f64, lon: f64, zoom: f64) {
+        self.flight = None;
         self.camera.lat = clamp_lat(lat);
         self.camera.lon = normalize_lon(lon);
         self.camera.zoom = clamp_zoom(zoom);
-        self.drag_state = None;
     }
 
     fn mouse_moved(&mut self, x: f32, y: f32) -> bool {
         let Some(last) = self.drag_state.as_mut() else {
             return false;
         };
+        self.flight = None;
         let dx = f64::from(x - last.x);
         let dy = f64::from(y - last.y);
         last.x = x;
@@ -169,12 +261,14 @@ impl CameraController {
         if delta == 0.0 {
             return false;
         }
+        self.flight = None;
         let direction = if delta > 0.0 { -1.0 } else { 1.0 };
         self.camera.zoom = clamp_zoom(self.camera.zoom + direction * WHEEL_STEP);
         true
     }
 
     fn double_clicked(&mut self, shift: bool) {
+        self.flight = None;
         let step = if shift {
             -DOUBLE_CLICK_STEP
         } else {
@@ -252,6 +346,8 @@ impl MapLibre {
     }
 
     /// Applies the style and camera declared on the Slint `MMapView`.
+    /// `MAPLIBRE_STYLE_URL` overrides the declared style, matching the
+    /// maplibre-native-slint demos.
     pub fn apply_initial(
         &mut self,
         style_url: &str,
@@ -261,9 +357,15 @@ impl MapLibre {
         bearing: f64,
         pitch: f64,
     ) {
+        let style_url = std::env::var("MAPLIBRE_STYLE_URL")
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| style_url.to_owned());
         if !style_url.is_empty() {
-            self.send(Command::Style(style_url.to_owned()));
+            self.send(Command::Style(style_url));
         }
+        self.controller.cancel_flight();
         self.controller.camera = MapCamera {
             lat: clamp_lat(lat),
             lon: normalize_lon(lon),
@@ -288,9 +390,23 @@ impl MapLibre {
         self.send(Command::Resize(new_size.0, new_size.1));
     }
 
+    /// Starts an eased fly to the given camera. Advanced by
+    /// [`MapLibre::advance_flight`] from the UI's frame tick.
     pub fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
         self.controller.fly_to(lat, lon, zoom);
-        self.push_camera();
+    }
+
+    /// Advances an in-progress fly-to. Returns whether the camera moved.
+    pub fn advance_flight(&mut self, delta: Duration) -> bool {
+        if self.controller.advance_flight(delta) {
+            self.push_camera();
+            return true;
+        }
+        false
+    }
+
+    pub fn flying(&self) -> bool {
+        self.controller.flight.is_some()
     }
 
     pub fn set_pitch(&mut self, pitch: f64) {
@@ -364,25 +480,33 @@ pub fn create_map(size: Size) -> Rc<RefCell<MapLibre>> {
 
 /// Owns the MapLibre Native renderer for the lifetime of the render thread.
 struct Engine {
-    renderer: Option<ImageRenderer<maplibre_native::Static>>,
+    renderer: Option<ImageRenderer<Continuous>>,
+    /// MapLibre Native delivers tile loads and layer layouts through the run
+    /// loop of the thread that owns the map, so it has to be turned for a
+    /// render to pick up anything new.
+    run_loop: RunLoopHandle,
     size: (u32, u32),
     style_url: String,
     camera: MapCamera,
     bands: [Band; BINS],
     applied: [Option<Band>; BINS],
     dirty: bool,
+    /// Frames still owed to the map so late-arriving tiles get drawn.
+    settling: u32,
 }
 
 impl Engine {
     fn new(size: (u32, u32)) -> Self {
         Self {
             renderer: None,
+            run_loop: RunLoopHandle::current(),
             size,
             style_url: DEFAULT_STYLE_URL.to_owned(),
             camera: MapCamera::default(),
             bands: [Band::default(); BINS],
             applied: [None; BINS],
             dirty: true,
+            settling: SETTLE_FRAMES,
         }
     }
 
@@ -391,10 +515,12 @@ impl Engine {
             Command::Resize(width, height) => {
                 if self.size != (width, height) {
                     self.size = (width, height);
-                    // The still renderer is fixed-size, so it has to be rebuilt.
-                    self.renderer = None;
-                    self.applied = [None; BINS];
-                    self.dirty = true;
+                    // Continuous mode can be resized in place, so the renderer
+                    // and its layers survive.
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.set_map_size(maplibre_native::Size { width, height });
+                    }
+                    self.mark_dirty();
                 }
             }
             Command::Style(url) => {
@@ -402,48 +528,75 @@ impl Engine {
                     self.style_url = url;
                     self.renderer = None;
                     self.applied = [None; BINS];
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
             }
             Command::Camera(camera) => {
                 if self.camera != camera {
                     self.camera = camera;
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
             }
             Command::Bands(bands) => {
                 if self.bands != *bands {
                     self.bands = *bands;
-                    self.dirty = true;
+                    self.mark_dirty();
                 }
             }
         }
     }
 
-    /// Renders one frame, first syncing the bands whose targets moved far
-    /// enough to be worth rebuilding their layers.
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.settling = SETTLE_FRAMES;
+    }
+
+    /// Whether another frame is worth rendering: either something changed, or
+    /// the map is still settling after the last change.
+    fn wants_frame(&self) -> bool {
+        self.dirty || self.settling > 0
+    }
+
+    fn tick(&self) {
+        self.run_loop.tick();
+    }
+
+    /// Renders one frame, first syncing any band whose layer has fallen behind.
     fn render(&mut self) -> Option<Frame> {
         self.ensure_renderer()?;
         self.sync_bands();
+        self.tick();
 
         let camera = camera_update(self.camera);
         let renderer = self.renderer.as_mut()?;
-        match renderer.render_static(&camera) {
-            Ok(image) => {
-                self.dirty = false;
-                let buffer = image.as_image();
-                Some(Frame {
-                    width: buffer.width(),
-                    height: buffer.height(),
-                    rgba: buffer.as_raw().clone(),
-                })
-            }
-            Err(error) => {
-                eprintln!("map render failed: {error}");
-                self.dirty = false;
-                None
-            }
+        renderer.update_camera(&camera);
+        renderer.render_once();
+
+        let image = renderer.read_still_image();
+        let size = image.size();
+        let buffer = image.buffer();
+
+        self.dirty = false;
+        self.settling = self.settling.saturating_sub(1);
+
+        // Slint builds the pixel buffer from the reported dimensions, so a
+        // short buffer would panic the UI thread rather than show a bad frame.
+        let expected = size.width as usize * size.height as usize * 4;
+        if buffer.len() != expected {
+            eprintln!(
+                "skipping a {}x{} frame: got {} bytes, expected {expected}",
+                size.width,
+                size.height,
+                buffer.len()
+            );
+            return None;
         }
+
+        Some(Frame {
+            width: size.width,
+            height: size.height,
+            rgba: buffer.to_vec(),
+        })
     }
 
     fn ensure_renderer(&mut self) -> Option<()> {
@@ -465,33 +618,14 @@ impl Engine {
         Some(())
     }
 
-    /// Rebuilds every band whose layer has fallen behind, but only once their
-    /// combined movement is worth the re-layout it triggers.
+    /// Rebuilds every band whose layer has fallen behind its target. In
+    /// continuous mode a layer swap is cheap, so this runs every frame.
     fn sync_bands(&mut self) {
-        let mut stale = Vec::new();
-        let mut total_drift = 0.0;
         for band in 0..BINS {
             let target = self.bands[band];
-            match self.applied[band] {
-                Some(applied) if applied.close_to(target) => {}
-                Some(applied) => {
-                    total_drift += drift(applied, target);
-                    stale.push(band);
-                }
-                // A band with no layer yet has to be created regardless.
-                None => {
-                    total_drift = f64::INFINITY;
-                    stale.push(band);
-                }
+            if self.applied[band].is_some_and(|applied| applied.close_to(target)) {
+                continue;
             }
-        }
-        if stale.is_empty() || total_drift < SWAP_DRIFT_THRESHOLD {
-            // Skipping is safe: the UI posts fresh bands every tick, so the
-            // next command marks the map dirty again.
-            return;
-        }
-        for band in stale {
-            let target = self.bands[band];
             if self.set_building_layer(band, target) {
                 self.applied[band] = Some(target);
             }
@@ -524,16 +658,18 @@ impl Engine {
     }
 }
 
-/// Render thread body: coalesce whatever commands are pending, then render at
-/// most one frame per batch. Blocks when there is nothing to do.
+/// Render thread body: coalesce whatever commands are pending, tick MapLibre
+/// Native's run loop, then render at most one frame per pass.
 fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSender<Frame>) {
     let mut engine = Engine::new(size);
     loop {
-        // The first command of a batch blocks, so an idle map costs nothing.
-        match commands.recv() {
+        // Waiting with a timeout rather than blocking keeps the run loop turning
+        // while the map is idle, so tile requests still complete.
+        match commands.recv_timeout(IDLE_TICK) {
             Ok(command) => engine.apply(command),
+            Err(RecvTimeoutError::Timeout) => {}
             // The UI dropped its handle: the app is shutting down.
-            Err(_) => return,
+            Err(RecvTimeoutError::Disconnected) => return,
         }
         loop {
             match commands.try_recv() {
@@ -543,7 +679,10 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
             }
         }
 
-        if !engine.dirty {
+        if !engine.wants_frame() {
+            // Nothing to draw, but in-flight tile requests still need the run
+            // loop turned so they finish and mark the map dirty.
+            engine.tick();
             continue;
         }
         if let Some(frame) = engine.render() {
@@ -552,13 +691,6 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
             let _ = frames.try_send(frame);
         }
     }
-}
-
-/// How far a band's applied layer has drifted from its target, in metres, with
-/// hue folded in so a colour-only change still eventually gets rebuilt.
-fn drift(applied: Band, target: Band) -> f64 {
-    let hue_delta = (applied.hue - target.hue).abs();
-    (applied.height - target.height).abs() + hue_delta.min(360.0 - hue_delta)
 }
 
 fn building_layer_id(band: usize) -> String {
@@ -634,7 +766,7 @@ fn camera_update(camera: MapCamera) -> CameraUpdate {
         .pitch(camera.pitch)
 }
 
-fn build_renderer(size: (u32, u32)) -> ImageRenderer<maplibre_native::Static> {
+fn build_renderer(size: (u32, u32)) -> ImageRenderer<Continuous> {
     ImageRendererBuilder::new()
         .with_size(
             NonZeroU32::new(size.0).unwrap_or(NonZeroU32::MIN),
@@ -642,7 +774,7 @@ fn build_renderer(size: (u32, u32)) -> ImageRenderer<maplibre_native::Static> {
         )
         .with_pixel_ratio(1.0)
         .with_resource_options(resource_options())
-        .build_static_renderer()
+        .build_continuous_renderer()
 }
 
 fn clamp_zoom(zoom: f64) -> f64 {
@@ -662,6 +794,26 @@ fn normalize_lon(lon: f64) -> f64 {
     if wrapped == -180.0 { 180.0 } else { wrapped }
 }
 
+/// Signed shortest-path delta between two longitudes, so a fly-to crosses the
+/// antimeridian rather than going the long way round.
+fn shortest_lon_delta(from: f64, to: f64) -> f64 {
+    let delta = (to - from).rem_euclid(360.0);
+    if delta > 180.0 { delta - 360.0 } else { delta }
+}
+
+/// Longer trips get longer flights, within bounds. `MAPLIBRE_FLY_MS` overrides
+/// the result outright, matching the Raspberry Pi port's knob for slow GPUs.
+fn fly_duration(travel_degrees: f64) -> Duration {
+    if let Some(ms) = std::env::var("MAPLIBRE_FLY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    let scaled = Duration::from_millis((travel_degrees * FLY_MS_PER_DEGREE) as u64);
+    (FLY_MIN + scaled).min(FLY_MAX)
+}
+
 fn normalize_bearing(bearing: f64) -> f64 {
     bearing.rem_euclid(360.0)
 }
@@ -679,7 +831,7 @@ mod tests {
 
     fn controller_at(lat: f64, lon: f64, zoom: f64) -> CameraController {
         let mut controller = CameraController::default();
-        controller.fly_to(lat, lon, zoom);
+        controller.jump_for_test(lat, lon, zoom);
         controller
     }
 
@@ -776,6 +928,63 @@ mod tests {
         }));
         assert!(!base.close_to(Band { hue: 40.0, ..base }));
     }
+    #[test]
+    fn shortest_longitude_delta_crosses_the_antimeridian() {
+        assert_eq!(shortest_lon_delta(170.0, -170.0), 20.0);
+        assert_eq!(shortest_lon_delta(-170.0, 170.0), -20.0);
+        assert_eq!(shortest_lon_delta(0.0, 90.0), 90.0);
+    }
+
+    #[test]
+    fn a_fly_to_eases_to_its_destination() {
+        let mut controller = CameraController::default();
+        controller.jump_for_test(35.68, 139.76, 16.0);
+        controller.fly_to(34.70, 135.49, 16.0);
+
+        let flight = controller.flight.as_ref().expect("a flight started");
+        let duration = flight.duration;
+        assert!(duration >= FLY_MIN && duration <= FLY_MAX);
+
+        // Halfway there the camera is between the two, and pulled back.
+        assert!(controller.advance_flight(duration / 2));
+        let midpoint = controller.camera;
+        assert!(
+            midpoint.lon < 139.76 && midpoint.lon > 135.49,
+            "{midpoint:?}"
+        );
+        assert!(
+            midpoint.zoom < 16.0,
+            "midpoint should zoom out: {midpoint:?}"
+        );
+
+        // Overshooting the duration lands exactly on the destination.
+        assert!(controller.advance_flight(duration));
+        assert!(controller.flight.is_none());
+        assert_eq!(controller.camera.lat, 34.70);
+        assert_eq!(controller.camera.lon, 135.49);
+        assert_eq!(controller.camera.zoom, 16.0);
+        assert!(!controller.advance_flight(duration));
+    }
+
+    #[test]
+    fn a_fly_to_takes_the_short_way_around_the_antimeridian() {
+        let mut controller = CameraController::default();
+        controller.jump_for_test(0.0, 175.0, 4.0);
+        controller.fly_to(0.0, -175.0, 4.0);
+        controller.advance_flight(Duration::from_millis(1));
+        // Going the long way would put the camera near 0°, not past 180°.
+        assert!(controller.camera.lon > 175.0, "{:?}", controller.camera);
+    }
+
+    #[test]
+    fn dragging_cancels_a_fly_to() {
+        let mut controller = CameraController::default();
+        controller.jump_for_test(0.0, 0.0, 4.0);
+        controller.fly_to(35.68, 139.76, 16.0);
+        controller.drag_state = Some(DragState { x: 10.0, y: 10.0 });
+        assert!(controller.mouse_moved(20.0, 20.0));
+        assert!(controller.flight.is_none());
+    }
 
     /// Opt-in: drives the real renderer to confirm that swapping a band's
     /// extrusion layer actually changes the rendered image. Needs the network
@@ -788,9 +997,22 @@ mod tests {
         }
 
         let mut engine = Engine::new((480, 360));
-        let started = std::time::Instant::now();
-        let flat = engine.render().expect("the flat frame renders");
-        eprintln!("first frame took {:?}", started.elapsed());
+        // Continuous mode draws whatever has loaded so far, so let the tiles
+        // arrive before comparing anything.
+        let settle = |engine: &mut Engine| {
+            let mut last = None;
+            for _ in 0..SETTLE_FRAMES {
+                engine.mark_dirty();
+                last = engine.render();
+            }
+            last.expect("a frame renders")
+        };
+
+        let flat = settle(&mut engine);
+        assert!(
+            flat.rgba.iter().any(|byte| *byte != 0),
+            "the renderer never produced an image"
+        );
 
         engine.apply(Command::Bands(Box::new(
             [Band {
@@ -799,9 +1021,7 @@ mod tests {
                 level: 1.0,
             }; BINS],
         )));
-        let started = std::time::Instant::now();
-        let tall = engine.render().expect("the extruded frame renders");
-        eprintln!("second frame took {:?}", started.elapsed());
+        let tall = settle(&mut engine);
 
         assert_eq!((flat.width, flat.height), (tall.width, tall.height));
         let changed = flat
@@ -818,8 +1038,7 @@ mod tests {
         );
     }
 
-    /// Opt-in timing probe: isolates the cost of a still render from the cost
-    /// of swapping extrusion layers, and of how many are swapped at once.
+    /// Opt-in timing probe for the render path the app actually uses.
     #[test]
     fn report_frame_costs() {
         if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
@@ -827,7 +1046,8 @@ mod tests {
         }
         let mut engine = Engine::new((960, 640));
         // Warm up so every band has a layer and the tiles are cached.
-        for _ in 0..3 {
+        for _ in 0..SETTLE_FRAMES {
+            engine.mark_dirty();
             engine.render().expect("warm-up frame");
         }
 
@@ -871,25 +1091,99 @@ mod tests {
         );
     }
 
+    /// Opt-in comparison of MapLibre Native's two renderer modes, kept as the
+    /// record of why the app uses the continuous one.
+    ///
+    /// `Static` is `renderStill`: it re-renders from scratch and re-lays out the
+    /// building tiles on every change to the layer set. `Continuous` keeps the
+    /// map alive between frames.
     #[test]
-    fn drift_folds_in_hue_and_wraps_around_the_colour_wheel() {
-        let base = Band {
-            height: 100.0,
-            hue: 10.0,
-            level: 0.5,
-        };
-        assert_eq!(drift(base, base), 0.0);
-        assert_eq!(
-            drift(
-                base,
-                Band {
-                    height: 130.0,
-                    ..base
-                }
-            ),
-            30.0
+    fn report_static_vs_continuous() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        const SIZE: (u32, u32) = (960, 640);
+        const ROUNDS: u32 = 5;
+
+        let url = DEFAULT_STYLE_URL.parse().expect("style URL");
+        let mut bands = [Band::default(); BINS];
+
+        // --- Static: one still render per frame ---
+        let mut still = ImageRendererBuilder::new()
+            .with_size(
+                NonZeroU32::new(SIZE.0).unwrap(),
+                NonZeroU32::new(SIZE.1).unwrap(),
+            )
+            .with_pixel_ratio(1.0)
+            .with_resource_options(resource_options())
+            .build_static_renderer();
+        still.load_style_from_url(&url).wait().expect("style loads");
+        for (band, spec) in bands.iter().enumerate() {
+            let id = building_layer_id(band);
+            let layer = AnyLayer::from_json_value(&building_layer_json(band, &id, *spec))
+                .expect("layer JSON");
+            still.style().add_layer(layer).expect("layer added");
+        }
+        still
+            .render_static(&camera_update(MapCamera::default()))
+            .expect("warm-up frame");
+
+        let mut static_bands = std::time::Duration::ZERO;
+        for step in 1..=ROUNDS {
+            let nudge = f64::from(step);
+            bands = [Band {
+                height: 20.0 * nudge,
+                hue: 30.0 * nudge,
+                level: 0.5,
+            }; BINS];
+            let started = std::time::Instant::now();
+            for (band, spec) in bands.iter().enumerate() {
+                let id = building_layer_id(band);
+                let layer = AnyLayer::from_json_value(&building_layer_json(band, &id, *spec))
+                    .expect("layer JSON");
+                let mut style = still.style();
+                style.remove_layer(&id);
+                style.add_layer(layer).expect("layer added");
+            }
+            still
+                .render_static(&camera_update(MapCamera {
+                    bearing: nudge * 2.0,
+                    ..MapCamera::default()
+                }))
+                .expect("static frame");
+            static_bands += started.elapsed();
+        }
+        drop(still);
+
+        // --- Continuous: the path the app uses ---
+        let mut engine = Engine::new(SIZE);
+        for _ in 0..SETTLE_FRAMES {
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
+        let mut continuous_bands = std::time::Duration::ZERO;
+        for step in 1..=ROUNDS {
+            let nudge = f64::from(step);
+            engine.apply(Command::Camera(MapCamera {
+                bearing: nudge * 2.0,
+                ..MapCamera::default()
+            }));
+            engine.apply(Command::Bands(Box::new(
+                [Band {
+                    height: 20.0 * nudge + 100.0,
+                    hue: 30.0 * nudge + 5.0,
+                    level: 0.5,
+                }; BINS],
+            )));
+            let started = std::time::Instant::now();
+            engine.render().expect("continuous frame");
+            continuous_bands += started.elapsed();
+        }
+
+        eprintln!(
+            "960x640, camera + 16 layer swaps per frame — static: {:?}, continuous: {:?}",
+            static_bands / ROUNDS,
+            continuous_bands / ROUNDS,
         );
-        // 350° is 20° away from 10°, not 340°.
-        assert_eq!(drift(base, Band { hue: 350.0, ..base }), 20.0);
     }
 }

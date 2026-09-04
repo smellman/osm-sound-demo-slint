@@ -58,6 +58,7 @@ struct State {
     busy: bool,
     track_started: Instant,
     started: Instant,
+    last_tick: Instant,
     frames: u32,
     fps_window: Instant,
     fps: f32,
@@ -99,6 +100,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         busy: false,
         track_started: now,
         started: now,
+        last_tick: now,
         frames: 0,
         fps_window: now,
         fps: 0.0,
@@ -392,11 +394,22 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         };
         let mut state = state.borrow_mut();
 
+        let now = Instant::now();
+        let delta = now.duration_since(state.last_tick);
+        state.last_tick = now;
         let elapsed = state.started.elapsed().as_secs_f64();
         let levels = state.analyzer.poll();
         let map = Rc::clone(&state.map);
 
-        if state.playing {
+        let flying = {
+            let mut map = map.borrow_mut();
+            map.advance_flight(delta);
+            map.flying()
+        };
+
+        // The web demo froze the animation during a fly-to. Keeping it means
+        // fighting the camera for tiles at the moment the map needs them most.
+        if state.playing && !flying {
             let mut map = map.borrow_mut();
             map.set_bearing(elapsed * BEARING_DEG_PER_SEC);
             map.apply_levels(&levels, elapsed * HUE_DEG_PER_SEC);

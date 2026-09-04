@@ -1,0 +1,3 @@
+[submodule "vendor/maplibre-native-slint"]
+	path = vendor/maplibre-native-slint
+	url = https://github.com/maplibre/maplibre-native-slint.git
