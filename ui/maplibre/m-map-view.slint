@@ -1,0 +1,140 @@
+import { MMapAdapter } from "m-map-adapter.slint";
+
+// A map view component powered by MapLibre Native.
+//
+// Usage:
+//   import { MMapView } from "@maplibre-native-slint/maplibre.slint";
+//
+//   map := MMapView {
+//       style-url: "https://demotiles.maplibre.org/style.json";
+//       center-lat: 35.6895;
+//       center-lon: 139.6917;
+//       zoom: 10;
+//   }
+export component MMapView {
+    // --- in: configuration ---
+    in property <string> style-url;
+    in property <float> center-lat: 0;
+    in property <float> center-lon: 0;
+    in property <float> zoom: 1;
+    in property <float> bearing: 0;
+    in property <float> pitch: 0;
+    in property <bool> interactive: true;
+
+    // --- out: reactive camera state ---
+    out property <float> current-lat: MMapAdapter.current-lat;
+    out property <float> current-lon: MMapAdapter.current-lon;
+    out property <float> current-zoom: MMapAdapter.current-zoom;
+    out property <float> current-bearing: MMapAdapter.current-bearing;
+    out property <float> current-pitch: MMapAdapter.current-pitch;
+
+    // --- out: reactive map state ---
+    out property <bool> style-loaded: MMapAdapter.style-loaded;
+    out property <bool> map-idle: MMapAdapter.map-idle;
+
+    // --- callback: external side effects ---
+    callback clicked(/* lat */ float, /* lon */ float);
+
+    // --- public function ---
+    public function fly-to(lat: float, lon: float, zoom: float) {
+        MMapAdapter.request-fly-to(lat, lon, zoom);
+    }
+
+    // --- public function ---
+    public function set-zoom(zoom: float) {
+        MMapAdapter.request-zoom-change(zoom);
+    }
+
+    // --- public function ---
+    public function set-pitch(pitch: float) {
+        MMapAdapter.request-pitch-change(pitch);
+    }
+
+    public function set-bearing(bearing: float) {
+        MMapAdapter.request-bearing-change(bearing);
+    }
+
+    // --- internal: publish the declared initial config so the backend can
+    // apply it once the map exists (init runs before the backend is ready). ---
+    init => {
+        MMapAdapter.initial-style-url = self.style-url;
+        MMapAdapter.initial-lat = self.center-lat;
+        MMapAdapter.initial-lon = self.center-lon;
+        MMapAdapter.initial-zoom = self.zoom;
+        MMapAdapter.initial-bearing = self.bearing;
+        MMapAdapter.initial-pitch = self.pitch;
+        MMapAdapter.initial-config-set = true;
+    }
+
+    // --- internal: propagate property changes to backend ---
+    changed style-url => {
+        MMapAdapter.request-style-change(self.style-url);
+    }
+    changed center-lat => {
+        MMapAdapter.request-fly-to(self.center-lat, self.center-lon, self.zoom);
+    }
+    changed center-lon => {
+        MMapAdapter.request-fly-to(self.center-lat, self.center-lon, self.zoom);
+    }
+    changed zoom => {
+        MMapAdapter.request-fly-to(self.center-lat, self.center-lon, self.zoom);
+    }
+    changed bearing => {
+        MMapAdapter.request-bearing-change(self.bearing);
+    }
+    changed pitch => {
+        MMapAdapter.request-pitch-change(self.pitch);
+    }
+
+    // --- internal: render loop ---
+    Timer {
+        interval: 16ms;
+        running: true;
+        triggered => {
+            MMapAdapter.tick();
+        }
+    }
+
+    // --- internal: map image display ---
+    Image {
+        source: MMapAdapter.frame;
+        width: 100%;
+        height: 100%;
+
+        touch := TouchArea {
+            mouse-cursor: self.pressed ? grabbing : grab;
+
+            pointer-event(e) => {
+                if !root.interactive { return; }
+
+                if e.kind == PointerEventKind.down {
+                    MMapAdapter.mouse-pressed(self.mouse-x / 1px, self.mouse-y / 1px);
+                } else if e.kind == PointerEventKind.up {
+                    MMapAdapter.mouse-released(self.mouse-x / 1px, self.mouse-y / 1px);
+                } else if e.kind == PointerEventKind.move && self.pressed {
+                    MMapAdapter.mouse-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+            }
+
+            double-clicked => {
+                if !root.interactive { return; }
+                // TODO: detect shift key from last pointer-event
+                MMapAdapter.double-clicked(
+                    self.mouse-x / 1px,
+                    self.mouse-y / 1px,
+                    false,
+                );
+            }
+
+            scroll-event(event) => {
+                if !root.interactive { return reject; }
+                MMapAdapter.wheel-zoomed(
+                    self.mouse-x / 1px,
+                    self.mouse-y / 1px,
+                    event.delta-y / 1px,
+                );
+                return accept;
+            }
+        }
+    }
+}
