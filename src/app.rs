@@ -55,6 +55,14 @@ const END_OF_TRACK_GRACE: Duration = Duration::from_millis(750);
 /// behaviour, which is how to A/B the fix.
 const HOLD_AFTER_FLIGHT: Duration = Duration::from_millis(2500);
 
+/// Whether `OSM_SOUND_DEMO_FPS` asked for the frame rate on stderr. The status
+/// line only shows it while a track plays, which is no help when the question
+/// is why the map is slow in the first place.
+fn fps_logging() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OSM_SOUND_DEMO_FPS").is_some())
+}
+
 /// Whether the band animation should give way: a fly-to is in progress, or one
 /// landed recently enough that its tiles may still be arriving.
 fn animation_gives_way(flying: bool, landed: Option<Instant>) -> bool {
@@ -139,6 +147,8 @@ struct State {
     track_started: Instant,
     last_tick: Instant,
     frames: u32,
+    /// `rendered_count` at the last frame-rate report, for the delta.
+    rendered_shown: u64,
     fps_window: Instant,
     fps: f32,
     status_shown: Instant,
@@ -188,6 +198,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         track_started: now,
         last_tick: now,
         frames: 0,
+        rendered_shown: 0,
         fps_window: now,
         fps: 0.0,
         status_shown: now,
@@ -648,6 +659,19 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         let window = state.fps_window.elapsed();
         if window >= Duration::from_secs(1) {
             state.fps = state.frames as f32 / window.as_secs_f32();
+            if fps_logging() {
+                // Two rates, because a low one means different things on either
+                // side of the frame channel: the render thread not finishing
+                // frames, or the UI not keeping up with the ones it finished.
+                let rendered = map.borrow().rendered_count();
+                let produced = rendered - state.rendered_shown;
+                state.rendered_shown = rendered;
+                eprintln!(
+                    "fps: {:.1} shown, {:.1} rendered",
+                    state.fps,
+                    produced as f32 / window.as_secs_f32(),
+                );
+            }
             state.frames = 0;
             state.fps_window = Instant::now();
         }

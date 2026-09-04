@@ -20,6 +20,8 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -49,19 +51,43 @@ const MAX_BUILDING_HEIGHT: f64 = 200.0;
 const HEIGHT_EPSILON: f64 = 2.0;
 const HUE_EPSILON: f64 = 4.0;
 
-/// Floor on how often the band layers are rewritten. At the UI's 60 Hz tick
-/// this turns 960 layer-set changes a second into at most 320, which the tile
-/// pipeline can live with.
-const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(50);
+/// Floor on how often the band layers are rewritten.
+///
+/// Rewriting a layer makes MapLibre Native re-run tile layout for the building
+/// source, and that is the most expensive thing this demo asks of the map: at
+/// 1920x1200 it takes the frame rate from 14.0 fps to 8.2.
+///
+/// What matters is how often a pass touches the layer set at all, not how many
+/// layers it touches — one swap and sixteen measured the same (8.3 fps against
+/// 8.1), because either way the whole source is laid out again. So rewriting a
+/// few bands per pass, round-robin, bought nothing and is not what this does;
+/// the bands all move together, less often. Passes in between then render at
+/// the map's own speed.
+///
+/// The interval has to clear the frame time to do anything: at 8 fps a pass
+/// arrives every 125 ms, so anything under that lets every pass rewrite.
+/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overrides it, `0` rewriting on every pass.
+const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long the map keeps rendering after the last change. Tiles arrive
 /// asynchronously, so stopping at the first frame after a move would leave
 /// whatever landed later undrawn.
 const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 
-/// Run-loop turns per render pass. Draining harder does not help — on Darwin
-/// `RunLoop::runOnce` waits rather than returning straight away, so 32 turns
-/// cost about 100 ms a frame against 4 ms for one, and it fixed nothing.
+/// Run-loop turns per render pass. One, on every platform.
+///
+/// Draining harder looks like it should help — a pass queues far more work than
+/// one turn dispatches, since each of the sixteen layer swaps re-runs tile
+/// layout for the building source — but it measures worse, and not only on
+/// Darwin, where `RunLoop::runOnce` parks rather than returning straight away
+/// and 32 turns cost about 100 ms a pass against 4 ms for one. On Linux, where
+/// a turn is `UV_RUN_NOWAIT` and returns immediately, the map idled at 21 fps
+/// on one turn, 6 on eight, and 3 on thirty-two: the turns dispatch the layout
+/// work a render then waits on anyway, so doing more per pass only moves the
+/// wait.
+///
+/// `OSM_SOUND_DEMO_RUN_LOOP_TICKS` overrides it, which is how that was
+/// measured.
 const RUN_LOOP_TICKS_PER_FRAME: u32 = 1;
 
 /// How long the render thread waits for a command before ticking MapLibre
@@ -329,6 +355,10 @@ impl CameraController {
 pub struct MapLibre {
     commands: Sender<Command>,
     frames: Receiver<Frame>,
+    /// Frames the render thread has finished, whether or not the UI picked them
+    /// up. Compared against the UI's own count, this says which side of the
+    /// channel a low frame rate is coming from.
+    rendered: Arc<AtomicU64>,
     controller: CameraController,
     size: (u32, u32),
     style_loaded: bool,
@@ -341,14 +371,19 @@ impl MapLibre {
         // A single slot: if the UI falls behind there is no point queueing stale
         // frames, the newest one is always the one worth showing.
         let (frame_tx, frames) = sync_channel(1);
+        let rendered = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new()
             .name("maplibre-render".to_owned())
-            .spawn(move || render_thread(size, command_rx, frame_tx))
+            .spawn({
+                let rendered = Arc::clone(&rendered);
+                move || render_thread(size, command_rx, frame_tx, &rendered)
+            })
             .expect("spawning the map render thread");
 
         Self {
             commands,
             frames,
+            rendered,
             controller: CameraController::default(),
             size,
             style_loaded: false,
@@ -386,6 +421,13 @@ impl MapLibre {
 
     pub fn map_idle(&self) -> bool {
         self.map_idle
+    }
+
+    /// Frames finished by the render thread since startup. The UI counts the
+    /// ones it actually showed, and the gap between the two is the number of
+    /// frames dropped for want of a taker.
+    pub fn rendered_count(&self) -> u64 {
+        self.rendered.load(Ordering::Relaxed)
     }
 
     /// Takes the newest finished frame, if the render thread produced one since
@@ -584,7 +626,9 @@ struct Engine {
     camera: MapCamera,
     bands: [Band; BINS],
     applied: [Option<Band>; BINS],
-    /// When the layers were last rewritten, for the rate cap.
+    /// Shortest gap between rewrites of the layer set.
+    rewrite_interval: Duration,
+    /// When the layers were last rewritten, for the interval above.
     bands_written: Instant,
     dirty: bool,
     /// Until when the map keeps rendering so late-arriving tiles get drawn.
@@ -592,25 +636,19 @@ struct Engine {
 }
 
 impl Engine {
-    /// Clears the rate cap, so a probe rendering back to back actually
-    /// rewrites the layers on the frame it is timing.
-    #[cfg(test)]
-    fn force_band_rewrite(&mut self) {
-        self.bands_written = Instant::now() - BAND_REWRITE_INTERVAL;
-    }
-
     fn new(size: (u32, u32)) -> Self {
         Self {
             renderer: None,
             run_loop: RunLoopHandle::current(),
-            ticks_per_frame: RUN_LOOP_TICKS_PER_FRAME,
+            ticks_per_frame: run_loop_ticks(),
             cache: cache_path(),
             size,
             style_url: DEFAULT_STYLE_URL.to_owned(),
             camera: MapCamera::default(),
             bands: [Band::default(); BINS],
             applied: [None; BINS],
-            bands_written: Instant::now() - BAND_REWRITE_INTERVAL,
+            rewrite_interval: band_rewrite_interval(),
+            bands_written: Instant::now() - SETTLE_WINDOW,
             dirty: true,
             settling_until: Instant::now() + SETTLE_WINDOW,
         }
@@ -730,16 +768,21 @@ impl Engine {
         Some(())
     }
 
-    /// Rewrites the band layers that have fallen behind their targets.
+    /// Rewrites the band layers that have fallen behind their targets, no more
+    /// often than [`Engine::rewrite_interval`].
     ///
     /// Every change to the layer set makes MapLibre Native re-run tile layout
     /// for the layer's source, which restarts whatever tiles are still in
-    /// flight. Sixteen changes a frame kept a loading map permanently at the
-    /// start line: flying while a track played left the map blank until the
-    /// music stopped. So rewrites give way after a camera move, and are rate
-    /// capped the rest of the time.
+    /// flight. Doing that on every pass kept a loading map permanently at the
+    /// start line — flying while a track played left the map blank until the
+    /// music stopped — and costs a third of the frame rate besides.
+    ///
+    /// Giving way for longer than this, while tiles from a move are still
+    /// landing, is [`crate::app`]'s job: it knows when a fly-to is in flight,
+    /// whereas the engine only sees a stream of camera updates and cannot tell
+    /// a fly-to from the demo's own bearing spin.
     fn sync_bands(&mut self) {
-        let may_update = may_rewrite_bands(self.bands_written.elapsed());
+        let may_update = self.bands_written.elapsed() >= self.rewrite_interval;
         let mut wrote = false;
         for band in 0..BINS {
             let target = self.bands[band];
@@ -788,16 +831,26 @@ impl Engine {
 
 /// Render thread body: coalesce whatever commands are pending, tick MapLibre
 /// Native's run loop, then render at most one frame per pass.
-fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSender<Frame>) {
+fn render_thread(
+    size: (u32, u32),
+    commands: Receiver<Command>,
+    frames: SyncSender<Frame>,
+    rendered: &AtomicU64,
+) {
     let mut engine = Engine::new(size);
     loop {
-        // Waiting with a timeout rather than blocking keeps the run loop turning
-        // while the map is idle, so tile requests still complete.
-        match commands.recv_timeout(IDLE_TICK) {
-            Ok(command) => engine.apply(command),
-            Err(RecvTimeoutError::Timeout) => {}
-            // The UI dropped its handle: the app is shutting down.
-            Err(RecvTimeoutError::Disconnected) => return,
+        // Only park when there is nothing to draw. Waiting the idle tick out on
+        // a frame the engine already wants added `IDLE_TICK` to every pass,
+        // which on its own capped the map at 60 fps and, next to a render that
+        // costs a few milliseconds, was most of the frame time. Removing it
+        // took the idling map from 16 fps to 21.
+        if !engine.wants_frame() {
+            match commands.recv_timeout(IDLE_TICK) {
+                Ok(command) => engine.apply(command),
+                Err(RecvTimeoutError::Timeout) => {}
+                // The UI dropped its handle: the app is shutting down.
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
         loop {
             match commands.try_recv() {
@@ -814,6 +867,7 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
             continue;
         }
         if let Some(frame) = engine.render() {
+            rendered.fetch_add(1, Ordering::Relaxed);
             // Drop the frame rather than stall if the UI has not consumed the
             // previous one yet.
             let _ = frames.try_send(frame);
@@ -821,16 +875,14 @@ fn render_thread(size: (u32, u32), commands: Receiver<Command>, frames: SyncSend
     }
 }
 
-/// Whether the band layers may be rewritten now: a rate cap, because each
-/// rewrite re-runs tile layout for the building source. Layers that do not
-/// exist yet are created regardless — that is handled by the caller.
-///
-/// Giving way for longer than this, while tiles from a move are still landing,
-/// is [`crate::app`]'s job: it knows when a fly-to is in flight, whereas the
-/// engine only sees a stream of camera updates and cannot tell a fly-to from
-/// the demo's own bearing spin.
-fn may_rewrite_bands(since_write: Duration) -> bool {
-    since_write >= BAND_REWRITE_INTERVAL
+/// Shortest gap between rewrites of the band layers,
+/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overriding the default so the trade
+/// against the frame rate can be measured.
+fn band_rewrite_interval() -> Duration {
+    std::env::var("OSM_SOUND_DEMO_BAND_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .map_or(BAND_REWRITE_INTERVAL, Duration::from_millis)
 }
 
 fn building_layer_id(band: usize) -> String {
@@ -958,6 +1010,15 @@ fn fly_duration(travel_degrees: f64) -> Duration {
     (FLY_MIN + scaled).min(FLY_MAX)
 }
 
+/// Run-loop turns per pass, `OSM_SOUND_DEMO_RUN_LOOP_TICKS` overriding the
+/// default so the two can be compared in one sitting.
+fn run_loop_ticks() -> u32 {
+    std::env::var("OSM_SOUND_DEMO_RUN_LOOP_TICKS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(RUN_LOOP_TICKS_PER_FRAME)
+}
+
 fn normalize_bearing(bearing: f64) -> f64 {
     bearing.rem_euclid(360.0)
 }
@@ -976,6 +1037,20 @@ mod tests {
     /// Frames a test renders to let tiles arrive; the production settle window
     /// is a timer, which a test cannot wait on frame by frame.
     const TEST_SETTLE_FRAMES: u32 = 90;
+
+    /// Size the timing probes render at, `OSM_SOUND_DEMO_RENDER_SIZE` as
+    /// `<width>x<height>`.
+    fn probe_size() -> (u32, u32) {
+        let Some(value) = std::env::var_os("OSM_SOUND_DEMO_RENDER_SIZE") else {
+            return (960, 640);
+        };
+        let value = value.to_string_lossy().into_owned();
+        let (width, height) = value.split_once('x').expect("<width>x<height>");
+        (
+            width.trim().parse().expect("width"),
+            height.trim().parse().expect("height"),
+        )
+    }
 
     fn controller_at(lat: f64, lon: f64, zoom: f64) -> CameraController {
         let mut controller = CameraController::default();
@@ -1132,10 +1207,13 @@ mod tests {
 
     #[test]
     fn band_rewrites_are_rate_capped() {
-        assert!(!may_rewrite_bands(Duration::ZERO));
-        assert!(!may_rewrite_bands(Duration::from_millis(16)));
-        assert!(may_rewrite_bands(BAND_REWRITE_INTERVAL));
-        assert!(may_rewrite_bands(Duration::from_secs(1)));
+        assert_eq!(band_rewrite_interval(), BAND_REWRITE_INTERVAL);
+        // An interval under the frame time lets every pass rewrite, which is
+        // the case the cap exists to avoid. 8 fps is 125 ms a pass.
+        assert!(
+            BAND_REWRITE_INTERVAL >= Duration::from_millis(125),
+            "{BAND_REWRITE_INTERVAL:?} is inside a frame"
+        );
     }
 
     #[test]
@@ -1241,8 +1319,7 @@ mod tests {
             let mut last = None;
             for _ in 0..TEST_SETTLE_FRAMES {
                 engine.mark_dirty();
-                engine.force_band_rewrite();
-                last = engine.render();
+                    last = engine.render();
             }
             last.expect("a frame renders")
         };
@@ -1278,21 +1355,78 @@ mod tests {
     }
 
     /// Opt-in timing probe for the render path the app actually uses.
+    /// Same probe as the WGPU branch carries, so the two backends can be
+    /// compared on identical work. Wall clock, not per-call timing: a layer
+    /// swap returns as soon as the work is queued.
+    #[test]
+    fn report_playing_frame_rate() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        let size = probe_size();
+        let mut engine = Engine::new(size);
+        for _ in 0..TEST_SETTLE_FRAMES {
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
+
+        const BUDGET: Duration = Duration::from_secs(5);
+
+        fn rate(engine: &mut Engine, mut step: impl FnMut(&mut Engine, u32)) -> f64 {
+            let started = Instant::now();
+            let mut frames = 0u32;
+            while started.elapsed() < BUDGET {
+                step(engine, frames);
+                engine.mark_dirty();
+                if engine.render().is_some() {
+                    frames += 1;
+                }
+            }
+            f64::from(frames) / started.elapsed().as_secs_f64()
+        }
+
+        let still = rate(&mut engine, |_, _| {});
+        let camera = rate(&mut engine, |engine, frame| {
+            engine.apply(Command::Camera(MapCamera {
+                bearing: f64::from(frame) * 2.0,
+                ..MapCamera::default()
+            }));
+        });
+        let playing = rate(&mut engine, |engine, frame| {
+            engine.apply(Command::Camera(MapCamera {
+                bearing: f64::from(frame) * 2.0,
+                ..MapCamera::default()
+            }));
+            let level = (f64::from(frame) / 10.0).sin().abs();
+            engine.apply(Command::Bands(Box::new(
+                [Band {
+                    height: 20.0 + level * 180.0,
+                    hue: f64::from(frame) * 3.0 % 360.0,
+                    level,
+                }; BINS],
+            )));
+        });
+
+        eprintln!(
+            "{}x{} — still: {still:.1} fps, camera only: {camera:.1} fps, camera + {} bands: {playing:.1} fps",
+            size.0, size.1, BINS,
+        );
+    }
+
     #[test]
     fn report_frame_costs() {
         if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
             return;
         }
-        let mut engine = Engine::new((960, 640));
+        let size = probe_size();
+        let mut engine = Engine::new(size);
         // Warm up so every band has a layer and the tiles are cached.
         for _ in 0..TEST_SETTLE_FRAMES {
             engine.mark_dirty();
-            engine.force_band_rewrite();
             engine.render().expect("warm-up frame");
         }
 
         let time = |engine: &mut Engine| {
-            engine.force_band_rewrite();
             let started = std::time::Instant::now();
             engine.render().expect("frame");
             started.elapsed()
@@ -1324,7 +1458,9 @@ mod tests {
             all_bands += time(&mut engine);
         }
         eprintln!(
-            "960x640 per frame — camera only: {:?}, one band moved: {:?}, all {} moved: {:?}",
+            "{}x{} per frame — camera only: {:?}, one band moved: {:?}, all {} moved: {:?}",
+            size.0,
+            size.1,
             camera_only / ROUNDS,
             one_band / ROUNDS,
             BINS,
@@ -1400,7 +1536,6 @@ mod tests {
         let mut engine = Engine::new(SIZE);
         for _ in 0..TEST_SETTLE_FRAMES {
             engine.mark_dirty();
-            engine.force_band_rewrite();
             engine.render().expect("warm-up frame");
         }
         let mut continuous_bands = std::time::Duration::ZERO;

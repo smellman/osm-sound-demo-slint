@@ -30,6 +30,14 @@ The first build compiles MapLibre Native from source through `maplibre_native`, 
 takes a while. Debug builds work but render the map at a few frames per second — use
 `--release` for anything you actually want to look at.
 
+That C++ build is memory-hungry, and Cargo hands CMake one job per core. On a 16-core,
+38 GB machine the default parallelism runs the box out of memory and the build is killed,
+so cap it:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
+```
+
 ### Environment
 
 | Variable | Effect |
@@ -37,6 +45,10 @@ takes a while. Debug builds work but render the map at a few frames per second �
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). `0` restores the old behaviour — see [Why the skyline pauses](#why-the-skyline-pauses-after-a-fly-to) |
+| `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
+| `OSM_SOUND_DEMO_RUN_LOOP_TICKS` | Run-loop turns per render pass (default 1). Raising it measures worse — see the comment on `RUN_LOOP_TICKS_PER_FRAME` |
+| `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
+| `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
 
 ## Controls
 
@@ -124,7 +136,34 @@ features are mutually exclusive:
 | Platform | Feature | MapLibre Native backend |
 | --- | --- | --- |
 | macOS | `metal` | `MLN_WITH_METAL` |
-| Linux, others | `wgpu` | `MLN_WITH_WEBGPU` + wgpu-native |
+| Linux, others | `vulkan` | `MLN_WITH_VULKAN` |
+
+Vulkan because it measures fastest on the load this app puts on the map. At 1920x1200
+in release, from `report_playing_frame_rate`:
+
+| Backend | still | camera only | camera + 16 bands |
+| --- | --- | --- | --- |
+| `vulkan` | 11.7 fps | 11.2 fps | **7.2 fps** |
+| `wgpu` | 12.0 fps | 10.8 fps | 2.8 fps |
+
+The two draw at the same speed. They part company under the band animation, which
+rewrites sixteen extrusion layers and makes MapLibre Native re-run tile layout for the
+building source, rebuilding buffers and textures constantly. On the `wgpu` path every one
+of those goes through `webgpu-shim`'s FFI and wgpu's validation; Vulkan talks to the
+driver directly.
+
+`wgpu` is otherwise the more appealing shape, and the one to revisit if that shim gets
+cheaper: it is the only backend that can hand Slint the rendered texture directly
+(`ImageRenderer::take_texture` into `slint::Image::try_from`, with Slint on
+`unstable-wgpu-29` so both sides share one WGPU device), which removes the full-screen
+CPU read-back the others need. With an idle map that is worth about 1.7x — but it does
+not come close to covering the resource churn above.
+
+`opengl` cannot run this app at all: `gl::HeadlessBackend::readStillImage` reaches
+`getContext()` with no `gfx::BackendScope` around it. Still mode gets away with it because
+`HeadlessFrontend::render(Map&)` wraps the whole call, but continuous mode reads outside
+that scope, so a debug build trips `assert(BackendScope::exists())` and a release build
+reads a GL context that is no longer current.
 
 The map runs in MapLibre Native's **continuous** mode, not still (`renderStill`) mode.
 That matters a lot here: still mode re-lays out the building tiles on every change to the

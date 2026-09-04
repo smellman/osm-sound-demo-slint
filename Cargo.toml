@@ -19,11 +19,36 @@ ureq = { version = "3", features = ["json"] }
 
 # Rendering backend, one per platform. `maplibre_native`'s backend features are
 # mutually exclusive, so they are selected per target rather than through our
-# own feature flags. The `wgpu` feature is the crate's WebGPU backend: it
-# configures MapLibre Native with `MLN_WITH_WEBGPU=ON` and wgpu-native as the
-# implementation.
+# own feature flags.
+#
+# Vulkan, measured against the alternatives at 1920x1200 in release, on the
+# load this app actually puts on the map (see `report_playing_frame_rate`):
+#
+#                     still     camera only   camera + 16 bands
+#     vulkan          11.7 fps     11.2 fps        7.2 fps
+#     wgpu            12.0 fps     10.8 fps        2.8 fps
+#
+# The two draw at the same speed. They part company under the band animation,
+# which rewrites sixteen extrusion layers and makes MapLibre Native re-run tile
+# layout for the building source — so buffers and textures are rebuilt
+# constantly, and on the `wgpu` path every one of those goes through
+# `webgpu-shim`'s FFI and wgpu's validation. Vulkan talks to the driver
+# directly and keeps 2.6x the frame rate.
+#
+# `wgpu` is otherwise the more appealing shape: it is the only backend that can
+# hand Slint the rendered texture directly (`ImageRenderer::take_texture` plus
+# `slint::Image::try_from`, with Slint on `unstable-wgpu-29` so both sides share
+# one device), which removes the full-screen CPU read-back the others need.
+# That saving does not come close to covering the per-frame resource churn
+# above. Worth revisiting if the shim gets cheaper.
+#
+# Not `opengl`: `gl::HeadlessBackend::readStillImage` reaches `getContext()`
+# with no `gfx::BackendScope` around it. Still mode gets away with it because
+# `HeadlessFrontend::render(Map&)` wraps the whole call, but continuous mode
+# reads outside that scope, so a debug build trips `assert(BackendScope::
+# exists())` and a release build reads a GL context that is no longer current.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-maplibre_native = { version = "0.8.2", features = ["wgpu"] }
+maplibre_native = { version = "0.8.2", features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 maplibre_native = { version = "0.8.2", features = ["metal"] }
