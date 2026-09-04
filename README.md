@@ -40,6 +40,10 @@ takes a while. Debug builds work but render the map at a few frames per second �
 
 ## Controls
 
+The window opens **full screen**: this is something to stand in front of and drive from a
+gamepad, not a window to keep alongside other work. A full-screen window has no title bar,
+so **Escape** leaves full screen and **F** toggles it.
+
 ### Mouse
 
 | | |
@@ -47,6 +51,7 @@ takes a while. Debug builds work but render the map at a few frames per second �
 | Drag | Pan |
 | Scroll | Zoom |
 | Double-click | Zoom in |
+| Escape / F | Leave full screen / toggle it |
 | Fly To | Fly to one of twelve cities |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |

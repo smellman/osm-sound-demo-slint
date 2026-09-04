@@ -12,9 +12,15 @@ export struct Size {
 
 export component AppWindow inherits Window {
     title: "OpenStreetMap Sound Demo";
+    // Opens full screen: this is something to stand in front of, driven from a
+    // gamepad, not a window to keep alongside other work. Escape leaves it and
+    // F toggles, since a full-screen window has no title bar to click.
+    full-screen: true;
+    // Used when it leaves full screen.
     preferred-width: 1024px;
     preferred-height: 720px;
     background: #16181d;
+    forward-focus: keys;
 
     out property <Size> map-size: { width: map.width, height: map.height };
     callback map-size-changed;
@@ -48,189 +54,204 @@ export component AppWindow inherits Window {
 
     property <bool> about-open: false;
 
-    VerticalLayout {
-        Rectangle {
-            vertical-stretch: 1;
-
-            VerticalLayout {
-                map := MMapView {
-                    style-url: "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
-                    center-lat: 35.680655;
-                    center-lon: 139.767165;
-                    zoom: 16;
-                    pitch: 60;
-                }
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.full-screen = false;
+                return accept;
             }
-
-            // --- overlay: top-left "About" ---
-            // The overlays sit on the map, whose brightness varies with the
-            // style and the animation, so each gets its own dark backing.
-            Rectangle {
-                x: 12px;
-                y: 12px;
-                width: 88px;
-                height: 32px;
-                background: #0d0f13cc;
-                border-radius: 6px;
-
-                Button {
-                    width: 100%;
-                    height: 100%;
-                    text: "About";
-                    clicked => {
-                        root.about-open = !root.about-open;
-                    }
-                }
+            if event.text == "f" || event.text == "F" {
+                root.full-screen = !root.full-screen;
+                return accept;
             }
-
-            // --- overlay: top-right "Fly To" ---
-            Rectangle {
-                x: parent.width - self.width - 12px;
-                y: 12px;
-                width: 220px;
-                height: 32px;
-                background: #0d0f13cc;
-                border-radius: 6px;
-
-                ComboBox {
-                    width: 100%;
-                    height: 100%;
-                    model: root.places;
-                    current-index <=> root.place-index;
-                    selected => {
-                        root.place-selected(self.current-index);
-                    }
-                }
-            }
-
-            // --- overlay: bottom-left status line ---
-            Rectangle {
-                x: 12px;
-                y: parent.height - self.height - 12px;
-                width: status-text.preferred-width + 16px;
-                height: status-text.preferred-height + 8px;
-                background: #0d0f13cc;
-                border-radius: 4px;
-
-                status-text := Text {
-                    text: root.status;
-                    color: #cdd4de;
-                    font-size: 11px;
-                }
-            }
-
-            // --- overlay: about panel ---
-            if root.about-open: Rectangle {
-                x: 12px;
-                y: 56px;
-                width: min(520px, parent.width - 24px);
-                height: about-text.preferred-height + 32px;
-                background: #0d0f13e6;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #2c313b;
-
-                about-text := Text {
-                    x: 16px;
-                    y: 16px;
-                    width: parent.width - 32px;
-                    wrap: word-wrap;
-                    color: #dfe4ec;
-                    font-size: 12px;
-                    text: "OpenStreetMap Sound Demo — native rebuild with MapLibre Native + Slint + rodio.\n\n"
-                        + "Map data © OpenStreetMap contributors, tiles by tile.openstreetmap.jp (© OpenMapTiles).\n"
-                        + "All music by Otherman Records (CC BY-NC 2.1 JP).\n"
-                        + "Original sound example by Mapbox (dancing buildings).\n"
-                        + "Developed by Taro Matsuzawa (smellman).\n\n"
-                        + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
-                        + "A drops, B orbits, D-pad picks track and release, L2/R2 set volume.";
-                }
-            }
+            return reject;
         }
 
-        // --- bottom transport bar ---
-        Rectangle {
-            height: 64px;
-            background: #1e2128;
+        VerticalLayout {
+            Rectangle {
+                vertical-stretch: 1;
 
-            HorizontalBox {
-                padding: 8px;
-                spacing: 8px;
-                alignment: stretch;
-
-                Button {
-                    width: 44px;
-                    text: "◀◀";
-                    enabled: root.has-release;
-                    clicked => {
-                        root.prev-track();
+                VerticalLayout {
+                    map := MMapView {
+                        style-url: "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
+                        center-lat: 35.680655;
+                        center-lon: 139.767165;
+                        zoom: 16;
+                        pitch: 60;
                     }
                 }
 
-                Button {
-                    width: 44px;
-                    text: root.playing ? "■" : "▶";
-                    enabled: root.has-release && !root.busy;
-                    clicked => {
-                        root.toggle-play();
-                    }
-                }
-
-                Button {
-                    width: 44px;
-                    text: "▶▶";
-                    enabled: root.has-release;
-                    clicked => {
-                        root.next-track();
-                    }
-                }
-
-                Text {
-                    text: "Vol";
-                    color: #b9c0cc;
-                    vertical-alignment: center;
-                }
-
-                Slider {
-                    width: 96px;
-                    minimum: 0;
-                    maximum: 100;
-                    value <=> root.volume;
-                    changed value => {
-                        root.volume-changed(self.value / 100);
-                    }
-                }
-
+                // --- overlay: top-left "About" ---
+                // The overlays sit on the map, whose brightness varies with the
+                // style and the animation, so each gets its own dark backing.
                 Rectangle {
-                    horizontal-stretch: 2;
-                    background: #0d0f13;
+                    x: 12px;
+                    y: 12px;
+                    width: 88px;
+                    height: 32px;
+                    background: #0d0f13cc;
+                    border-radius: 6px;
+
+                    Button {
+                        width: 100%;
+                        height: 100%;
+                        text: "About";
+                        clicked => {
+                            root.about-open = !root.about-open;
+                        }
+                    }
+                }
+
+                // --- overlay: top-right "Fly To" ---
+                Rectangle {
+                    x: parent.width - self.width - 12px;
+                    y: 12px;
+                    width: 220px;
+                    height: 32px;
+                    background: #0d0f13cc;
+                    border-radius: 6px;
+
+                    ComboBox {
+                        width: 100%;
+                        height: 100%;
+                        model: root.places;
+                        current-index <=> root.place-index;
+                        selected => {
+                            root.place-selected(self.current-index);
+                        }
+                    }
+                }
+
+                // --- overlay: bottom-left status line ---
+                Rectangle {
+                    x: 12px;
+                    y: parent.height - self.height - 12px;
+                    width: status-text.preferred-width + 16px;
+                    height: status-text.preferred-height + 8px;
+                    background: #0d0f13cc;
                     border-radius: 4px;
 
+                    status-text := Text {
+                        text: root.status;
+                        color: #cdd4de;
+                        font-size: 11px;
+                    }
+                }
+
+                // --- overlay: about panel ---
+                if root.about-open: Rectangle {
+                    x: 12px;
+                    y: 56px;
+                    width: min(520px, parent.width - 24px);
+                    height: about-text.preferred-height + 32px;
+                    background: #0d0f13e6;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #2c313b;
+
+                    about-text := Text {
+                        x: 16px;
+                        y: 16px;
+                        width: parent.width - 32px;
+                        wrap: word-wrap;
+                        color: #dfe4ec;
+                        font-size: 12px;
+                        text: "OpenStreetMap Sound Demo — native rebuild with MapLibre Native + Slint + rodio.\n\n"
+                            + "Map data © OpenStreetMap contributors, tiles by tile.openstreetmap.jp (© OpenMapTiles).\n"
+                            + "All music by Otherman Records (CC BY-NC 2.1 JP).\n"
+                            + "Original sound example by Mapbox (dancing buildings).\n"
+                            + "Developed by Taro Matsuzawa (smellman).\n\n"
+                            + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
+                            + "A drops, B orbits, D-pad picks track and release, L2/R2 set volume.\n"
+                            + "Escape leaves full screen, F toggles it.";
+                    }
+                }
+            }
+
+            // --- bottom transport bar ---
+            Rectangle {
+                height: 64px;
+                background: #1e2128;
+
+                HorizontalBox {
+                    padding: 8px;
+                    spacing: 8px;
+                    alignment: stretch;
+
+                    Button {
+                        width: 44px;
+                        text: "◀◀";
+                        enabled: root.has-release;
+                        clicked => {
+                            root.prev-track();
+                        }
+                    }
+
+                    Button {
+                        width: 44px;
+                        text: root.playing ? "■" : "▶";
+                        enabled: root.has-release && !root.busy;
+                        clicked => {
+                            root.toggle-play();
+                        }
+                    }
+
+                    Button {
+                        width: 44px;
+                        text: "▶▶";
+                        enabled: root.has-release;
+                        clicked => {
+                            root.next-track();
+                        }
+                    }
+
                     Text {
-                        x: 8px;
-                        width: parent.width - 16px;
-                        height: 100%;
-                        text: root.busy ? "Loading… " + root.track-title : root.track-title;
-                        color: #e8ecf3;
-                        overflow: elide;
+                        text: "Vol";
+                        color: #b9c0cc;
                         vertical-alignment: center;
                     }
-                }
 
-                ComboBox {
-                    horizontal-stretch: 3;
-                    model: root.releases;
-                    current-index <=> root.release-index;
-                    selected => {
-                        root.release-selected(self.current-index);
+                    Slider {
+                        width: 96px;
+                        minimum: 0;
+                        maximum: 100;
+                        value <=> root.volume;
+                        changed value => {
+                            root.volume-changed(self.value / 100);
+                        }
                     }
-                }
 
-                Button {
-                    text: "Go To Release";
-                    enabled: root.has-release;
-                    clicked => {
-                        root.open-release();
+                    Rectangle {
+                        horizontal-stretch: 2;
+                        background: #0d0f13;
+                        border-radius: 4px;
+
+                        Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            height: 100%;
+                            text: root.busy ? "Loading… " + root.track-title : root.track-title;
+                            color: #e8ecf3;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    ComboBox {
+                        horizontal-stretch: 3;
+                        model: root.releases;
+                        current-index <=> root.release-index;
+                        selected => {
+                            root.release-selected(self.current-index);
+                        }
+                    }
+
+                    Button {
+                        text: "Go To Release";
+                        enabled: root.has-release;
+                        clicked => {
+                            root.open-release();
+                        }
                     }
                 }
             }
