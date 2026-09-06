@@ -138,6 +138,7 @@ does not expose. The fork adds a backend on GameController.framework instead, pe
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me, answering without the network |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
+| `OSM_SOUND_DEMO_PREFETCH` | Override MapLibre Native's `prefetch_zoom_delta`; `0` turns prefetching off. Unset by default, and measuring says leave it that way — see [Tile prefetching](#tile-prefetching) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
@@ -322,6 +323,35 @@ Things that turned out not to be the problem, in case they look tempting: turnin
 MapLibre Native's run loop more times per pass (worse — 21 fps at one turn, 6 at eight,
 3 at thirty-two), and dropping frames at the render-thread channel (never happened;
 `OSM_SOUND_DEMO_FPS` shows `shown` and `rendered` matching).
+
+
+### Tile prefetching
+
+`prefetch_zoom_delta` is how many zoom levels above the current one MapLibre Native may
+pull a coarse parent tile from, so there is something to draw over ground whose own tile
+has not arrived. It only fires while the map is moving, and only in `Continuous` mode.
+
+The app does not set it. That is a measured decision rather than an oversight: the default
+of 4 beat both alternatives. `report_prefetch_effect` jumps between six cities with a
+cleared cache and reads how much of the frame is not flat background after 1.2 s at each,
+which is what prefetching is supposed to improve:
+
+| `OSM_SOUND_DEMO_PREFETCH` | filled | fps |
+| --- | --- | --- |
+| 0 (off) | 42.8%, 34.9%, 50.4% | 320, 374, 282 |
+| unset (MapLibre Native's 4) | 51.2%, 52.6%, 52.6% | 283, 239, 248 |
+| 8 | 21.5% | 1199 |
+
+Three runs each at 1280x800 on Metal. The default is not only better but steady, where
+turning prefetching off swings between 35% and 50% depending on which tiles happen to
+arrive first. The higher frame rate at `0` and `8` is not a win — it is the map drawing
+less, and at `8` drawing almost nothing: asking for zoom-8 tiles under a zoom-16 camera
+floods the connection and starves the tiles actually being looked at.
+
+`set_tile_options` also carries the LOD controls (`lod_min_radius`, `lod_scale`,
+`lod_pitch_threshold`, `lod_zoom_shift`, `lod_mode`). Those go untested here; at a pitch of
+85° the horizon covers a lot of distant tiles, so they are the next thing to measure if
+this ever needs more frame rate.
 
 
 ### Differences from the web demo

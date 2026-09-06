@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use maplibre_native_ffi::{
     AnimationOptions, BoundOptions, CameraOptions, LatLng, MapHandle, MapMode, MapOptions,
-    NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
-    RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
+    MapTileOptions, NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask,
+    RuntimeEventPayload, RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
 #[cfg(feature = "opengl")]
 use maplibre_native_ffi::{
@@ -61,6 +61,20 @@ const ATTRIBUTION_ATTEMPTS: u32 = 600;
 /// The buildings' colour. Flat, as the web demo's was: the style's light is
 /// what tints the scene with the music.
 const BUILDING_COLOR: &str = "#aaa";
+
+/// How many zoom levels above the current one MapLibre Native may fetch a
+/// coarse parent tile from, to cover ground that has no tile yet.
+///
+/// `OSM_SOUND_DEMO_PREFETCH` overrides it; `0` turns prefetching off, which is
+/// how to A/B what it costs. `None` leaves MapLibre Native's own default alone.
+fn prefetch_zoom_delta() -> Option<u32> {
+    static DELTA: OnceLock<Option<u32>> = OnceLock::new();
+    *DELTA.get_or_init(|| {
+        std::env::var("OSM_SOUND_DEMO_PREFETCH")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    })
+}
 
 /// The pitch the map opens at, matching the web demo.
 const DEFAULT_PITCH: f64 = 70.0;
@@ -935,6 +949,14 @@ impl Engine {
         bounds.max_pitch = Some(MAX_PITCH);
         if let Err(error) = map.set_bounds(&bounds) {
             eprintln!("raising the pitch bound failed: {error}");
+        }
+        if let Some(prefetch_zoom_delta) = prefetch_zoom_delta() {
+            // Non-exhaustive, so the fields are filled in rather than named.
+            let mut options = MapTileOptions::default();
+            options.prefetch_zoom_delta = Some(prefetch_zoom_delta);
+            if let Err(error) = map.set_tile_options(&options) {
+                eprintln!("setting the tile options failed: {error}");
+            }
         }
         if let Err(error) = map.set_style_url(&self.style_url) {
             eprintln!("style load failed: {error}");
@@ -2181,6 +2203,112 @@ mod tests {
             ratio > 0.05,
             "raising every band barely changed the image ({ratio})"
         );
+    }
+
+    /// What `prefetch_zoom_delta` buys and what it costs.
+    ///
+    /// The frame-rate probe below holds the camera in one place, so the tile
+    /// cover never changes and prefetching never happens: it only fires when
+    /// the map moves, requesting a coarse parent tile so there is something to
+    /// draw over ground whose own tile has not arrived. So this one moves.
+    ///
+    /// Two numbers per setting. `filled` is the fraction of the frame that is
+    /// not the style's flat background, sampled shortly after each jump — that
+    /// is what prefetching is for. `fps` is what it costs to render the extra
+    /// tiles. Run with a cleared cache, or the second setting measures the
+    /// first one's downloads:
+    ///
+    /// ```text
+    /// rm -f "$TMPDIR/osm-sound-demo-slint-tiles.sqlite"
+    /// OSM_SOUND_DEMO_RENDERER_TESTS=1 OSM_SOUND_DEMO_PREFETCH=0 \
+    ///   cargo test --release --features metal report_prefetch_effect -- --nocapture
+    /// ```
+    #[test]
+    fn report_prefetch_effect() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        // Far enough apart that no jump reuses the last one's tiles.
+        const JUMPS: [(f64, f64); 6] = [
+            (139.767165, 35.680655),
+            (135.4975879, 34.7034131),
+            (141.35079, 43.06868),
+            (130.4017509, 33.5898988),
+            (132.455486, 34.394377),
+            (140.883518, 38.260128),
+        ];
+        /// How long each location gets before its coverage is read. Short on
+        /// purpose: given long enough every setting ends up fully drawn, and
+        /// the question is what is on screen while the tiles are still coming.
+        const DWELL: Duration = Duration::from_millis(1200);
+
+        let size = probe_size();
+        let mut engine = Engine::new(size);
+        let warm_up = Instant::now();
+        while warm_up.elapsed() < SETTLE_DEADLINE {
+            engine.pump(Some(SETTLE_PUMP));
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
+
+        let mut frames = 0u32;
+        let mut filled = Vec::new();
+        let measured = Instant::now();
+        for (index, (lon, lat)) in JUMPS.iter().enumerate() {
+            engine.apply(Command::Camera(MapCamera {
+                lon: *lon,
+                lat: *lat,
+                // Spun as the demo spins it, so the cover keeps changing rather
+                // than settling the moment the jump lands.
+                bearing: f64::from(index as u32) * 40.0,
+                ..MapCamera::default()
+            }));
+
+            let dwell = Instant::now();
+            let mut last = None;
+            while dwell.elapsed() < DWELL {
+                engine.pump(Some(PUMP_BUDGET));
+                engine.mark_dirty();
+                if let Some(frame) = engine.render() {
+                    frames += 1;
+                    last = Some(frame);
+                }
+            }
+            let frame = last.expect("a frame at every location");
+            filled.push(background_fraction(&frame.rgba));
+        }
+
+        let seconds = measured.elapsed().as_secs_f64();
+        let mean = filled.iter().sum::<f64>() / filled.len() as f64;
+        eprintln!(
+            "{}x{} prefetch={} — filled: {:.1}% (per jump: {}), {:.1} fps",
+            size.0,
+            size.1,
+            prefetch_zoom_delta().map_or("default".to_owned(), |delta| delta.to_string()),
+            mean * 100.0,
+            filled
+                .iter()
+                .map(|value| format!("{:.0}%", value * 100.0))
+                .collect::<Vec<_>>()
+                .join(" "),
+            f64::from(frames) / seconds,
+        );
+    }
+
+    /// The fraction of a frame that is not the style's flat background.
+    ///
+    /// The toner style paints white behind everything, so ground with no tile
+    /// yet stays white while ground with one picks up roads and buildings.
+    fn background_fraction(rgba: &[u8]) -> f64 {
+        let pixels = rgba.as_chunks::<4>().0;
+        if pixels.is_empty() {
+            return 0.0;
+        }
+        let drawn = pixels
+            .iter()
+            .filter(|pixel| pixel[0] < 240 || pixel[1] < 240 || pixel[2] < 240)
+            .count();
+        drawn as f64 / pixels.len() as f64
     }
 
     /// Opt-in timing probe for the render path the app actually uses.
