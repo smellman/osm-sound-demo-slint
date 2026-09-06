@@ -118,12 +118,12 @@ second a device that is not already in the developer account is refused rather t
 registered. On a free personal team the installed app stops launching after seven days,
 and building again is what renews it.
 
-Two things do not carry over to a device. The About overlay's link opens through `open`,
-which iOS has neither the binary nor the process spawning for — it needs `UIApplication`.
-And gamepads are out: `gilrs` reports "gamepad input is not supported on this platform"
-there, so the pad bindings below do nothing and the keyboard ones need a hardware keyboard.
-Touch drives the map, and VJ mode works because `NSMicrophoneUsageDescription` is in the
-generated `Info.plist` — without it iOS kills the app the moment it starts listening.
+One thing does not carry over to a device: gamepads. `gilrs` reports "gamepad input is not
+supported on this platform" there, so the pad bindings below do nothing and the keyboard
+ones need a hardware keyboard. Touch drives the map, links open in Safari through
+`UIApplication` rather than `open`, and VJ mode works because
+`NSMicrophoneUsageDescription` is in the generated `Info.plist` — without it iOS kills the
+app the moment it starts listening.
 
 ### Environment
 

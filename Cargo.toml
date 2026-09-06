@@ -56,6 +56,12 @@ objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
 # it; see the `session` module in src/audio.rs.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-avf-audio = { version = "0.3", features = ["AVAudioSession", "AVAudioSessionTypes"] }
+# Handing a URL to Safari, which on iOS is UIKit's job rather than a subprocess'.
+objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIResponder", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSDictionary"] }
+# UIKit is on objc2 0.6 while objc2-metal 0.2 pins 0.5, so rather than disturb
+# the renderer the two majors sit side by side under different names.
+objc2-v06 = { package = "objc2", version = "0.6" }
 
 [build-dependencies]
 slint-build = "1.16"
