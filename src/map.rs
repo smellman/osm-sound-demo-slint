@@ -17,6 +17,12 @@ pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
     let adapter = ui.global::<MapAdapter>();
 
     let frame = map.take_frame();
+    // Every frame carries it, so only touch the property when it changes.
+    if let Some(attribution) = frame.as_ref().and_then(|frame| frame.attribution.as_ref())
+        && ui.get_attribution() != attribution.as_str()
+    {
+        ui.set_attribution(attribution.into());
+    }
     if let Some(frame) = &frame {
         let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
             &frame.rgba,

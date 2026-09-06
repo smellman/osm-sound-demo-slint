@@ -54,6 +54,10 @@ fn default_style_url() -> String {
         .unwrap_or_else(|| DEFAULT_STYLE_URL.to_owned())
 }
 
+/// How many frames to keep looking for an attribution before accepting that
+/// the style has none. A source reports one once its TileJSON has arrived.
+const ATTRIBUTION_ATTEMPTS: u32 = 600;
+
 /// The buildings' colour. Flat, as the web demo's was: the style's light is
 /// what tints the scene with the music.
 const BUILDING_COLOR: &str = "#aaa";
@@ -144,6 +148,9 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// The style's attribution, once its sources have reported one. Sent on
+    /// the frame it changes and `None` on every other.
+    pub attribution: Option<String>,
     /// The map's own camera, reported while it is flying so the UI can follow.
     pub camera: Option<MapCamera>,
     /// Whether a fly-to is still in the air.
@@ -561,6 +568,11 @@ struct Engine {
     /// Report the camera with the next frame even though nothing is flying,
     /// so the UI picks up where a flight ended.
     report_camera: bool,
+    /// What the style's sources say has to be credited, and whether the UI has
+    /// been told. A source carries this in its TileJSON, which arrives after
+    /// the style itself, so it is looked for until it turns up.
+    attribution: Option<String>,
+    attribution_attempts: u32,
     /// Something the UI asked for has not been drawn yet.
     dirty: bool,
     /// MapLibre Native says it has more to draw — tiles still arriving, or a
@@ -600,6 +612,8 @@ impl Engine {
             last_flight: None,
             pending_fly: None,
             report_camera: false,
+            attribution: None,
+            attribution_attempts: 0,
             dirty: true,
             wants_repaint: false,
             pixels: Vec::new(),
@@ -639,6 +653,8 @@ impl Engine {
                         attached.layers = false;
                         attached.style_loaded = false;
                         self.applied_light = None;
+                        self.attribution = None;
+                        self.attribution_attempts = 0;
                     }
                     self.applied = [None; BINS];
                     self.mark_dirty();
@@ -746,6 +762,7 @@ impl Engine {
             }
         }
         self.wants_repaint = wants_repaint;
+        self.collect_attribution();
         if landed {
             self.flight_id = None;
             // Take the camera the flight ended on before `jump_to` resumes:
@@ -772,6 +789,10 @@ impl Engine {
         self.ensure_map()?;
         self.sync_bands();
         self.sync_light();
+        // Carried on every frame rather than announced once: a frame is allowed
+        // to be dropped or superseded, and a one-shot riding on one that was
+        // would be lost for good.
+        let attribution = self.attribution.clone();
 
         if let Some((camera, duration_ms, id)) = self.pending_fly.take() {
             let mut animation = AnimationOptions::default();
@@ -862,6 +883,7 @@ impl Engine {
             width,
             height,
             rgba: self.pixels.clone(),
+            attribution,
             camera,
             flying,
             flight: self.last_flight,
@@ -1022,6 +1044,47 @@ impl Engine {
                 self.applied_light = Some(self.light);
             }
         }
+    }
+
+    /// Collects what the style's sources say has to be credited.
+    ///
+    /// A source's attribution comes from its TileJSON, which is fetched after
+    /// the style, so this keeps looking for a while rather than asking once.
+    /// It runs from `pump` rather than `render` because a settled map stops
+    /// drawing, and the attribution usually arrives after that — finding one
+    /// asks for a frame to carry it.
+    fn collect_attribution(&mut self) {
+        if self.attribution.is_some() || self.attribution_attempts >= ATTRIBUTION_ATTEMPTS {
+            return;
+        }
+        let Some(attached) = self.map.as_ref() else {
+            return;
+        };
+        if !attached.style_loaded {
+            return;
+        }
+        self.attribution_attempts += 1;
+
+        let ids = attached.map.style_source_ids().unwrap_or_default();
+        let mut credits: Vec<String> = Vec::new();
+        for id in ids {
+            let Ok(Some(info)) = attached.map.style_source_info(&id) else {
+                continue;
+            };
+            let Some(attribution) = info.attribution else {
+                continue;
+            };
+            let text = attribution_text(&attribution);
+            if !text.is_empty() && !credits.contains(&text) {
+                credits.push(text);
+            }
+        }
+        if credits.is_empty() {
+            return;
+        }
+        self.attribution = Some(credits.join(" · "));
+        // Nothing else may be pending, and a frame is what carries it.
+        self.mark_dirty();
     }
 
     /// Closes the map and runtime in order, so the tile cache is flushed rather
@@ -1611,6 +1674,55 @@ fn frame_ends_flight(frame_flight: Option<u64>, frame_flying: bool, waiting_for:
     !frame_flying && frame_flight == Some(waiting_for)
 }
 
+/// Plain text from an attribution, which the style spec allows to be HTML.
+///
+/// Slint has no rich text to hand here, and a link is no use on a backdrop
+/// nobody clicks, so the markup is dropped and the words kept.
+fn attribution_text(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut entity: Option<String> = None;
+    for character in html.chars() {
+        match (in_tag, &mut entity, character) {
+            (false, _, '<') => in_tag = true,
+            (true, _, '>') => in_tag = false,
+            (true, _, _) => {}
+            (false, slot @ None, '&') => *slot = Some(String::new()),
+            (false, Some(name), ';') => {
+                text.push_str(&decode_entity(name));
+                entity = None;
+            }
+            // An unterminated entity is just text after all.
+            (false, Some(name), _) if name.len() > 8 => {
+                text.push('&');
+                text.push_str(name);
+                text.push(character);
+                entity = None;
+            }
+            (false, Some(name), _) => name.push(character),
+            (false, None, _) => text.push(character),
+        }
+    }
+    if let Some(name) = entity {
+        text.push('&');
+        text.push_str(&name);
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_entity(name: &str) -> String {
+    match name {
+        "copy" => "©".to_owned(),
+        "amp" => "&".to_owned(),
+        "lt" => "<".to_owned(),
+        "gt" => ">".to_owned(),
+        "quot" => "\"".to_owned(),
+        "apos" | "#39" => "'".to_owned(),
+        "nbsp" => " ".to_owned(),
+        other => format!("&{other};"),
+    }
+}
+
 /// The camera as MapLibre Native's FFI wants it.
 fn camera_options(camera: MapCamera) -> CameraOptions {
     let mut options = CameraOptions::default();
@@ -1684,6 +1796,38 @@ mod tests {
         let mut controller = CameraController::default();
         controller.jump_for_test(lon, lat, zoom);
         controller
+    }
+
+    #[test]
+    fn attribution_html_becomes_plain_text() {
+        // What tile.openstreetmap.jp's TileJSON actually carries.
+        let html = "<a href=\"https://www.openmaptiles.org/\" target=\"_blank\">\
+                    &copy; OpenMapTiles</a> \
+                    <a href=\"https://www.openstreetmap.org/copyright\" target=\"_blank\">\
+                    &copy; OpenStreetMap contributors</a>";
+        assert_eq!(
+            attribution_text(html),
+            "© OpenMapTiles © OpenStreetMap contributors"
+        );
+    }
+
+    #[test]
+    fn attribution_text_survives_awkward_markup() {
+        // Plain text passes through, and whitespace is collapsed.
+        assert_eq!(attribution_text("  © Someone   Else  "), "© Someone Else");
+        // The entities the spec's examples use.
+        assert_eq!(
+            attribution_text("&copy; A &amp; B &lt;tag&gt; &quot;q&quot;"),
+            "© A & B <tag> \"q\""
+        );
+        // An unknown entity is left alone rather than swallowed.
+        assert_eq!(attribution_text("&reg; Thing"), "&reg; Thing");
+        // A stray ampersand is text, not the start of anything.
+        assert_eq!(attribution_text("Rock & Roll Maps"), "Rock & Roll Maps");
+        // An unterminated entity at the end is text too.
+        assert_eq!(attribution_text("Maps &copy"), "Maps &copy");
+        assert_eq!(attribution_text(""), "");
+        assert_eq!(attribution_text("<a href=\"#\"></a>"), "");
     }
 
     #[test]

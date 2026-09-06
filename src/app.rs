@@ -871,9 +871,17 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 .is_some_and(|(_, posted)| posted.elapsed() < NOTICE_LINGER);
             if !fresh {
                 state.notice = None;
+                // The style's sources have to be credited, and this line is
+                // the only text the map carries.
+                let attribution = ui.get_attribution();
+                let credit = if attribution.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {attribution}")
+                };
                 ui.set_status(
                     format!(
-                        "{:.4}, {:.4} · z{:.1}{rate} · {input}",
+                        "{:.4}, {:.4} · z{:.1}{rate} · {input}{credit}",
                         camera.lon, camera.lat, camera.zoom
                     )
                     .into(),
