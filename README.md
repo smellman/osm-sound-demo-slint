@@ -150,6 +150,19 @@ The window opens **full screen**: this is something to stand in front of and dri
 gamepad, not a window to keep alongside other work. A full-screen window has no title bar,
 so **Escape** leaves full screen, **F** toggles it, and **Q** quits.
 
+The four face-button effects are on the keyboard as well, as a diamond under the right
+hand that matches the one on the pad rather than the buttons' letters:
+
+```
+      I          Y — switch the colouring
+    J   L        X — switch how finely the skyline is cut  /  B — the orbit
+      K          A — the drop
+```
+
+The shape is what carries over, so a hand that knows the pad knows these. Both routes go
+through one mapping — `the_keyboard_and_the_pad_agree_on_the_face_buttons` checks the keys
+against the pad's own bindings rather than against a second copy of the answer.
+
 Q, Cmd+Q and the close button all shut down the same way: playback stops, any download
 still in flight is abandoned, and the render thread is waited for so MapLibre Native closes
 its tile cache properly rather than being cut off mid-write.
@@ -163,6 +176,7 @@ its tile cache properly rather than being cut off mid-write.
 | Double-click | Zoom in |
 | Escape / F | Leave full screen / toggle it |
 | Q | Quit |
+| I / J / K / L | The pad's Y / X / A / B, laid out as they sit on the pad |
 | Fly To | Fly to one of twelve cities |
 | Locate Me | Fly to where this machine appears to be |
 | VJ Mode | Follow an input device instead of a track |

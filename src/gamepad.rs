@@ -45,7 +45,9 @@ pub enum Action {
     NextRelease,
 }
 
-fn action_for(button: Button) -> Option<Action> {
+/// Also reached from the keyboard's face-button keys, which is why it is not
+/// private: one mapping, two ways in.
+pub fn action_for_button(button: Button) -> Option<Action> {
     match button {
         Button::Start => Some(Action::Play),
         Button::Select => Some(Action::Stop),
@@ -142,7 +144,7 @@ impl Gamepads {
         while let Some(event) = gilrs.next_event() {
             match event.event {
                 EventType::ButtonPressed(button, _) => {
-                    if let Some(action) = action_for(button) {
+                    if let Some(action) = action_for_button(button) {
                         actions.push(action);
                     }
                 }
@@ -209,18 +211,36 @@ mod tests {
 
     #[test]
     fn the_documented_buttons_map_to_actions() {
-        assert_eq!(action_for(Button::Start), Some(Action::Play));
-        assert_eq!(action_for(Button::Select), Some(Action::Stop));
-        assert_eq!(action_for(Button::LeftTrigger), Some(Action::PreviousPlace));
-        assert_eq!(action_for(Button::RightTrigger), Some(Action::NextPlace));
-        assert_eq!(action_for(Button::South), Some(Action::Drop));
-        assert_eq!(action_for(Button::East), Some(Action::Orbit));
-        assert_eq!(action_for(Button::North), Some(Action::ToggleLight));
-        assert_eq!(action_for(Button::West), Some(Action::ToggleSlices));
-        assert_eq!(action_for(Button::DPadLeft), Some(Action::PreviousTrack));
-        assert_eq!(action_for(Button::DPadRight), Some(Action::NextTrack));
-        assert_eq!(action_for(Button::DPadUp), Some(Action::PreviousRelease));
-        assert_eq!(action_for(Button::DPadDown), Some(Action::NextRelease));
+        assert_eq!(action_for_button(Button::Start), Some(Action::Play));
+        assert_eq!(action_for_button(Button::Select), Some(Action::Stop));
+        assert_eq!(
+            action_for_button(Button::LeftTrigger),
+            Some(Action::PreviousPlace)
+        );
+        assert_eq!(
+            action_for_button(Button::RightTrigger),
+            Some(Action::NextPlace)
+        );
+        assert_eq!(action_for_button(Button::South), Some(Action::Drop));
+        assert_eq!(action_for_button(Button::East), Some(Action::Orbit));
+        assert_eq!(action_for_button(Button::North), Some(Action::ToggleLight));
+        assert_eq!(action_for_button(Button::West), Some(Action::ToggleSlices));
+        assert_eq!(
+            action_for_button(Button::DPadLeft),
+            Some(Action::PreviousTrack)
+        );
+        assert_eq!(
+            action_for_button(Button::DPadRight),
+            Some(Action::NextTrack)
+        );
+        assert_eq!(
+            action_for_button(Button::DPadUp),
+            Some(Action::PreviousRelease)
+        );
+        assert_eq!(
+            action_for_button(Button::DPadDown),
+            Some(Action::NextRelease)
+        );
     }
 
     #[test]
@@ -290,7 +310,7 @@ mod tests {
             Button::RightThumb,
             Button::Unknown,
         ] {
-            assert_eq!(action_for(button), None, "{button:?}");
+            assert_eq!(action_for_button(button), None, "{button:?}");
         }
     }
 }

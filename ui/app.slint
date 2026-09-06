@@ -172,6 +172,8 @@ export component AppWindow inherits Window {
     callback open-project();
     callback locate-me();
     callback toggle-vj();
+    // One of "a", "b", "x", "y" — the gamepad's face buttons, from the keyboard.
+    callback face-button(/* button */ string);
     callback quit();
 
     property <bool> about-open: false;
@@ -188,6 +190,26 @@ export component AppWindow inherits Window {
             }
             if event.text == "q" || event.text == "Q" {
                 root.quit();
+                return accept;
+            }
+            // The pad's face buttons, laid out the way they sit on the pad
+            // rather than by their letters: I on top for Y, K below it for A,
+            // J and L either side for X and B. The shape is what carries over,
+            // so a hand that knows the pad knows these.
+            if event.text == "i" || event.text == "I" {
+                root.face-button("y");
+                return accept;
+            }
+            if event.text == "k" || event.text == "K" {
+                root.face-button("a");
+                return accept;
+            }
+            if event.text == "j" || event.text == "J" {
+                root.face-button("x");
+                return accept;
+            }
+            if event.text == "l" || event.text == "L" {
+                root.face-button("b");
                 return accept;
             }
             return reject;
@@ -320,7 +342,8 @@ export component AppWindow inherits Window {
                             + "A drops, B orbits, X cuts the skyline finer, Y switches the colouring, "
                             + "D-pad picks track and release, "
                             + "L2/R2 set volume.\n"
-                            + "Escape leaves full screen, F toggles it, Q quits.\n\n"
+                            + "Escape leaves full screen, F toggles it, Q quits. "
+                            + "I/J/K/L are the pad's Y/X/A/B, laid out as they sit on the pad.\n\n"
                             + "VJ mode drives the map from whatever the input device hears instead of "
                             + "from a track, so it follows a live mix. Route the sound you are playing "
                             + "into an input first: Loopback.app on macOS, Helvum with PipeWire on Linux. "

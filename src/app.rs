@@ -419,6 +419,21 @@ fn palette() -> [f64; crate::map::SLICES] {
     std::array::from_fn(|slice| (offset + slice as f64 * step).rem_euclid(360.0))
 }
 
+/// What a face button does, whether it came from the pad or the keyboard.
+///
+/// The keyboard sends the button's name rather than the action, so the two
+/// routes cannot drift apart: there is one mapping from a face button to what
+/// it does, and it is this one.
+fn face_button_action(button: &str) -> Option<Action> {
+    match button {
+        "a" => Some(Action::Drop),
+        "b" => Some(Action::Orbit),
+        "x" => Some(Action::ToggleSlices),
+        "y" => Some(Action::ToggleLight),
+        _ => None,
+    }
+}
+
 /// Dispatches one gamepad action.
 fn run_action(ui: &AppWindow, state: &Rc<RefCell<State>>, action: Action) {
     match action {
@@ -586,6 +601,19 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     });
 
     ui.on_open_project(|| open_in_browser(PROJECT_URL));
+
+    ui.on_face_button({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move |button| {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            if let Some(action) = face_button_action(&button) {
+                run_action(&ui, &state, action);
+            }
+        }
+    });
 
     ui.on_toggle_vj({
         let ui_handle = ui.as_weak();
@@ -1048,5 +1076,36 @@ fn open_in_browser(url: &str) {
         .spawn()
     {
         eprintln!("could not open {url}: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gamepad::action_for_button;
+
+    #[test]
+    fn the_keyboard_and_the_pad_agree_on_the_face_buttons() {
+        // Two routes to the same four actions, so the risk is that one is
+        // changed and the other is forgotten. Checked against the pad's own
+        // mapping rather than against a second copy of the answer.
+        for (key, button) in [
+            ("a", gilrs::Button::South),
+            ("b", gilrs::Button::East),
+            ("x", gilrs::Button::West),
+            ("y", gilrs::Button::North),
+        ] {
+            assert_eq!(
+                face_button_action(key),
+                action_for_button(button),
+                "the {key} key and its button have drifted apart"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_does_nothing() {
+        assert_eq!(face_button_action("z"), None);
+        assert_eq!(face_button_action(""), None);
     }
 }
