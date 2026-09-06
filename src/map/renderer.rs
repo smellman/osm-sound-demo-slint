@@ -26,9 +26,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use maplibre_native_ffi::{
-    CameraOptions, LatLng, MapHandle, MapMode, MapOptions, NativePointer, RenderSessionHandle,
-    RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload, RuntimeEventSource,
-    RuntimeEventType, RuntimeHandle, RuntimeOptions,
+    BoundOptions, CameraOptions, LatLng, MapHandle, MapMode, MapOptions, NativePointer,
+    RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
+    RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
 #[cfg(target_os = "macos")]
 use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
@@ -49,6 +49,13 @@ fn default_style_url() -> String {
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| DEFAULT_STYLE_URL.to_owned())
 }
+
+/// The buildings' colour. Flat, as the web demo's was: the style's light is
+/// what tints the scene with the music.
+const BUILDING_COLOR: &str = "#aaa";
+
+/// The pitch the map opens at, matching the web demo.
+const DEFAULT_PITCH: f64 = 70.0;
 
 /// Vector source and source-layer holding building footprints in the
 /// OpenMapTiles schema used by tile.openstreetmap.jp.
@@ -76,9 +83,10 @@ const PUMP_BUDGET: Duration = Duration::from_millis(2);
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
 const MIN_PITCH: f64 = 0.0;
-/// MapLibre Native clamps the camera at 60°, so the web demo's 70° is not
-/// reachable here.
-const MAX_PITCH: f64 = 60.0;
+/// The web demo allowed up to 85°. MapLibre Native clamps at 60 unless the
+/// bound is raised first, which `Engine::ensure_map` does — asking for more
+/// without that silently gives 60 back.
+const MAX_PITCH: f64 = 85.0;
 const MAX_ABS_LAT: f64 = 85.0;
 const WHEEL_STEP: f64 = 0.5;
 const DOUBLE_CLICK_STEP: f64 = 1.0;
@@ -115,36 +123,22 @@ impl Default for MapCamera {
             lon: 139.767165,
             zoom: 16.0,
             bearing: 0.0,
-            pitch: MAX_PITCH,
+            pitch: DEFAULT_PITCH,
         }
     }
 }
 
-/// One frequency band's contribution to the skyline.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One frequency band's contribution to the skyline. Only the height: the
+/// colour comes from the style's light, which follows the music too.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Band {
     /// Extrusion height in metres.
     pub height: f64,
-    /// Hue in degrees.
-    pub hue: f64,
-    /// Normalized band level, driving saturation and lightness.
-    pub level: f64,
-}
-
-impl Default for Band {
-    fn default() -> Self {
-        Self {
-            height: 0.0,
-            hue: 0.0,
-            level: 0.0,
-        }
-    }
 }
 
 impl Band {
     fn close_to(self, other: Self) -> bool {
         (self.height - other.height).abs() < HEIGHT_EPSILON
-            && (self.hue - other.hue).abs() < HUE_EPSILON
     }
 }
 
@@ -160,6 +154,27 @@ enum Command {
     Style(String),
     Camera(MapCamera),
     Bands(Box<[Band; BINS]>),
+    Light(Light),
+}
+
+/// The style's light, which the web demo animated with `map.setLight`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Light {
+    /// Hue in degrees.
+    pub hue: f64,
+    /// Saturation in percent.
+    pub saturation: f64,
+    /// 0.0..=1.0.
+    pub intensity: f64,
+}
+
+impl Light {
+    /// Whether a change is worth sending to the style.
+    fn close_to(self, other: Self) -> bool {
+        (self.hue - other.hue).abs() < HUE_EPSILON
+            && (self.saturation - other.saturation).abs() < 2.0
+            && (self.intensity - other.intensity).abs() < 0.02
+    }
 }
 
 #[derive(Debug)]
@@ -508,27 +523,26 @@ impl MapLibre {
     /// Applies one frame of the sound animation: every band gets its own
     /// extrusion height and hue.
     ///
-    /// `hue_offset` rotates the colour wheel over time — the native API exposes
-    /// neither light settings nor paint-property setters, so the hue of the
-    /// buildings themselves stands in for the web demo's animated `setLight`.
     /// `height_gain` scales the whole skyline, which the drop effect uses to
     /// make it jump.
-    pub fn apply_levels(&mut self, levels: &[f32; BINS], hue_offset: f64, height_gain: f64) {
+    pub fn apply_levels(&mut self, levels: &[f32; BINS], height_gain: f64) {
         let mut bands = [Band::default(); BINS];
         for (band, (slot, level)) in bands.iter_mut().zip(levels.iter()).enumerate() {
             let level = f64::from(*level);
-            *slot = Band {
-                height: (10.0 + 4.0 * band as f64 + level * 255.0) * height_gain,
-                hue: (hue_offset + band as f64 * 6.0).rem_euclid(360.0),
-                level,
-            };
+            slot.height = (10.0 + 4.0 * band as f64 + level * 255.0) * height_gain;
         }
         self.send(Command::Bands(Box::new(bands)));
+    }
+
+    /// Sets the style's light, as the web demo's `map.setLight` did.
+    pub fn set_light(&mut self, light: Light) {
+        self.send(Command::Light(light));
     }
 
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
         self.send(Command::Bands(Box::new([Band::default(); BINS])));
+        self.send(Command::Light(Light::default()));
     }
 }
 
@@ -562,6 +576,8 @@ struct Engine {
     camera: MapCamera,
     bands: [Band; BINS],
     applied: [Option<Band>; BINS],
+    light: Light,
+    applied_light: Option<Light>,
     /// Something the UI asked for has not been drawn yet.
     dirty: bool,
     /// MapLibre Native says it has more to draw — tiles still arriving, or a
@@ -595,6 +611,8 @@ impl Engine {
             camera: MapCamera::default(),
             bands: [Band::default(); BINS],
             applied: [None; BINS],
+            light: Light::default(),
+            applied_light: None,
             dirty: true,
             wants_repaint: false,
             pixels: Vec::new(),
@@ -606,11 +624,21 @@ impl Engine {
             Command::Resize(width, height) => {
                 if self.size != (width, height) {
                     self.size = (width, height);
-                    // A map's size is fixed at creation and an owned texture is
-                    // allocated at one extent, so a resize replaces both. The
-                    // runtime, and with it the tile cache, survives.
-                    self.map = None;
-                    self.applied = [None; BINS];
+                    // Resize the session rather than rebuilding the map: that
+                    // keeps the renderer, the tile pyramid and — the reason
+                    // this matters — the loaded style. Rebuilding re-fetched
+                    // the style from its URL, so resizing the window with no
+                    // network left the map blank.
+                    if let Some(attached) = &self.map
+                        && let Err(error) = attached.session.resize(width, height, 1.0)
+                    {
+                        eprintln!("resizing the render target failed: {error}");
+                        // Fall back to a rebuild, which at least recovers when
+                        // the network is there.
+                        self.map = None;
+                        self.applied = [None; BINS];
+                        self.applied_light = None;
+                    }
                     self.mark_dirty();
                 }
             }
@@ -623,6 +651,7 @@ impl Engine {
                         }
                         attached.layers = false;
                         attached.style_loaded = false;
+                        self.applied_light = None;
                     }
                     self.applied = [None; BINS];
                     self.mark_dirty();
@@ -637,6 +666,12 @@ impl Engine {
             Command::Bands(bands) => {
                 if self.bands != *bands {
                     self.bands = *bands;
+                    self.mark_dirty();
+                }
+            }
+            Command::Light(light) => {
+                if self.light != light {
+                    self.light = light;
                     self.mark_dirty();
                 }
             }
@@ -701,6 +736,7 @@ impl Engine {
     fn render(&mut self) -> Option<Frame> {
         self.ensure_map()?;
         self.sync_bands();
+        self.sync_light();
 
         let camera = camera_options(self.camera);
         let attached = self.map.as_ref()?;
@@ -787,6 +823,13 @@ impl Engine {
         ) {
             eprintln!("selecting map events failed: {error}");
         }
+        // Raise the pitch bound before any camera goes in: MapLibre Native
+        // clamps at 60 by default and would silently hold anything steeper.
+        let mut bounds = BoundOptions::default();
+        bounds.max_pitch = Some(MAX_PITCH);
+        if let Err(error) = map.set_bounds(&bounds) {
+            eprintln!("raising the pitch bound failed: {error}");
+        }
         if let Err(error) = map.set_style_url(&self.style_url) {
             eprintln!("style load failed: {error}");
         }
@@ -849,18 +892,50 @@ impl Engine {
             }
             let id = building_layer_id(band);
             let height = serde_json::json!(target.height).to_string();
-            let color = serde_json::json!(band_color(target)).to_string();
-            let set = attached
+            match attached
                 .map
                 .set_layer_property(&id, "fill-extrusion-height", height.as_bytes())
-                .and_then(|()| {
-                    attached
-                        .map
-                        .set_layer_property(&id, "fill-extrusion-color", color.as_bytes())
-                });
-            match set {
+            {
                 Ok(()) => self.applied[band] = Some(target),
                 Err(error) => eprintln!("updating building layer {band} failed: {error}"),
+            }
+        }
+    }
+
+    /// Sets the style's light when it has moved on.
+    ///
+    /// This is the web demo's `map.setLight({ color, intensity })`, which the
+    /// old bindings could not express — the building hue stood in for it. Two
+    /// property sets, so it costs no more than a band update.
+    fn sync_light(&mut self) {
+        let Some(attached) = &self.map else { return };
+        if !attached.style_loaded {
+            return;
+        }
+        if self
+            .applied_light
+            .is_some_and(|applied| applied.close_to(self.light))
+        {
+            return;
+        }
+
+        let color =
+            serde_json::json!(hsl_to_hex(self.light.hue, self.light.saturation, 50.0)).to_string();
+        let intensity = serde_json::json!(self.light.intensity).to_string();
+        let set = attached
+            .map
+            .set_style_light_property("color", color.as_bytes())
+            .and_then(|()| {
+                attached
+                    .map
+                    .set_style_light_property("intensity", intensity.as_bytes())
+            });
+        match set {
+            Ok(()) => self.applied_light = Some(self.light),
+            Err(error) => {
+                eprintln!("setting the style light failed: {error}");
+                // Stop retrying every frame on a style with no light.
+                self.applied_light = Some(self.light);
             }
         }
     }
@@ -1118,18 +1193,15 @@ fn building_layer_json(band: usize, id: &str) -> serde_json::Value {
         "source-layer": BUILDING_SOURCE_LAYER,
         "filter": ["all", [">", "render_height", low], ["<=", "render_height", high]],
         "paint": {
-            "fill-extrusion-color": band_color(Band::default()),
+            "fill-extrusion-color": BUILDING_COLOR,
             "fill-extrusion-height": Band::default().height,
             "fill-extrusion-opacity": 0.6,
         },
     })
 }
 
-/// Silent bands stay neutral grey (the web demo used a flat "#aaa");
-/// saturation and lightness rise with the band level.
-fn band_color(spec: Band) -> String {
-    hsl_to_hex(spec.hue, spec.level * 80.0, 50.0 + spec.level * 15.0)
-}
+// no per-band colour: the style's light does the colouring, as it did in the
+// web demo, so the buildings stay the flat grey it used.
 
 /// `h` in degrees, `s` and `l` in percent.
 fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
@@ -1360,7 +1432,7 @@ mod tests {
         };
         let view = controller.effective();
         assert_eq!(view.zoom, 14.0);
-        assert_eq!(view.pitch, 30.0);
+        assert_eq!(view.pitch, DEFAULT_PITCH - 30.0);
         assert_eq!(view.bearing, 110.0);
         // The user's own camera is untouched, so the effect decays cleanly.
         assert_eq!(controller.camera.zoom, 16.0);
@@ -1369,7 +1441,7 @@ mod tests {
         // Boosts are clamped to what the map can actually show.
         controller.boost = CameraBoost {
             zoom: 50.0,
-            pitch: 50.0,
+            pitch: 90.0,
             bearing: 0.0,
         };
         let view = controller.effective();
@@ -1397,8 +1469,14 @@ mod tests {
     }
 
     #[test]
-    fn silent_bands_render_grey() {
-        assert_eq!(band_color(Band::default()), "#808080");
+    fn the_buildings_are_flat_grey() {
+        // The style's light colours the scene, as it did in the web demo, so
+        // the buildings themselves must not be tinted per band.
+        let json = building_layer_json(3, "a");
+        assert_eq!(
+            json["paint"]["fill-extrusion-color"],
+            serde_json::json!(BUILDING_COLOR)
+        );
     }
 
     #[test]
@@ -1421,20 +1499,9 @@ mod tests {
 
     #[test]
     fn nearby_bands_do_not_trigger_a_layer_rebuild() {
-        let base = Band {
-            height: 100.0,
-            hue: 10.0,
-            level: 0.5,
-        };
-        assert!(base.close_to(Band {
-            height: 101.0,
-            ..base
-        }));
-        assert!(!base.close_to(Band {
-            height: 110.0,
-            ..base
-        }));
-        assert!(!base.close_to(Band { hue: 40.0, ..base }));
+        let base = Band { height: 100.0 };
+        assert!(base.close_to(Band { height: 101.0 }));
+        assert!(!base.close_to(Band { height: 110.0 }));
     }
 
     #[test]
@@ -1523,13 +1590,7 @@ mod tests {
             "the renderer never produced an image"
         );
 
-        engine.apply(Command::Bands(Box::new(
-            [Band {
-                height: 220.0,
-                hue: 200.0,
-                level: 1.0,
-            }; BINS],
-        )));
+        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; BINS])));
         let tall = settle(&mut engine);
 
         assert_eq!((flat.width, flat.height), (tall.width, tall.height));
@@ -1594,8 +1655,6 @@ mod tests {
             engine.apply(Command::Bands(Box::new(
                 [Band {
                     height: 20.0 + level * 180.0,
-                    hue: f64::from(frame) * 3.0 % 360.0,
-                    level,
                 }; BINS],
             )));
         });
@@ -1644,8 +1703,6 @@ mod tests {
 
             let bands = [Band {
                 height: 20.0 * nudge,
-                hue: 30.0 * nudge,
-                level: 0.5,
             }; BINS];
             engine.apply(Command::Bands(Box::new(bands)));
             all_bands += time(&mut engine);

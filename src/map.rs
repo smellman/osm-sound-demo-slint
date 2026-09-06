@@ -9,7 +9,7 @@ use crate::AppWindow;
 use crate::MapAdapter;
 
 mod renderer;
-pub use renderer::{CameraBoost, MapLibre, create_map};
+pub use renderer::{CameraBoost, Light, MapLibre, create_map};
 
 /// Publishes the newest rendered frame and the camera state to the UI, and
 /// reports whether a new frame arrived.

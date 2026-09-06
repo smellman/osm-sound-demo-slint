@@ -10,7 +10,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::audio::{Analyzer, AudioPlayer};
 use crate::gamepad::{Action, Gamepads};
-use crate::map::{self, CameraBoost, MapLibre};
+use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
 use crate::{AppWindow, MapAdapter};
 
@@ -32,10 +32,32 @@ const PLACES: &[(&str, f64, f64)] = &[
 
 const FLY_TO_ZOOM: f64 = 16.0;
 
+/// Where the app calls home. The web demo asked the browser; a native binary
+/// would need CoreLocation or GeoClue, and on macOS that means an app bundle
+/// with a usage description, so the coordinates are given instead.
+const HOME_VAR: &str = "OSM_SOUND_DEMO_HOME";
+
+/// The project's source, opened from About.
+const PROJECT_URL: &str = "https://github.com/smellman/osm-sound-demo-slint";
+
 /// Degrees of bearing per second, matching the web demo's `now / 500`.
 const BEARING_DEG_PER_SEC: f64 = 2.0;
 /// Degrees of hue per second, matching the web demo's `now / 100`.
 const HUE_DEG_PER_SEC: f64 = 10.0;
+
+/// The web demo's light, restored now that the bindings can set it:
+///
+/// ```js
+/// map.setLight({
+///   color: 'hsl(' + ((now / 100) % 360) + ',' + Math.min(50 + avg / 4, 100) + '%,50%)',
+///   intensity: Math.min(1, (avg / 256) * 10),
+/// })
+/// ```
+///
+/// `avg` is the mean band level, which is 0..1 here rather than 0..255.
+const LIGHT_SATURATION_BASE: f64 = 50.0;
+const LIGHT_SATURATION_GAIN: f64 = 255.0 / 4.0;
+const LIGHT_INTENSITY_GAIN: f64 = 10.0;
 
 /// A freshly started track reports an empty queue for a moment; ignore
 /// end-of-track detection until it has had a chance to fill.
@@ -444,6 +466,29 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         }
     });
 
+    ui.on_open_project(|| open_in_browser(PROJECT_URL));
+
+    ui.on_locate_me({
+        let ui_handle = ui.as_weak();
+        move || {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            match home() {
+                Some((lat, lon)) => {
+                    ui.global::<MapAdapter>().invoke_request_fly_to(
+                        lat as f32,
+                        lon as f32,
+                        FLY_TO_ZOOM as f32,
+                    );
+                }
+                None => {
+                    ui.set_status(format!("Set {HOME_VAR}=<lat>,<lon> to use Locate Me").into())
+                }
+            }
+        }
+    });
+
     ui.on_open_release({
         let state = Rc::clone(state);
         move || {
@@ -683,8 +728,17 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 + DROP_HUE_GAIN * punch
                 + ORBIT_HUE_GAIN * (std::f64::consts::PI * orbit_t).sin();
             state.hue += seconds * HUE_DEG_PER_SEC * hue_gain;
+
+            // The style's light follows the mean band level, as the web demo's
+            // `setLight` did.
+            let average = f64::from(levels.iter().sum::<f32>()) / crate::audio::BINS as f64;
+            map.set_light(Light {
+                hue: state.hue.rem_euclid(360.0),
+                saturation: (LIGHT_SATURATION_BASE + average * LIGHT_SATURATION_GAIN).min(100.0),
+                intensity: (average * LIGHT_INTENSITY_GAIN).min(1.0),
+            });
             let gain = 1.0 + DROP_HEIGHT_GAIN * punch;
-            map.apply_levels(&levels, state.hue, gain);
+            map.apply_levels(&levels, gain);
         }
 
         if map::push_state(&ui, &mut map.borrow_mut()) {
@@ -754,6 +808,15 @@ fn step_to_next_after_end(ui: &AppWindow) {
     step_track(ui, &state, 1);
 }
 
+/// Reads `OSM_SOUND_DEMO_HOME` as `lat,lon`.
+fn home() -> Option<(f64, f64)> {
+    let value = std::env::var(HOME_VAR).ok()?;
+    let (lat, lon) = value.split_once(',')?;
+    let lat: f64 = lat.trim().parse().ok()?;
+    let lon: f64 = lon.trim().parse().ok()?;
+    (-90.0..=90.0).contains(&lat).then_some((lat, lon))
+}
+
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
@@ -789,5 +852,23 @@ mod tests {
         // moved" never expires.
         let long_ago = Instant::now() - hold_after_flight() - Duration::from_millis(1);
         assert!(!animation_gives_way(false, Some(long_ago)));
+    }
+
+    #[test]
+    fn home_reads_a_coordinate_pair() {
+        // Parsing is what is testable here; the variable itself is read once.
+        let parse = |value: &str| -> Option<(f64, f64)> {
+            let (lat, lon) = value.split_once(',')?;
+            let lat: f64 = lat.trim().parse().ok()?;
+            let lon: f64 = lon.trim().parse().ok()?;
+            (-90.0..=90.0).contains(&lat).then_some((lat, lon))
+        };
+        assert_eq!(parse("35.68,139.76"), Some((35.68, 139.76)));
+        assert_eq!(parse(" 35.68 , 139.76 "), Some((35.68, 139.76)));
+        assert_eq!(parse("-1.279803,36.816647"), Some((-1.279803, 36.816647)));
+        assert_eq!(parse("nonsense"), None);
+        assert_eq!(parse("35.68"), None);
+        // Latitude out of range is a swapped pair, not a location.
+        assert_eq!(parse("139.76,35.68"), None);
     }
 }

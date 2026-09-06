@@ -35,10 +35,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     map.set_style_url(STYLE_URL)?;
 
+    // MapLibre Native clamps pitch at 60 by default; raise the bound first.
+    let mut bounds = maplibre_native_ffi::BoundOptions::default();
+    bounds.max_pitch = Some(85.0);
+    map.set_bounds(&bounds)?;
+
     let mut camera = CameraOptions::default();
     camera.center = Some(LatLng::new(35.680655, 139.767165));
     camera.zoom = Some(16.0);
-    camera.pitch = Some(60.0);
+    camera.pitch = Some(85.0);
     map.jump_to(&camera)?;
     map.request_repaint()?;
 
@@ -48,6 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = MetalOwnedTextureDescriptor::new(extent, MetalContextDescriptor::new(device));
     // Sessions attach through a reference to the map, not the handle itself.
     let session = map.attach_ref()?.attach_metal_owned_texture(&descriptor)?;
+
+    // Does MapLibre Native honour a pitch past the 60 degrees the old
+    // bindings clamped at, or does it clamp internally?
+    println!("asked for pitch 85, map reports {:?}", map.camera()?.pitch);
 
     let started = Instant::now();
     let mut pixels = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
