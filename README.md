@@ -182,6 +182,7 @@ line. Anything the pad does, the mouse can still do.
 | Select | Stop |
 | A | The drop — see [the effects](#the-effects) |
 | B | The orbit |
+| Y | Switch how the skyline is coloured — see [the effects](#the-effects) |
 | L1 / R1 | Fly to the previous / next city (the dropdown follows) |
 | L2 / R2 | Volume down / up (the slider follows) |
 | Left stick | Pan |
@@ -418,6 +419,44 @@ of the drop: a sweep rather than an impact.
 Both are transient offsets (`CameraBoost`) kept separate from the camera the user controls,
 so an effect can never strand the map somewhere once it decays. Both fire whether or not a
 track is playing, and they simply add if you hit them together.
+
+**Y — the colouring.** Not an effect but a switch between two of them.
+
+*Lit*, the default, is the web demo's: one light over the whole scene, its colour and
+intensity following the mean band level, over flat grey buildings.
+
+*By height* gives each of the sixteen bands a colour of its own, so the skyline reads as a
+gradient from the low buildings up to the towers. The hues are spread evenly around the
+wheel from a starting point that differs every time — evenly rather than sixteen
+independent draws, because independent draws clump and two neighbouring bands landing on
+the same colour is exactly what this is meant to tell apart.
+
+It also swaps the music's light for a steady white one at intensity 0.5, and that is not
+cosmetic. With no light at all a scene is lit flatly from every direction: two buildings
+side by side in one height band come out as a single solid block and the skyline loses its
+shape. A light puts a different value on each face, which is what a boundary is. White,
+because the light's colour multiplies into the buildings' — measured over the palette at
+480x360:
+
+| light | distinct shades | frame still coloured |
+| --- | --- | --- |
+| none | 281 | 84% |
+| white, intensity 0.3 | 560 | 84% |
+| white, intensity 0.5 | 682 | 84% |
+| white, intensity 0.7 | 742 | 81% |
+| white, intensity 1.0 | 631 | 41% |
+
+0.5 is where the shading has arrived and the colour has not started to wash out.
+
+Switching costs sixteen `fill-extrusion-color` sets and no layer churn, and it is done by
+hand rather than animated, so it does not touch the per-frame path. The hue goes on
+accumulating while painted, so going back to lit resumes the light's animation instead of
+jumping to a new phase.
+
+`a_palette_colours_the_buildings` holds both ends of that: the style underneath is toner
+and the resting buildings are grey, so the map is monochrome until something colours it.
+Coloured subpixels go from 0.0% to 84.0% when the palette goes on and back down when it
+comes off, and the frame carries 682 distinct shades rather than one per band.
 
 ### Streaming, not downloading
 

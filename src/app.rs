@@ -26,10 +26,17 @@ const PLACES: &[(&str, f64, f64)] = &[
     ("Sendai / Japan", 140.883518, 38.260128),
     ("Kyoto / Japan", 135.759535, 34.985034),
     ("Shimane / Japan", 133.064008, 35.463968),
+    // Centred on Chiba station rather than the city, so the jump lands on
+    // something recognisable. OSM's own node for the station, since OSM is what
+    // the tiles are drawn from.
+    ("Chiba / Japan", 140.114626, 35.613310),
     ("Firenze / Italy", 11.248662, 43.777424),
     ("Prishtina / Kosovo", 21.163569, 42.663895),
     ("Nairobi / Kenya", 36.816647, -1.279803),
     ("Manila / Philippines", 121.067019, 14.656875),
+    // Midtown rather than the city centroid: this demo is about the skyline,
+    // and Times Square is where the towers are. OSM's node for it.
+    ("New York / America", -73.985972, 40.757010),
 ];
 
 const FLY_TO_ZOOM: f64 = 16.0;
@@ -131,6 +138,9 @@ struct State {
     drop_started: Option<Instant>,
     /// When the current orbit effect started, if one is running.
     orbit_started: Option<Instant>,
+    /// Whether the skyline is lit by the music, or painted a colour per height
+    /// band. See [`toggle_light`].
+    lit: bool,
     /// Which release the D-pad steps through.
     release_index: usize,
     volume: f32,
@@ -194,6 +204,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         locating: false,
         drop_started: None,
         orbit_started: None,
+        lit: true,
         release_index: 0,
         volume: 1.0,
         hue: 0.0,
@@ -293,6 +304,90 @@ fn step_release(ui: &AppWindow, delta: isize) {
     select_release(ui, next);
 }
 
+/// The light the painted skyline is shaded by: white, and steady rather than
+/// following the music.
+///
+/// Not darkness. The first attempt turned the light off, and a scene with no
+/// light is lit flatly from every direction: two buildings side by side in the
+/// same height band came out one solid block, and the skyline lost its shape.
+/// A light is what puts a different value on each face.
+///
+/// White, because the light's colour multiplies into the buildings'. Measured
+/// over the palette at 480x360, counting distinct shades against how much of
+/// the frame still holds a colour at all:
+///
+/// | light | shades | coloured |
+/// | --- | --- | --- |
+/// | none (the old off) | 281 | 84% |
+/// | white, intensity 0.3 | 560 | 84% |
+/// | white, intensity 0.5 | 682 | 84% |
+/// | white, intensity 0.7 | 742 | 81% |
+/// | white, intensity 1.0 | 631 | 41% |
+///
+/// 0.5 is where the shading has arrived and the colour has not yet started to
+/// wash out. `a_palette_colours_the_buildings` holds both ends of that.
+const PALETTE_LIGHT: Light = Light {
+    hue: 0.0,
+    saturation: 0.0,
+    lightness: 100.0,
+    intensity: 0.5,
+};
+
+/// Switches between the two ways the skyline is coloured.
+///
+/// **Lit** is the web demo's: one light over the whole scene, its colour and
+/// intensity following the music, over flat grey buildings.
+///
+/// **Painted** gives each of the sixteen height bands a colour of its own, so
+/// the skyline reads as a gradient from the low buildings to the towers, and
+/// swaps the music's light for the steady white one that keeps the buildings
+/// apart. Turning the light off on its own just left the map its original
+/// monochrome, which is not worth a button.
+///
+/// The hue goes on accumulating while painted, so going back to lit resumes the
+/// animation rather than jumping to a new phase.
+fn toggle_light(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let lit = {
+        let mut state = state.borrow_mut();
+        state.lit = !state.lit;
+        state.lit
+    };
+
+    let map = state.borrow().map.clone();
+    let mut map = map.borrow_mut();
+    if lit {
+        map.set_palette(None);
+    } else {
+        map.set_light(PALETTE_LIGHT);
+        map.set_palette(Some(palette()));
+    }
+    notify(
+        ui,
+        if lit {
+            "colour: lit"
+        } else {
+            "colour: by height"
+        },
+    );
+}
+
+/// A hue per height band, spread evenly around the wheel from a starting point
+/// that differs every time.
+///
+/// Evenly spread rather than sixteen independent random hues: independent draws
+/// clump, and two neighbouring bands landing on the same colour is exactly what
+/// this is meant to show apart. The offset is what keeps it from being the same
+/// rainbow every time.
+fn palette() -> [f64; crate::audio::BINS] {
+    let offset = f64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos() % 360),
+    );
+    let step = 360.0 / crate::audio::BINS as f64;
+    std::array::from_fn(|band| (offset + band as f64 * step).rem_euclid(360.0))
+}
+
 /// Dispatches one gamepad action.
 fn run_action(ui: &AppWindow, state: &Rc<RefCell<State>>, action: Action) {
     match action {
@@ -314,6 +409,7 @@ fn run_action(ui: &AppWindow, state: &Rc<RefCell<State>>, action: Action) {
         Action::NextRelease => step_release(ui, 1),
         Action::Drop => state.borrow_mut().drop_started = Some(Instant::now()),
         Action::Orbit => state.borrow_mut().orbit_started = Some(Instant::now()),
+        Action::ToggleLight => toggle_light(ui, state),
     }
 }
 
@@ -780,12 +876,17 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 
             // The style's light follows the mean band level, as the web demo's
             // `setLight` did.
-            let average = f64::from(levels.iter().sum::<f32>()) / crate::audio::BINS as f64;
-            map.set_light(Light {
-                hue: state.hue.rem_euclid(360.0),
-                saturation: (LIGHT_SATURATION_BASE + average * LIGHT_SATURATION_GAIN).min(100.0),
-                intensity: (average * LIGHT_INTENSITY_GAIN).min(1.0),
-            });
+            if state.lit {
+                let average = f64::from(levels.iter().sum::<f32>()) / crate::audio::BINS as f64;
+                map.set_light(Light {
+                    hue: state.hue.rem_euclid(360.0),
+                    // The web demo's light was always half lightness.
+                    lightness: 50.0,
+                    saturation: (LIGHT_SATURATION_BASE + average * LIGHT_SATURATION_GAIN)
+                        .min(100.0),
+                    intensity: (average * LIGHT_INTENSITY_GAIN).min(1.0),
+                });
+            }
             let gain = 1.0 + DROP_HEIGHT_GAIN * punch;
             map.apply_levels(&levels, gain);
         }

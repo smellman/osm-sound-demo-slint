@@ -58,9 +58,14 @@ fn default_style_url() -> String {
 /// the style has none. A source reports one once its TileJSON has arrived.
 const ATTRIBUTION_ATTEMPTS: u32 = 600;
 
-/// The buildings' colour. Flat, as the web demo's was: the style's light is
-/// what tints the scene with the music.
+/// The buildings' colour when no palette is set. Flat, as the web demo's was:
+/// there the style's light is what tints the scene with the music.
 const BUILDING_COLOR: &str = "#aaa";
+
+/// How saturated and how light a palette's colours are. Well clear of both ends
+/// so all sixteen read as colours rather than as near-white or near-black.
+const PALETTE_SATURATION: f64 = 72.0;
+const PALETTE_LIGHTNESS: f64 = 55.0;
 
 /// How many zoom levels above the current one MapLibre Native may fetch a
 /// coarse parent tile from, to cover ground that has no tile yet.
@@ -189,6 +194,8 @@ enum Command {
     },
     Bands(Box<[Band; BINS]>),
     Light(Light),
+    /// A hue per band, or `None` for the flat colour the light tints.
+    Palette(Option<Box<[f64; BINS]>>),
 }
 
 /// The style's light, which the web demo animated with `map.setLight`.
@@ -198,6 +205,9 @@ pub struct Light {
     pub hue: f64,
     /// Saturation in percent.
     pub saturation: f64,
+    /// Lightness in percent. The web demo's light was always 50; a white light
+    /// shades the extrusion faces without draining their colour.
+    pub lightness: f64,
     /// 0.0..=1.0.
     pub intensity: f64,
 }
@@ -207,6 +217,7 @@ impl Light {
     fn close_to(self, other: Self) -> bool {
         (self.hue - other.hue).abs() < HUE_EPSILON
             && (self.saturation - other.saturation).abs() < 2.0
+            && (self.lightness - other.lightness).abs() < 2.0
             && (self.intensity - other.intensity).abs() < 0.02
     }
 }
@@ -533,6 +544,12 @@ impl MapLibre {
         self.send(Command::Light(light));
     }
 
+    /// Colours the skyline by height, a hue per band, or `None` to go back to
+    /// the flat colour the light tints.
+    pub fn set_palette(&mut self, palette: Option<[f64; BINS]>) {
+        self.send(Command::Palette(palette.map(Box::new)));
+    }
+
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
         self.send(Command::Bands(Box::new([Band::default(); BINS])));
@@ -572,6 +589,9 @@ struct Engine {
     applied: [Option<Band>; BINS],
     light: Light,
     applied_light: Option<Light>,
+    /// A hue per band, so the skyline is coloured by height instead of lit.
+    palette: Option<Box<[f64; BINS]>>,
+    applied_palette: Option<Option<Box<[f64; BINS]>>>,
     /// The transition the map is running, if any.
     flight_id: Option<u64>,
     /// The last fly-to taken on, kept after `flight_id` is cleared so a frame
@@ -622,6 +642,8 @@ impl Engine {
             applied: [None; BINS],
             light: Light::default(),
             applied_light: None,
+            palette: None,
+            applied_palette: None,
             flight_id: None,
             last_flight: None,
             pending_fly: None,
@@ -667,6 +689,7 @@ impl Engine {
                         attached.layers = false;
                         attached.style_loaded = false;
                         self.applied_light = None;
+                        self.applied_palette = None;
                         self.attribution = None;
                         self.attribution_attempts = 0;
                     }
@@ -704,6 +727,10 @@ impl Engine {
                     self.bands = *bands;
                     self.mark_dirty();
                 }
+            }
+            Command::Palette(palette) => {
+                self.palette = palette;
+                self.mark_dirty();
             }
             Command::Light(light) => {
                 if self.light != light {
@@ -1028,6 +1055,40 @@ impl Engine {
                 Err(error) => eprintln!("updating building layer {band} failed: {error}"),
             }
         }
+
+        self.sync_palette();
+    }
+
+    /// Recolours the band layers when the palette has changed.
+    ///
+    /// Sixteen property sets, and only on a change — the palette is switched by
+    /// hand rather than animated, so this does nothing on almost every frame.
+    fn sync_palette(&mut self) {
+        if self
+            .applied_palette
+            .as_ref()
+            .is_some_and(|applied| *applied == self.palette)
+        {
+            return;
+        }
+        let Some(attached) = &self.map else { return };
+
+        for band in 0..BINS {
+            let color = match &self.palette {
+                Some(hues) => hsl_to_hex(hues[band], PALETTE_SATURATION, PALETTE_LIGHTNESS),
+                None => BUILDING_COLOR.to_owned(),
+            };
+            let color = serde_json::json!(color).to_string();
+            if let Err(error) = attached.map.set_layer_property(
+                &building_layer_id(band),
+                "fill-extrusion-color",
+                color.as_bytes(),
+            ) {
+                eprintln!("recolouring building layer {band} failed: {error}");
+                return;
+            }
+        }
+        self.applied_palette = Some(self.palette.clone());
     }
 
     /// Sets the style's light when it has moved on.
@@ -1047,8 +1108,12 @@ impl Engine {
             return;
         }
 
-        let color =
-            serde_json::json!(hsl_to_hex(self.light.hue, self.light.saturation, 50.0)).to_string();
+        let color = serde_json::json!(hsl_to_hex(
+            self.light.hue,
+            self.light.saturation,
+            self.light.lightness
+        ))
+        .to_string();
         let intensity = serde_json::json!(self.light.intensity).to_string();
         let set = attached
             .map
@@ -1612,8 +1677,9 @@ fn building_layer_json(band: usize, id: &str) -> serde_json::Value {
     })
 }
 
-// no per-band colour: the style's light does the colouring, as it did in the
-// web demo, so the buildings stay the flat grey it used.
+// A band's colour is set in place by `sync_palette` rather than baked into the
+// layer above, so switching palettes costs sixteen property sets and no layer
+// churn.
 
 /// `h` in degrees, `s` and `l` in percent.
 fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
@@ -2203,6 +2269,105 @@ mod tests {
             ratio > 0.05,
             "raising every band barely changed the image ({ratio})"
         );
+    }
+
+    /// Opt-in: confirms a palette actually reaches the buildings.
+    ///
+    /// The style underneath is toner and the buildings' resting colour is grey,
+    /// so the map is very nearly monochrome until something colours it. That
+    /// makes "how many pixels have a colour at all" a direct reading of whether
+    /// the palette landed, rather than the weaker "the image changed".
+    #[test]
+    fn a_palette_colours_the_buildings() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_RENDERER_TESTS=1 to run");
+            return;
+        }
+
+        let mut engine = Engine::new((480, 360));
+        let settle = |engine: &mut Engine| {
+            let started = Instant::now();
+            let mut last = None;
+            while started.elapsed() < SETTLE_DEADLINE {
+                engine.pump(Some(SETTLE_PUMP));
+                engine.mark_dirty();
+                last = engine.render();
+            }
+            last.expect("a frame renders")
+        };
+
+        // Raised first, so the buildings are worth colouring in.
+        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; BINS])));
+        let grey = settle(&mut engine);
+
+        let hues: [f64; BINS] = std::array::from_fn(|band| band as f64 * (360.0 / BINS as f64));
+        engine.apply(Command::Palette(Some(Box::new(hues))));
+        // The white light the painted mode uses; see `PALETTE_LIGHT`.
+        engine.apply(Command::Light(Light {
+            hue: 0.0,
+            saturation: 0.0,
+            lightness: 100.0,
+            intensity: 0.5,
+        }));
+        let painted = settle(&mut engine);
+
+        let before = coloured_fraction(&grey.rgba);
+        let after = coloured_fraction(&painted.rgba);
+        eprintln!("coloured subpixels: {before:.3} grey, {after:.3} painted");
+        assert!(
+            after > before * 3.0 && after > 0.02,
+            "the palette did not colour the map ({before} -> {after})"
+        );
+
+        // Colour alone is not enough: with no light every face of every
+        // building takes the same value and neighbours in one height band merge
+        // into a single block. The light is what separates them, and it must do
+        // that without washing the colour back out.
+        let shades = distinct_colours(&painted.rgba);
+        eprintln!("distinct shades: {shades}");
+        assert!(
+            shades > BINS * 20,
+            "the painted skyline is flat, not shaded ({shades} shades)"
+        );
+
+        // And back: the buildings return to the grey the light tints.
+        engine.apply(Command::Palette(None));
+        let returned = coloured_fraction(&settle(&mut engine).rgba);
+        assert!(
+            returned < after / 2.0,
+            "clearing the palette left the map coloured ({after} -> {returned})"
+        );
+    }
+
+    /// How many distinct colours the frame holds, quantised so noise does not
+    /// count. Flat-lit buildings give one shade per band; shaded ones give a
+    /// spread, which is what tells one face from the next.
+    fn distinct_colours(rgba: &[u8]) -> usize {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| (pixel[0] >> 3, pixel[1] >> 3, pixel[2] >> 3))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// The fraction of a frame that has a colour rather than a shade of grey.
+    fn coloured_fraction(rgba: &[u8]) -> f64 {
+        let pixels = rgba.as_chunks::<4>().0;
+        if pixels.is_empty() {
+            return 0.0;
+        }
+        let coloured = pixels
+            .iter()
+            .filter(|pixel| {
+                let high = pixel[0].max(pixel[1]).max(pixel[2]);
+                let low = pixel[0].min(pixel[1]).min(pixel[2]);
+                // Grey has every channel equal; anything with a real spread
+                // between them is a colour.
+                high.saturating_sub(low) > 24
+            })
+            .count();
+        coloured as f64 / pixels.len() as f64
     }
 
     /// What `prefetch_zoom_delta` buys and what it costs.
