@@ -136,7 +136,7 @@ does not expose. The fork adds a backend on GameController.framework instead, pe
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
-| `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me, answering without the network |
+| `OSM_SOUND_DEMO_HOME` | `lon,lat` for Locate Me, answering without the network. Longitude first, as MapLibre and GeoJSON order a position |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
 | `OSM_SOUND_DEMO_PREFETCH` | Override MapLibre Native's `prefetch_zoom_delta`; `0` turns prefetching off. Unset by default, and measuring says leave it that way — see [Tile prefetching](#tile-prefetching) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
@@ -395,8 +395,13 @@ Some of these are deliberate, some are limits of the current Rust bindings.
   OS; CoreLocation on macOS would mean shipping an app bundle with a usage description. So
   the button looks the machine up by its public address instead — **pressing it sends that
   address to `ipinfo.io`**, and the answer is accurate to about a city. Setting
-  `OSM_SOUND_DEMO_HOME=lat,lon` answers from that instead and never touches the network,
-  which is what to use at a venue or offline.
+  `OSM_SOUND_DEMO_HOME=lon,lat` answers from that instead and never touches the network,
+  which is what to use at a venue or offline. Longitude first, as MapLibre and GeoJSON
+  order a position — `139.7672,35.6807` is Tokyo, not the other way round. A pair is
+  refused when its second number cannot be a latitude, which catches the Google Maps order
+  for most of the world but not all of it: `-1.2798,36.8166` is Nairobi written backwards
+  and every number in it is in range, so it is accepted and lands in open water off Spain.
+  Check the status line after pressing the button.
 - **No QR code.** It pointed at the web version; About links to the source instead.
 
 ### VJ mode
