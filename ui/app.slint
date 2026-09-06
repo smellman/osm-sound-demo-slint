@@ -39,6 +39,7 @@ export component AppWindow inherits Window {
     in property <bool> playing: false;
     in property <bool> busy: false;
     in property <bool> has-release: false;
+    in property <bool> vj: false;
     // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
     in-out property <int> place-index: 0;
     // Two-way so the gamepad's D-pad moves the release dropdown too.
@@ -56,6 +57,7 @@ export component AppWindow inherits Window {
     callback open-release();
     callback open-project();
     callback locate-me();
+    callback toggle-vj();
     callback quit();
 
     property <bool> about-open: false;
@@ -126,7 +128,26 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- overlay: top-right "Locate Me" ---
+                // --- overlay: top-right "VJ Mode" ---
+            Rectangle {
+                x: parent.width - self.width - 360px;
+                y: 12px;
+                width: 110px;
+                height: 32px;
+                background: root.vj ? #1f6feb : #0d0f13cc;
+                border-radius: 6px;
+
+                Button {
+                    width: 100%;
+                    height: 100%;
+                    text: root.vj ? "VJ: on" : "VJ Mode";
+                    clicked => {
+                        root.toggle-vj();
+                    }
+                }
+            }
+
+            // --- overlay: top-right "Locate Me" ---
             Rectangle {
                 x: parent.width - self.width - 244px;
                 y: 12px;

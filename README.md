@@ -34,6 +34,8 @@ CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
+| `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me |
+| `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
 | `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). Nothing needs this any more — see [The band animation](#the-band-animation) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
@@ -60,6 +62,8 @@ its tile cache properly rather than being cut off mid-write.
 | Escape / F | Leave full screen / toggle it |
 | Q | Quit |
 | Fly To | Fly to one of twelve cities |
+| Locate Me | Fly to `OSM_SOUND_DEMO_HOME` |
+| VJ Mode | Follow an input device instead of a track |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |
 | Release dropdown | Load a release; the first one loads on startup |
@@ -204,21 +208,44 @@ Some of these are deliberate, some are limits of the current Rust bindings.
   run loop, which on macOS is the process CoreFoundation run loop; pumping that from
   inside a Slint callback re-enters winit's event handling and aborts. The UI thread only
   posts camera and band updates and picks up finished frames.
-- **The buildings carry the colour, not the light.** The web demo animated
-  `map.setLight({ color, intensity })`. The Rust bindings expose no light settings and no
-  paint-property setters, so each band's layer is rebuilt from style-spec JSON with a
-  rotating hue instead.
-- **Fly-to is eased here, not by MapLibre.** The Rust bindings expose only `jumpTo`, so
-  `Fly To` interpolates the camera itself, easing the position and arcing the zoom out at
-  the midpoint. A jump would land on a blank map: the camera outruns tile loading, which is
-  the same reason the [Raspberry Pi port](https://github.com/yuiseki/pi-maplibre-native-slint-touch/tree/main/hdmi)
-  defaults its `MAPLIBRE_FLY_MS` to six seconds. As in the web demo, the building animation
-  pauses during a fly.
-- **Pitch tops out at 60°**, not the web demo's 70°: MapLibre Native clamps the camera there.
+- **Fly-to is MapLibre Native's own.** `Fly To` hands the camera over with
+  `MapHandle::fly_to` and follows along until the transition-finished event; MapLibre picks
+  the duration from the distance, as the web demo's `flyTo` did, unless `MAPLIBRE_FLY_MS`
+  says otherwise. Anything that moves the camera — a drag, the sticks, an effect — cancels
+  the flight. As in the web demo, the building animation pauses during a fly.
+- **No "hash"**: the web demo kept the camera in the URL, which a native binary has no use
+  for.
+- **Pitch opens at 70°**, as the web demo did, and goes to 85°. MapLibre Native clamps at
+  60° unless `BoundOptions::max_pitch` is raised first — asking for more without that
+  silently gives 60 back.
 - **Vector tiles come from the style's own source**, not from `planet.pmtiles` — there is no
   `pmtiles://` protocol to register on the native side.
-- **No VJ mode and no "Locate Me"** yet. Both need platform work rodio does not cover
-  (input capture, CoreLocation).
+- **Locate Me reads a coordinate**, `OSM_SOUND_DEMO_HOME`, rather than asking the OS. The
+  web demo asked the browser; CoreLocation on macOS would mean shipping an app bundle with
+  a usage description.
+- **No QR code.** It pointed at the web version; About links to the source instead.
+
+### VJ mode
+
+The map can follow what an input device hears rather than a track, so it reacts to a live
+mix. The web demo did this with `getUserMedia`; here a thread pulls
+[rodio's](https://github.com/RustAudio/rodio) `Microphone` and pushes it through the same
+tap the tracks go through, into the same analyser — so bands, light and effects are
+unchanged. Nothing is played back: the sound is already coming out of whatever is being
+mixed.
+
+Route the sound into an input first, then pick it with `OSM_SOUND_DEMO_INPUT`:
+
+- **macOS**: [Loopback.app](https://rogueamoeba.com/loopback/), or BlackHole
+- **Linux**: Helvum with PipeWire
+
+A plain microphone works too, and reacts to the room. Turning VJ mode on stops any track,
+since both would be feeding the same analyser.
+
+On macOS the input is behind the microphone permission, and a binary started from a
+terminal inherits that terminal's grant. Without it the device opens and delivers silence
+rather than failing, so a flat skyline with a device named in the status line means the
+permission, not the routing.
 
 ### The effects
 

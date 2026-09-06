@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-use crate::audio::{Analyzer, AudioPlayer};
+use crate::audio::{Analyzer, AudioPlayer, VjMode};
 use crate::gamepad::{Action, Gamepads};
 use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
@@ -39,6 +39,9 @@ const HOME_VAR: &str = "OSM_SOUND_DEMO_HOME";
 
 /// The project's source, opened from About.
 const PROJECT_URL: &str = "https://github.com/smellman/osm-sound-demo-slint";
+
+/// Picks the VJ input device by a substring of its name.
+const INPUT_VAR: &str = "OSM_SOUND_DEMO_INPUT";
 
 /// Degrees of bearing per second, matching the web demo's `now / 500`.
 const BEARING_DEG_PER_SEC: f64 = 2.0;
@@ -148,6 +151,8 @@ struct State {
     /// When the last fly-to landed, so the skyline can give way while the new
     /// location loads.
     flight_landed: Option<Instant>,
+    /// Listening to an input device instead of a track.
+    vj: Option<VjMode>,
     /// When the current drop effect started, if one is running.
     drop_started: Option<Instant>,
     /// When the current orbit effect started, if one is running.
@@ -211,6 +216,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gamepads: Gamepads::new(),
         place: 0,
         flight_landed: None,
+        vj: None,
         drop_started: None,
         orbit_started: None,
         release_index: 0,
@@ -468,6 +474,49 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 
     ui.on_open_project(|| open_in_browser(PROJECT_URL));
 
+    ui.on_toggle_vj({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move || {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            if state.borrow().vj.is_some() {
+                let mut state = state.borrow_mut();
+                state.vj = None;
+                // Nothing feeds the analyser now, so the skyline would freeze
+                // at whatever it last heard.
+                state.audio.stop();
+                state.map.borrow_mut().reset_levels();
+                drop(state);
+                ui.set_vj(false);
+                ui.set_status("VJ mode off".into());
+                return;
+            }
+
+            // A track and an input would both be feeding the same analyser.
+            if state.borrow().playing {
+                stop(&ui, &state);
+            }
+            let wanted = std::env::var(INPUT_VAR).ok();
+            let started = state
+                .borrow()
+                .audio
+                .start_vj(wanted.as_deref().filter(|name| !name.is_empty()));
+            match started {
+                Ok(vj) => {
+                    ui.set_status(format!("VJ mode: listening to {}", vj.device()).into());
+                    state.borrow_mut().vj = Some(vj);
+                    ui.set_vj(true);
+                }
+                Err(error) => {
+                    eprintln!("VJ mode failed: {error}");
+                    ui.set_status(format!("VJ mode unavailable: {error}").into());
+                }
+            }
+        }
+    });
+
     ui.on_locate_me({
         let ui_handle = ui.as_weak();
         move || {
@@ -718,7 +767,8 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 
         // The web demo froze the animation during a fly-to too; here it also
         // stays frozen for a moment after landing.
-        if state.playing && !loading {
+        let animating = state.playing || state.vj.is_some();
+        if animating && !loading {
             let mut map = map.borrow_mut();
             map.nudge_bearing(seconds * BEARING_DEG_PER_SEC);
             let hue_gain = 1.0
@@ -766,7 +816,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             let camera = map.borrow().camera();
             // The still renderer only redraws on change, so frames per second
             // is only meaningful while the animation is running.
-            let rate = if state.playing {
+            let rate = if state.playing || state.vj.is_some() {
                 format!(" · {:.0} fps", state.fps)
             } else {
                 String::new()

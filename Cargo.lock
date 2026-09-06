@@ -4627,6 +4627,7 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
+ "rtrb",
  "symphonia",
  "thiserror 2.0.20",
 ]
@@ -4664,6 +4665,12 @@ dependencies = [
  "unicode-linebreak",
  "unicode-width",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
 
 [[package]]
 name = "rustc-hash"

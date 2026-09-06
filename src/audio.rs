@@ -5,6 +5,7 @@
 //! sample stream on its way to the device and running an FFT over the most
 //! recent window on the UI thread.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -265,6 +266,92 @@ impl AudioPlayer {
     }
 }
 
+/// VJ mode: the map follows what an input device hears rather than a track.
+///
+/// The web demo did this with `getUserMedia`, feeding the live stream into the
+/// same analyser. Here a thread pulls the input and pushes it into the same
+/// [`Spectrum`] the tracks use, so everything downstream — bands, light,
+/// effects — is unchanged. Nothing is played back: the sound is already coming
+/// out of whatever is being mixed.
+///
+/// Route the sound into an input first. On macOS that means Loopback.app, on
+/// Linux Helvum with PipeWire; a plain microphone works too, and reacts to the
+/// room.
+pub struct VjMode {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    device: String,
+}
+
+impl VjMode {
+    /// The input being listened to.
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+}
+
+impl Drop for VjMode {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // The reader parks on the input's poll interval, so this returns
+            // promptly.
+            let _ = thread.join();
+        }
+    }
+}
+
+impl AudioPlayer {
+    /// Starts listening to an input device.
+    ///
+    /// `wanted` picks the device by a case-insensitive substring of its name;
+    /// without it the system default is used.
+    pub fn start_vj(&self, wanted: Option<&str>) -> Result<VjMode, Error> {
+        let builder = rodio::microphone::MicrophoneBuilder::new();
+        let (device, name) = match wanted {
+            Some(wanted) => {
+                let wanted = wanted.to_lowercase();
+                let inputs = rodio::microphone::available_inputs()?;
+                let found = inputs
+                    .into_iter()
+                    .find(|input| input.to_string().to_lowercase().contains(&wanted))
+                    .ok_or_else(|| format!("no input device matching {wanted:?}"))?;
+                let name = found.to_string();
+                (builder.device(found)?, name)
+            }
+            None => {
+                let device = builder.default_device()?;
+                (device, "default input".to_owned())
+            }
+        };
+        let microphone = device.default_config()?.open_stream()?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spectrum = Arc::clone(&self.spectrum);
+        let thread = std::thread::Builder::new()
+            .name("vj-input".to_owned())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    // The same tap the tracks go through, so channel folding
+                    // and the ring buffer behave identically.
+                    let mut tap = Tap::new(microphone, spectrum);
+                    while !stop.load(Ordering::Relaxed) {
+                        if tap.next().is_none() {
+                            break;
+                        }
+                    }
+                }
+            })?;
+
+        Ok(VjMode {
+            stop,
+            thread: Some(thread),
+            device: name,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +534,48 @@ mod tests {
         assert!(
             loudest[0] > 0.0 && loudest[BINS - 1] > 0.0,
             "bands at the edges never moved: {loudest:?}"
+        );
+    }
+
+    /// Opt-in: opens a real input device, since there is no way to fake one.
+    /// Reports what it hears rather than asserting on it — a quiet room is a
+    /// valid reading.
+    #[test]
+    fn vj_mode_opens_an_input() {
+        if std::env::var_os("OSM_SOUND_DEMO_AUDIO_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_AUDIO_TESTS=1 to run");
+            return;
+        }
+        for input in rodio::microphone::available_inputs().expect("listing inputs") {
+            eprintln!("input: {input}");
+        }
+
+        let (player, mut analyzer) = AudioPlayer::new().expect("opening the audio device");
+        // `OSM_SOUND_DEMO_INPUT` picks the device, as it does in the app.
+        let wanted = std::env::var("OSM_SOUND_DEMO_INPUT").ok();
+        let vj = player
+            .start_vj(wanted.as_deref().filter(|name| !name.is_empty()))
+            .expect("opening the input");
+        eprintln!("listening to {}", vj.device());
+
+        let mut loudest = [0.0f32; BINS];
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let levels = analyzer.poll();
+            for (peak, level) in loudest.iter_mut().zip(levels.iter()) {
+                *peak = peak.max(*level);
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        eprintln!("loudest bands over two seconds: {loudest:?}");
+
+        // Dropping it must stop the reader thread rather than leave it running.
+        let stopped = std::time::Instant::now();
+        drop(vj);
+        assert!(
+            stopped.elapsed() < Duration::from_secs(2),
+            "the input thread took {:?} to stop",
+            stopped.elapsed()
         );
     }
 }
