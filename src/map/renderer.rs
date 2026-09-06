@@ -148,6 +148,10 @@ pub struct Frame {
     pub camera: Option<MapCamera>,
     /// Whether a fly-to is still in the air.
     pub flying: bool,
+    /// The most recent fly-to the render thread has taken on, whether or not it
+    /// is still in the air. A frame drawn before the command arrived carries
+    /// the one before it, which is how the UI tells the two apart.
+    pub flight: Option<u64>,
 }
 
 enum Command {
@@ -378,7 +382,7 @@ impl MapLibre {
             if let Some(camera) = frame.camera {
                 self.controller.camera = camera;
             }
-            if !frame.flying {
+            if frame_ends_flight(frame.flight, frame.flying, self.flight_id) {
                 self.flying = false;
             }
         }
@@ -549,6 +553,9 @@ struct Engine {
     applied_light: Option<Light>,
     /// The transition the map is running, if any.
     flight_id: Option<u64>,
+    /// The last fly-to taken on, kept after `flight_id` is cleared so a frame
+    /// can still say which flight it belongs to.
+    last_flight: Option<u64>,
     /// A fly-to that arrived before the map existed, or before this pass.
     pending_fly: Option<(MapCamera, Option<f64>, u64)>,
     /// Report the camera with the next frame even though nothing is flying,
@@ -590,6 +597,7 @@ impl Engine {
             light: Light::default(),
             applied_light: None,
             flight_id: None,
+            last_flight: None,
             pending_fly: None,
             report_camera: false,
             dirty: true,
@@ -657,6 +665,7 @@ impl Engine {
             } => {
                 self.camera = camera;
                 self.flight_id = Some(id);
+                self.last_flight = Some(id);
                 self.pending_fly = Some((camera, duration_ms, id));
                 self.mark_dirty();
             }
@@ -676,6 +685,13 @@ impl Engine {
     }
 
     fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Asks for the map's camera to ride along with the next frame, for when
+    /// the frame that was carrying it never reached the UI.
+    fn request_camera_report(&mut self) {
+        self.report_camera = true;
         self.dirty = true;
     }
 
@@ -815,8 +831,16 @@ impl Engine {
 
         // While the map owns the camera, hand it back with the frame so the UI
         // can follow. `flying` also tells the UI when it has landed.
+        //
+        // The landing frame needs `report_camera` to carry it: `flight_id` is
+        // cleared when the transition-finished event arrives, which is in the
+        // pump before this render, so `flying` is already false here. Without
+        // it the UI's last sample stays the mid-flight one — short of the
+        // destination, and visibly so in the zoom, which is what the map is
+        // still easing when the last airborne frame is drawn.
         let flying = self.flight_id.is_some();
-        let camera = flying
+        let report = flying || std::mem::take(&mut self.report_camera);
+        let camera = report
             .then(|| self.map.as_ref().and_then(|a| a.map.camera().ok()))
             .flatten()
             .map(|camera| MapCamera {
@@ -840,6 +864,7 @@ impl Engine {
             rgba: self.pixels.clone(),
             camera,
             flying,
+            flight: self.last_flight,
         })
     }
 
@@ -1016,6 +1041,15 @@ impl Engine {
     }
 }
 
+/// MapLibre Native allows one runtime per owning thread, so an engine that goes
+/// out of scope without giving its own up leaves that thread unable to build
+/// another. The app only ever has one, but the tests share a thread.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Render thread body: coalesce whatever commands are pending, turn the
 /// runtime, then render at most one frame per pass.
 fn render_thread(
@@ -1060,10 +1094,16 @@ fn render_thread(
             rendered.fetch_add(1, Ordering::Relaxed);
             // Drop the frame rather than stall if the UI has not consumed the
             // previous one yet.
-            let _ = frames.try_send(frame);
+            let carried_camera = frame.camera.is_some();
+            if frames.try_send(frame).is_err() && carried_camera {
+                // A dropped frame is no loss on its own, but the camera it was
+                // carrying is: nothing else will tell the UI where the map
+                // stopped.
+                engine.request_camera_report();
+            }
         }
     }
-    engine.close();
+    // `Drop` closes it; naming it here as well would only be a second way in.
 }
 
 /// Attaches a render target the map draws into and this thread reads back.
@@ -1547,6 +1587,20 @@ impl MapCamera {
     }
 }
 
+/// Whether a frame is allowed to end the flight the UI believes is in the air.
+///
+/// Only a frame the render thread drew *after* taking the fly-to on can say it
+/// is over. Frames are produced continuously, so one drawn between `fly_to`
+/// sending its command and the render thread applying it still reports
+/// `flying: false` — and believing it un-suppresses the bearing animation,
+/// which then pushes an absolute camera and cancels the flight a tick after it
+/// started. That leaves the map at the old zoom, which is what the bug looked
+/// like from the outside, and only while a track played, because that is when
+/// the animation is running.
+fn frame_ends_flight(frame_flight: Option<u64>, frame_flying: bool, waiting_for: u64) -> bool {
+    !frame_flying && frame_flight == Some(waiting_for)
+}
+
 /// The camera as MapLibre Native's FFI wants it.
 fn camera_options(camera: MapCamera) -> CameraOptions {
     let mut options = CameraOptions::default();
@@ -1595,9 +1649,12 @@ mod tests {
     /// its first tiles have to come over the network.
     const SETTLE_PUMP: Duration = Duration::from_millis(50);
 
-    /// Frames a test renders to let tiles arrive; the production settle window
-    /// is a timer, which a test cannot wait on frame by frame.
-    const TEST_SETTLE_FRAMES: u32 = 90;
+    /// How long a settle runs. Wall clock, not a frame count: what it is
+    /// waiting for is the network, and a frame count measures the GPU. Ninety
+    /// frames is four seconds against a cold cache and eight hundredths of a
+    /// second against a warm one, so counting frames made these tests pass or
+    /// fail on whether the last run had left the buildings lying around.
+    const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
 
     /// Size the timing probes render at, `OSM_SOUND_DEMO_RENDER_SIZE` as
     /// `<width>x<height>`.
@@ -1765,6 +1822,21 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_frame_cannot_end_a_flight() {
+        // Drawn before the fly-to reached the render thread: it belongs to the
+        // flight before this one, or to none at all.
+        assert!(!frame_ends_flight(None, false, 1));
+        assert!(!frame_ends_flight(Some(0), false, 1));
+        // In the air, so not over whatever it says about the flight.
+        assert!(!frame_ends_flight(Some(1), true, 1));
+        // Drawn after the command landed, and reporting the flight done.
+        assert!(frame_ends_flight(Some(1), false, 1));
+        // Still true for later frames, so a dropped landing frame is not the
+        // only chance the UI gets.
+        assert!(frame_ends_flight(Some(1), false, 1));
+    }
+
+    #[test]
     fn nearby_bands_do_not_trigger_a_layer_rebuild() {
         let base = Band { height: 100.0 };
         assert!(base.close_to(Band { height: 101.0 }));
@@ -1791,6 +1863,7 @@ mod tests {
         let mut engine = Engine::new((480, 360));
         // Let the map come up before asking it to travel.
         for _ in 0..30 {
+            engine.pump(Some(SETTLE_PUMP));
             engine.mark_dirty();
             engine.render().expect("warm-up frame");
         }
@@ -1803,6 +1876,7 @@ mod tests {
 
         let mut moved_midway = false;
         let mut landed_after = None;
+        let mut landing = None;
         for frame in 0..PATIENCE {
             engine.pump(Some(Duration::from_millis(4)));
             let Some(rendered) = engine.render() else {
@@ -1819,6 +1893,7 @@ mod tests {
                 }
             } else if engine.flight_id.is_none() {
                 landed_after = Some(frame);
+                landing = Some(rendered);
                 break;
             }
         }
@@ -1830,6 +1905,19 @@ mod tests {
             )
         });
         eprintln!("flew in {frames} frames, midway sample seen: {moved_midway}");
+        let landing = landing.expect("the landing frame");
+        // The engine knowing where it landed is not enough: the UI only ever
+        // learns the camera from a frame, so the destination has to be on the
+        // one that reports the flight over.
+        let reported = landing
+            .camera
+            .expect("the landing frame reports where the map stopped");
+        assert!(
+            (reported.zoom - target.zoom).abs() < 0.01,
+            "the landing frame reported zoom {}, wanted {}",
+            reported.zoom,
+            target.zoom
+        );
         assert!(
             moved_midway,
             "the camera jumped rather than flying: no midway position was reported"
@@ -1839,6 +1927,14 @@ mod tests {
                 && (engine.camera.lon - target.lon).abs() < 0.01,
             "landed at {:?}, wanted {target:?}",
             engine.camera
+        );
+        // The zoom is part of the destination: landing over the right place at
+        // the wrong scale is still the wrong camera.
+        assert!(
+            (engine.camera.zoom - target.zoom).abs() < 0.01,
+            "landed at zoom {}, wanted {}",
+            engine.camera.zoom,
+            target.zoom
         );
     }
 
@@ -1899,8 +1995,9 @@ mod tests {
         // the style load and every tile finish on the runtime, so a loop that
         // only renders draws an empty map for as long as it runs.
         let settle = |engine: &mut Engine| {
+            let started = Instant::now();
             let mut last = None;
-            for _ in 0..TEST_SETTLE_FRAMES {
+            while started.elapsed() < SETTLE_DEADLINE {
                 engine.pump(Some(SETTLE_PUMP));
                 engine.mark_dirty();
                 last = engine.render();
@@ -1943,7 +2040,8 @@ mod tests {
         }
         let size = probe_size();
         let mut engine = Engine::new(size);
-        for _ in 0..TEST_SETTLE_FRAMES {
+        let warm_up = Instant::now();
+        while warm_up.elapsed() < SETTLE_DEADLINE {
             engine.pump(Some(SETTLE_PUMP));
             engine.mark_dirty();
             engine.render().expect("warm-up frame");
@@ -2001,7 +2099,8 @@ mod tests {
         let size = probe_size();
         let mut engine = Engine::new(size);
         // Warm up so every band has a layer and the tiles are cached.
-        for _ in 0..TEST_SETTLE_FRAMES {
+        let warm_up = Instant::now();
+        while warm_up.elapsed() < SETTLE_DEADLINE {
             engine.pump(Some(SETTLE_PUMP));
             engine.mark_dirty();
             engine.render().expect("warm-up frame");
