@@ -89,9 +89,38 @@ const DEFAULT_PITCH: f64 = 70.0;
 const BUILDING_SOURCE: &str = "openmaptiles";
 const BUILDING_SOURCE_LAYER: &str = "building";
 
-/// Buildings are split into `BINS` layers by their true height, so each
-/// frequency band drives its own slice of the skyline.
+/// Buildings are split into `SLICES` layers by their true height.
 const MAX_BUILDING_HEIGHT: f64 = 200.0;
+
+/// How many height slices the skyline is cut into, and so how many extrusion
+/// layers the style carries. Every one of them is created once and then kept:
+/// changing the layer set is what makes MapLibre Native re-run tile layout for
+/// the building source, and the coarser modes below hide layers rather than
+/// remove them.
+///
+/// Deliberately more than [`BINS`]. The frequency bands and the height slices
+/// used to be one constant doing both jobs, which tied how finely the skyline
+/// could be cut to how finely the spectrum was read. They are separate things:
+/// `slice_levels` interpolates the one onto the other.
+pub const SLICES: usize = 64;
+
+/// The slice counts the skyline can be shown at, coarsest first.
+///
+/// A coarser mode shows every `SLICES / n`th layer, widened to cover the slices
+/// between, and hides the rest.
+///
+/// Cutting the same range into more layers is cheaper than it sounds, because
+/// the slices do not overlap: the same buildings are drawn either way, just
+/// spread over more layers, so what is paid is per-layer overhead rather than
+/// drawing anything twice. Measured on Metal, camera and bands both running:
+///
+/// | | 16 slices | 64 slices |
+/// | --- | --- | --- |
+/// | 1280x800 | 89.8, 89.6 | 79.7, 80.8 |
+/// | 1920x1200 | 71.0, 73.2 | 61.6, 66.5 |
+///
+/// About 11% either way.
+pub const SLICE_MODES: [usize; 2] = [16, 64];
 
 /// A band counts as unchanged until its target moves by more than this many
 /// metres, or this many degrees of hue, which keeps the animation from setting
@@ -192,10 +221,12 @@ enum Command {
         /// a cancelled flight is ignored.
         id: u64,
     },
-    Bands(Box<[Band; BINS]>),
+    Bands(Box<[Band; SLICES]>),
     Light(Light),
-    /// A hue per band, or `None` for the flat colour the light tints.
-    Palette(Option<Box<[f64; BINS]>>),
+    /// A hue per slice, or `None` for the flat colour the light tints.
+    Palette(Option<Box<[f64; SLICES]>>),
+    /// How many of the slices to show; one of [`SLICE_MODES`].
+    Slices(usize),
 }
 
 /// The style's light, which the web demo animated with `map.setLight`.
@@ -337,6 +368,8 @@ pub struct MapLibre {
     flying: bool,
     /// Identifies each fly-to so a finished one can be matched to its start.
     flight_id: u64,
+    /// How many height slices the skyline is shown at; one of [`SLICE_MODES`].
+    slices: usize,
 }
 
 impl MapLibre {
@@ -363,6 +396,7 @@ impl MapLibre {
             size,
             flying: false,
             flight_id: 0,
+            slices: SLICE_MODES[0],
         }
     }
 
@@ -531,12 +565,33 @@ impl MapLibre {
     /// `height_gain` scales the whole skyline, which the drop effect uses to
     /// make it jump.
     pub fn apply_levels(&mut self, levels: &[f32; BINS], height_gain: f64) {
-        let mut bands = [Band::default(); BINS];
-        for (band, (slot, level)) in bands.iter_mut().zip(levels.iter()).enumerate() {
-            let level = f64::from(*level);
-            slot.height = (10.0 + 4.0 * band as f64 + level * 255.0) * height_gain;
+        let shown = self.slices;
+        let sampled = slice_levels(levels, shown);
+        let mut bands = [Band::default(); SLICES];
+        // Only the shown slices are visible, and they are every `step`th layer.
+        let step = SLICES / shown;
+        for slot in 0..shown {
+            let level = f64::from(sampled[slot]);
+            // Spread the resting height over however many slices are shown, so
+            // the skyline keeps the same overall rake at either setting.
+            let base = 10.0 + 4.0 * (slot * BINS) as f64 / shown as f64;
+            bands[slot * step].height = (base + level * 255.0) * height_gain;
         }
         self.send(Command::Bands(Box::new(bands)));
+    }
+
+    /// How many slices the skyline is shown at; one of [`SLICE_MODES`].
+    pub fn slices(&self) -> usize {
+        self.slices
+    }
+
+    /// Shows the skyline at `slices`, which has to be one of [`SLICE_MODES`].
+    pub fn set_slices(&mut self, slices: usize) {
+        if !SLICE_MODES.contains(&slices) {
+            return;
+        }
+        self.slices = slices;
+        self.send(Command::Slices(slices));
     }
 
     /// Sets the style's light, as the web demo's `map.setLight` did.
@@ -546,13 +601,13 @@ impl MapLibre {
 
     /// Colours the skyline by height, a hue per band, or `None` to go back to
     /// the flat colour the light tints.
-    pub fn set_palette(&mut self, palette: Option<[f64; BINS]>) {
+    pub fn set_palette(&mut self, palette: Option<[f64; SLICES]>) {
         self.send(Command::Palette(palette.map(Box::new)));
     }
 
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
-        self.send(Command::Bands(Box::new([Band::default(); BINS])));
+        self.send(Command::Bands(Box::new([Band::default(); SLICES])));
         self.send(Command::Light(Light::default()));
     }
 }
@@ -585,13 +640,16 @@ struct Engine {
     size: (u32, u32),
     style_url: String,
     camera: MapCamera,
-    bands: [Band; BINS],
-    applied: [Option<Band>; BINS],
+    bands: [Band; SLICES],
+    applied: [Option<Band>; SLICES],
     light: Light,
     applied_light: Option<Light>,
     /// A hue per band, so the skyline is coloured by height instead of lit.
-    palette: Option<Box<[f64; BINS]>>,
-    applied_palette: Option<Option<Box<[f64; BINS]>>>,
+    palette: Option<Box<[f64; SLICES]>>,
+    applied_palette: Option<Option<Box<[f64; SLICES]>>>,
+    /// How many slices are shown, and what the style has been told.
+    slices: usize,
+    applied_slices: Option<usize>,
     /// The transition the map is running, if any.
     flight_id: Option<u64>,
     /// The last fly-to taken on, kept after `flight_id` is cleared so a frame
@@ -638,12 +696,14 @@ impl Engine {
             size,
             style_url: default_style_url(),
             camera: MapCamera::default(),
-            bands: [Band::default(); BINS],
-            applied: [None; BINS],
+            bands: [Band::default(); SLICES],
+            applied: [None; SLICES],
             light: Light::default(),
             applied_light: None,
             palette: None,
             applied_palette: None,
+            slices: SLICE_MODES[0],
+            applied_slices: None,
             flight_id: None,
             last_flight: None,
             pending_fly: None,
@@ -673,7 +733,7 @@ impl Engine {
                         // Fall back to a rebuild, which at least recovers when
                         // the network is there.
                         self.map = None;
-                        self.applied = [None; BINS];
+                        self.applied = [None; SLICES];
                         self.applied_light = None;
                     }
                     self.mark_dirty();
@@ -690,10 +750,11 @@ impl Engine {
                         attached.style_loaded = false;
                         self.applied_light = None;
                         self.applied_palette = None;
+                        self.applied_slices = None;
                         self.attribution = None;
                         self.attribution_attempts = 0;
                     }
-                    self.applied = [None; BINS];
+                    self.applied = [None; SLICES];
                     self.mark_dirty();
                 }
             }
@@ -730,6 +791,10 @@ impl Engine {
             }
             Command::Palette(palette) => {
                 self.palette = palette;
+                self.mark_dirty();
+            }
+            Command::Slices(slices) => {
+                self.slices = slices;
                 self.mark_dirty();
             }
             Command::Light(light) => {
@@ -1023,40 +1088,88 @@ impl Engine {
             return;
         }
         if !attached.layers {
-            for band in 0..BINS {
-                let json = building_layer_json(band, &building_layer_id(band));
+            for slice in 0..SLICES {
+                let json = building_layer_json(slice, 1, &building_layer_id(slice));
                 if let Err(error) = attached
                     .map
                     .add_style_layer_json(json.to_string().as_bytes(), None)
                 {
-                    eprintln!("adding building layer {band} failed: {error}");
+                    eprintln!("adding building layer {slice} failed: {error}");
                     return;
                 }
             }
             if let Some(attached) = &mut self.map {
                 attached.layers = true;
             }
-            self.applied = [None; BINS];
+            self.applied = [None; SLICES];
+            self.applied_slices = None;
         }
 
+        self.sync_slices();
+
         let Some(attached) = &self.map else { return };
-        for band in 0..BINS {
-            let target = self.bands[band];
-            if self.applied[band].is_some_and(|applied| applied.close_to(target)) {
+        let step = SLICES / self.slices;
+        for slice in (0..SLICES).step_by(step) {
+            let target = self.bands[slice];
+            if self.applied[slice].is_some_and(|applied| applied.close_to(target)) {
                 continue;
             }
-            let id = building_layer_id(band);
+            let id = building_layer_id(slice);
             let height = serde_json::json!(target.height).to_string();
             match attached
                 .map
                 .set_layer_property(&id, "fill-extrusion-height", height.as_bytes())
             {
-                Ok(()) => self.applied[band] = Some(target),
-                Err(error) => eprintln!("updating building layer {band} failed: {error}"),
+                Ok(()) => self.applied[slice] = Some(target),
+                Err(error) => eprintln!("updating building layer {slice} failed: {error}"),
             }
         }
 
         self.sync_palette();
+    }
+
+    /// Shows the skyline at the slice count that was asked for.
+    ///
+    /// The layer set never changes; what changes is which layers are visible
+    /// and how much height each covers. A shown layer is widened to span the
+    /// slices hidden behind it, so the skyline stays whole either way.
+    fn sync_slices(&mut self) {
+        use maplibre_native_ffi::StyleLayerVisibility;
+
+        if self.applied_slices == Some(self.slices) {
+            return;
+        }
+        let Some(attached) = &self.map else { return };
+
+        let step = SLICES / self.slices;
+        for slice in 0..SLICES {
+            let id = building_layer_id(slice);
+            let shown = slice.is_multiple_of(step);
+            let visibility = if shown {
+                StyleLayerVisibility::Visible
+            } else {
+                StyleLayerVisibility::None
+            };
+            if let Err(error) = attached.map.set_layer_visibility(&id, visibility) {
+                eprintln!("showing building layer {slice} failed: {error}");
+                return;
+            }
+            if !shown {
+                continue;
+            }
+            let filter = building_layer_filter(slice, step);
+            if let Err(error) = attached
+                .map
+                .set_layer_filter(&id, Some(filter.to_string().as_bytes()))
+            {
+                eprintln!("refiltering building layer {slice} failed: {error}");
+                return;
+            }
+        }
+        // A layer that was hidden kept whatever height it had, and a shown one
+        // now covers a different span, so nothing that was applied still holds.
+        self.applied = [None; SLICES];
+        self.applied_slices = Some(self.slices);
     }
 
     /// Recolours the band layers when the palette has changed.
@@ -1064,27 +1177,29 @@ impl Engine {
     /// Sixteen property sets, and only on a change — the palette is switched by
     /// hand rather than animated, so this does nothing on almost every frame.
     fn sync_palette(&mut self) {
-        if self
-            .applied_palette
-            .as_ref()
-            .is_some_and(|applied| *applied == self.palette)
+        if self.applied_slices == Some(self.slices)
+            && self
+                .applied_palette
+                .as_ref()
+                .is_some_and(|applied| *applied == self.palette)
         {
             return;
         }
         let Some(attached) = &self.map else { return };
 
-        for band in 0..BINS {
+        let step = SLICES / self.slices;
+        for slice in (0..SLICES).step_by(step) {
             let color = match &self.palette {
-                Some(hues) => hsl_to_hex(hues[band], PALETTE_SATURATION, PALETTE_LIGHTNESS),
+                Some(hues) => hsl_to_hex(hues[slice], PALETTE_SATURATION, PALETTE_LIGHTNESS),
                 None => BUILDING_COLOR.to_owned(),
             };
             let color = serde_json::json!(color).to_string();
             if let Err(error) = attached.map.set_layer_property(
-                &building_layer_id(band),
+                &building_layer_id(slice),
                 "fill-extrusion-color",
                 color.as_bytes(),
             ) {
-                eprintln!("recolouring building layer {band} failed: {error}");
+                eprintln!("recolouring building layer {slice} failed: {error}");
                 return;
             }
         }
@@ -1649,8 +1764,29 @@ fn metal_device() -> NativePointer {
     unsafe { NativePointer::from_address(address) }
 }
 
-fn building_layer_id(band: usize) -> String {
-    format!("3d-buildings-{band}")
+/// Spreads `BINS` frequency levels across `shown` height slices.
+///
+/// Linear interpolation rather than repeating each band `shown / BINS` times:
+/// repeating gives four identical slices in a row and the skyline comes out as
+/// steps, which is the thing a finer cut was supposed to remove. The ends are
+/// pinned to the first and last band so the full range is used.
+fn slice_levels(levels: &[f32; BINS], shown: usize) -> Vec<f32> {
+    if shown <= 1 {
+        return vec![levels[0]; shown];
+    }
+    (0..shown)
+        .map(|slot| {
+            let position = slot as f32 * (BINS - 1) as f32 / (shown - 1) as f32;
+            let low = position.floor() as usize;
+            let high = (low + 1).min(BINS - 1);
+            let fraction = position - low as f32;
+            levels[low] * (1.0 - fraction) + levels[high] * fraction
+        })
+        .collect()
+}
+
+fn building_layer_id(slice: usize) -> String {
+    format!("3d-buildings-{slice}")
 }
 
 /// Builds the style-spec JSON for one band's extrusion layer. Each band filters
@@ -1659,22 +1795,31 @@ fn building_layer_id(band: usize) -> String {
 ///
 /// The paint values here are only the resting state; the animation sets them in
 /// place with `set_layer_property`.
-fn building_layer_json(band: usize, id: &str) -> serde_json::Value {
-    let bin_width = MAX_BUILDING_HEIGHT / BINS as f64;
-    let low = band as f64 * bin_width;
-    let high = (band + 1) as f64 * bin_width;
+fn building_layer_json(slice: usize, span: usize, id: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "type": "fill-extrusion",
         "source": BUILDING_SOURCE,
         "source-layer": BUILDING_SOURCE_LAYER,
-        "filter": ["all", [">", "render_height", low], ["<=", "render_height", high]],
+        "filter": building_layer_filter(slice, span),
         "paint": {
             "fill-extrusion-color": BUILDING_COLOR,
             "fill-extrusion-height": Band::default().height,
             "fill-extrusion-opacity": 0.6,
         },
     })
+}
+
+/// The height range one layer draws: `span` slices starting at `slice`.
+fn building_layer_filter(slice: usize, span: usize) -> serde_json::Value {
+    let width = MAX_BUILDING_HEIGHT / SLICES as f64;
+    let low = slice as f64 * width;
+    let high = ((slice + span).min(SLICES)) as f64 * width;
+    serde_json::json!([
+        "all",
+        [">", "render_height", low],
+        ["<=", "render_height", high]
+    ])
 }
 
 // A band's colour is set in place by `sync_palette` rather than baked into the
@@ -2038,7 +2183,7 @@ mod tests {
     fn the_buildings_are_flat_grey() {
         // The style's light colours the scene, as it did in the web demo, so
         // the buildings themselves must not be tinted per band.
-        let json = building_layer_json(3, "a");
+        let json = building_layer_json(3, 1, "a");
         assert_eq!(
             json["paint"]["fill-extrusion-color"],
             serde_json::json!(BUILDING_COLOR)
@@ -2046,16 +2191,68 @@ mod tests {
     }
 
     #[test]
-    fn building_layer_bins_cover_the_height_range() {
-        let first = building_layer_json(0, "a");
-        let last = building_layer_json(BINS - 1, "b");
+    fn the_levels_land_unchanged_when_a_slice_is_a_band() {
+        let levels: [f32; BINS] = std::array::from_fn(|band| band as f32 / BINS as f32);
+        let spread = slice_levels(&levels, BINS);
+        assert_eq!(spread, levels.to_vec());
+    }
+
+    #[test]
+    fn a_finer_cut_interpolates_between_the_bands() {
+        let levels: [f32; BINS] = std::array::from_fn(|band| band as f32);
+        let spread = slice_levels(&levels, SLICES);
+        assert_eq!(spread.len(), SLICES);
+
+        // Pinned at both ends, so the full range of the spectrum is used.
+        assert_eq!(spread[0], levels[0]);
+        assert_eq!(spread[SLICES - 1], levels[BINS - 1]);
+
+        // Between them it rises smoothly rather than in steps of four, which is
+        // the whole point of interpolating instead of repeating each band.
+        assert!(
+            spread.windows(2).all(|pair| pair[1] > pair[0]),
+            "not strictly rising: {spread:?}"
+        );
+        let step = spread[1] - spread[0];
+        assert!(
+            spread
+                .windows(2)
+                .all(|pair| (pair[1] - pair[0] - step).abs() < 1e-5),
+            "a ramp should rise evenly: {spread:?}"
+        );
+    }
+
+    #[test]
+    fn building_layer_slices_cover_the_height_range() {
+        let first = building_layer_json(0, 1, "a");
+        let last = building_layer_json(SLICES - 1, 1, "b");
         assert_eq!(first["filter"][1][2], serde_json::json!(0.0));
         assert_eq!(last["filter"][2][2], serde_json::json!(MAX_BUILDING_HEIGHT));
     }
 
     #[test]
+    fn a_coarse_mode_covers_the_same_range_with_fewer_layers() {
+        // Every shown layer widens to span the ones hidden behind it, so the
+        // skyline has no gaps at either setting.
+        for mode in SLICE_MODES {
+            let step = SLICES / mode;
+            let mut edge = 0.0;
+            for slice in (0..SLICES).step_by(step) {
+                let filter = building_layer_filter(slice, step);
+                assert_eq!(
+                    filter[1][2],
+                    serde_json::json!(edge),
+                    "slice {slice} of {mode}"
+                );
+                edge = filter[2][2].as_f64().expect("an upper edge");
+            }
+            assert_eq!(edge, MAX_BUILDING_HEIGHT, "{mode} slices stop short");
+        }
+    }
+
+    #[test]
     fn the_building_layers_use_constant_paint() {
-        let json = building_layer_json(3, "a");
+        let json = building_layer_json(3, 1, "a");
         let paint = &json["paint"];
         // Data-driven paint (a `step` / `get` expression) would be re-evaluated
         // per building every frame and costs about twenty times as much.
@@ -2253,7 +2450,7 @@ mod tests {
             "the renderer never produced an image"
         );
 
-        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; BINS])));
+        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; SLICES])));
         let tall = settle(&mut engine);
 
         assert_eq!((flat.width, flat.height), (tall.width, tall.height));
@@ -2297,10 +2494,11 @@ mod tests {
         };
 
         // Raised first, so the buildings are worth colouring in.
-        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; BINS])));
+        engine.apply(Command::Bands(Box::new([Band { height: 220.0 }; SLICES])));
         let grey = settle(&mut engine);
 
-        let hues: [f64; BINS] = std::array::from_fn(|band| band as f64 * (360.0 / BINS as f64));
+        let hues: [f64; SLICES] =
+            std::array::from_fn(|slice| slice as f64 * (360.0 / SLICES as f64));
         engine.apply(Command::Palette(Some(Box::new(hues))));
         // The white light the painted mode uses; see `PALETTE_LIGHT`.
         engine.apply(Command::Light(Light {
@@ -2528,7 +2726,7 @@ mod tests {
             engine.apply(Command::Bands(Box::new(
                 [Band {
                     height: 20.0 + level * 180.0,
-                }; BINS],
+                }; SLICES],
             )));
         });
 
@@ -2578,7 +2776,7 @@ mod tests {
 
             let bands = [Band {
                 height: 20.0 * nudge,
-            }; BINS];
+            }; SLICES];
             engine.apply(Command::Bands(Box::new(bands)));
             all_bands += time(&mut engine);
         }

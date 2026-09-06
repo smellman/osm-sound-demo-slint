@@ -33,6 +33,8 @@ pub enum Action {
     Orbit,
     /// Y — the style's light on or off.
     ToggleLight,
+    /// X — how finely the skyline is cut into height slices.
+    ToggleSlices,
     /// D-pad left — previous track.
     PreviousTrack,
     /// D-pad right — next track.
@@ -54,6 +56,7 @@ fn action_for(button: Button) -> Option<Action> {
         Button::South => Some(Action::Drop),
         Button::East => Some(Action::Orbit),
         Button::North => Some(Action::ToggleLight),
+        Button::West => Some(Action::ToggleSlices),
         Button::DPadLeft => Some(Action::PreviousTrack),
         Button::DPadRight => Some(Action::NextTrack),
         Button::DPadUp => Some(Action::PreviousRelease),
@@ -213,6 +216,7 @@ mod tests {
         assert_eq!(action_for(Button::South), Some(Action::Drop));
         assert_eq!(action_for(Button::East), Some(Action::Orbit));
         assert_eq!(action_for(Button::North), Some(Action::ToggleLight));
+        assert_eq!(action_for(Button::West), Some(Action::ToggleSlices));
         assert_eq!(action_for(Button::DPadLeft), Some(Action::PreviousTrack));
         assert_eq!(action_for(Button::DPadRight), Some(Action::NextTrack));
         assert_eq!(action_for(Button::DPadUp), Some(Action::PreviousRelease));
@@ -281,7 +285,6 @@ mod tests {
         for button in [
             Button::LeftTrigger2,
             Button::RightTrigger2,
-            Button::West,
             Button::Mode,
             Button::LeftThumb,
             Button::RightThumb,
