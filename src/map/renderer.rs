@@ -30,9 +30,13 @@ use maplibre_native_ffi::{
     NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
     RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
-#[cfg(not(target_os = "macos"))]
+#[cfg(feature = "opengl")]
+use maplibre_native_ffi::{
+    EglContextDescriptor, OpenGLContextDescriptor, OpenGLOwnedTextureDescriptor,
+};
+#[cfg(feature = "vulkan")]
 use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor};
 
 use crate::Size;
@@ -1067,7 +1071,7 @@ fn render_thread(
 /// The backend is chosen at compile time to match the `maplibre-native-ffi`
 /// feature in `Cargo.toml`; the FFI hands the graphics plumbing to the caller,
 /// so the device comes from here.
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 fn attach_render_target(
     map: &MapHandle,
     size: (u32, u32),
@@ -1083,7 +1087,7 @@ fn attach_render_target(
 /// Headless: nothing here presents to a surface, so no swapchain and no
 /// surface extensions. MapLibre Native draws into a texture the session owns
 /// and this thread reads it back.
-#[cfg(not(target_os = "macos"))]
+#[cfg(feature = "vulkan")]
 fn attach_render_target(
     map: &MapHandle,
     size: (u32, u32),
@@ -1108,13 +1112,231 @@ fn attach_render_target(
         .attach_vulkan_owned_texture(&VulkanOwnedTextureDescriptor::new(extent, context))
 }
 
+/// Attaches an OpenGL owned-texture render target, drawn through EGL.
+///
+/// Shared ownership: this thread owns an EGL context and keeps it current, and
+/// the session creates its own in the same share group. That is the
+/// configuration `maplibre-native-ffi` exercises for owned textures on Linux.
+/// `get_proc_address` is left null, as it is there — the session resolves its
+/// entry points through the display it is handed.
+#[cfg(feature = "opengl")]
+fn attach_render_target(
+    map: &MapHandle,
+    size: (u32, u32),
+) -> maplibre_native_ffi::Result<RenderSessionHandle> {
+    let egl = egl_context();
+    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
+    // SAFETY: every address below names an object leaked in
+    // `create_egl_context`, so all of them outlive this session.
+    let pointer = |address: usize| unsafe { NativePointer::from_address(address) };
+    let context = EglContextDescriptor::new(
+        pointer(egl.display),
+        pointer(egl.config),
+        pointer(egl.context),
+    );
+    map.attach_ref()?.attach_opengl_owned_texture(&OpenGLOwnedTextureDescriptor::new(
+        extent,
+        OpenGLContextDescriptor::Egl(context),
+    ))
+}
+
+/// The EGL handles a render target borrows, as plain addresses for the same
+/// reason [`VulkanContext`] holds them that way.
+#[cfg(feature = "opengl")]
+#[derive(Clone, Copy)]
+struct EglContext {
+    display: usize,
+    config: usize,
+    context: usize,
+}
+
+/// This thread's EGL context, created on first use and kept current.
+///
+/// Per thread, not per process as the Vulkan device is: an EGL context is
+/// current on one thread at a time, and the session inherits the one current
+/// where it renders. The render thread is the only one that reaches this in the
+/// app; the renderer tests each get their own.
+#[cfg(feature = "opengl")]
+fn egl_context() -> EglContext {
+    thread_local! {
+        static CONTEXT: std::cell::OnceCell<EglContext> = const { std::cell::OnceCell::new() };
+    }
+    CONTEXT.with(|cell| *cell.get_or_init(|| create_egl_context().expect("creating an EGL context")))
+}
+
+#[cfg(feature = "opengl")]
+fn create_egl_context() -> Result<EglContext, Box<dyn std::error::Error>> {
+    use glutin_egl_sys::egl;
+    use glutin_egl_sys::egl::types::EGLint;
+    use libloading::Library;
+    use std::ffi::{CString, c_void};
+
+    // Bindings only: the library itself has to be opened, and the two are kept
+    // alive by leaking them at the end.
+    let lib = unsafe { Library::new("libEGL.so.1") }
+        .or_else(|_| unsafe { Library::new("libEGL.so") })
+        .map_err(|error| format!("failed to load libEGL: {error}"))?;
+    type EglGetProcAddress = unsafe extern "system" fn(*const c_void) -> *const c_void;
+    let get_proc_address: libloading::Symbol<'_, EglGetProcAddress> =
+        unsafe { lib.get(b"eglGetProcAddress\0")? };
+    // SAFETY: every symbol is resolved from the library just opened, or from
+    // its own `eglGetProcAddress`.
+    let egl = unsafe {
+        egl::Egl::load_with(|symbol| {
+            let name = CString::new(symbol).expect("EGL symbol names do not contain NULs");
+            if let Ok(loaded) = lib.get::<*const c_void>(name.as_bytes_with_nul()) {
+                *loaded
+            } else {
+                get_proc_address(name.as_ptr().cast())
+            }
+        })
+    };
+
+    // Nothing here presents to a window, so the map draws headless on Mesa's
+    // surfaceless platform rather than opening a display server connection.
+    const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+    if !egl.GetPlatformDisplayEXT.is_loaded() {
+        return Err("eglGetPlatformDisplayEXT is unavailable".into());
+    }
+    // SAFETY: the entry point is loaded, and the attribute list is terminated.
+    let display = unsafe {
+        egl.GetPlatformDisplayEXT(
+            EGL_PLATFORM_SURFACELESS_MESA,
+            egl::DEFAULT_DISPLAY as *mut c_void,
+            [egl::NONE as EGLint].as_ptr(),
+        )
+    };
+    if display == egl::NO_DISPLAY {
+        // SAFETY: EGL is loaded; GetError needs no live display.
+        return Err(format!("eglGetPlatformDisplayEXT failed with 0x{:x}", unsafe {
+            egl.GetError()
+        })
+        .into());
+    }
+    // SAFETY: display was just obtained.
+    if unsafe { egl.Initialize(display, std::ptr::null_mut(), std::ptr::null_mut()) }
+        == egl::FALSE
+    {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglInitialize failed with 0x{:x}", unsafe { egl.GetError() }).into());
+    }
+
+    let config_attributes = [
+        egl::SURFACE_TYPE as EGLint,
+        egl::PBUFFER_BIT as EGLint,
+        egl::RENDERABLE_TYPE as EGLint,
+        egl::OPENGL_ES3_BIT as EGLint,
+        egl::RED_SIZE as EGLint,
+        8,
+        egl::GREEN_SIZE as EGLint,
+        8,
+        egl::BLUE_SIZE as EGLint,
+        8,
+        egl::ALPHA_SIZE as EGLint,
+        8,
+        egl::DEPTH_SIZE as EGLint,
+        24,
+        egl::STENCIL_SIZE as EGLint,
+        8,
+        egl::NONE as EGLint,
+    ];
+    let mut config: egl::types::EGLConfig = std::ptr::null_mut();
+    let mut config_count = 0;
+    // SAFETY: display is initialised and the attribute list is terminated.
+    if unsafe {
+        egl.ChooseConfig(
+            display,
+            config_attributes.as_ptr(),
+            &mut config,
+            1,
+            &mut config_count,
+        )
+    } == egl::FALSE
+        || config_count == 0
+    {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglChooseConfig found nothing: 0x{:x}", unsafe {
+            egl.GetError()
+        })
+        .into());
+    }
+
+    // SAFETY: EGL is initialised on this display.
+    if unsafe { egl.BindAPI(egl::OPENGL_ES_API) } == egl::FALSE {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglBindAPI failed with 0x{:x}", unsafe { egl.GetError() }).into());
+    }
+
+    let context_attributes = [
+        egl::CONTEXT_CLIENT_VERSION as EGLint,
+        3,
+        egl::NONE as EGLint,
+    ];
+    // SAFETY: display and config are live, and the attribute list is terminated.
+    let context = unsafe {
+        egl.CreateContext(
+            display,
+            config,
+            egl::NO_CONTEXT,
+            context_attributes.as_ptr(),
+        )
+    };
+    if context == egl::NO_CONTEXT {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglCreateContext failed with 0x{:x}", unsafe {
+            egl.GetError()
+        })
+        .into());
+    }
+
+    // A pbuffer only so the context has something to be current against; the
+    // map renders into the texture the session owns, never into this.
+    let surface_attributes = [
+        egl::WIDTH as EGLint,
+        1,
+        egl::HEIGHT as EGLint,
+        1,
+        egl::NONE as EGLint,
+    ];
+    // SAFETY: display and config are live, and the attribute list is terminated.
+    let surface =
+        unsafe { egl.CreatePbufferSurface(display, config, surface_attributes.as_ptr()) };
+    if surface == egl::NO_SURFACE {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglCreatePbufferSurface failed with 0x{:x}", unsafe {
+            egl.GetError()
+        })
+        .into());
+    }
+    // Shared ownership means the session joins whatever is current here, so
+    // this has to be current before any session attaches.
+    // SAFETY: every handle was created on this display.
+    if unsafe { egl.MakeCurrent(display, surface, surface, context) } == egl::FALSE {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglMakeCurrent failed with 0x{:x}", unsafe { egl.GetError() }).into());
+    }
+
+    let handles = EglContext {
+        display: display as usize,
+        config: config as usize,
+        context: context as usize,
+    };
+
+    // Deliberate, as on the Vulkan path: the render target borrows these for as
+    // long as the thread runs, and tearing them down under a live session would
+    // be a use-after-free.
+    std::mem::forget(egl);
+    std::mem::forget(lib);
+    Ok(handles)
+}
+
 /// The handles a Vulkan render target borrows.
 ///
 /// Held as plain addresses because `NativePointer` is deliberately `!Send`, and
 /// this lives in a static. The instance and device behind them are leaked, so
 /// they stay valid for the process — the render target borrows them and a map
 /// may outlive any one session.
-#[cfg(not(target_os = "macos"))]
+#[cfg(feature = "vulkan")]
 struct VulkanContext {
     instance: usize,
     physical_device: usize,
@@ -1126,13 +1348,13 @@ struct VulkanContext {
 }
 
 /// The process-wide Vulkan device the render target allocates its texture on.
-#[cfg(not(target_os = "macos"))]
+#[cfg(feature = "vulkan")]
 fn vulkan_context() -> &'static VulkanContext {
     static CONTEXT: OnceLock<VulkanContext> = OnceLock::new();
     CONTEXT.get_or_init(|| create_vulkan_context().expect("creating a Vulkan device"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(feature = "vulkan")]
 fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> {
     use ash::vk;
     use ash::vk::Handle;
@@ -1208,7 +1430,7 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
 /// The process-wide Metal device the render target allocates its texture on.
 /// Leaked deliberately: it outlives every map, and the render target only
 /// borrows the pointer.
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 fn metal_device() -> NativePointer {
     use objc2::rc::Retained;
     use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -1367,6 +1589,11 @@ fn degrees_per_pixel(zoom: f64, lat: f64) -> (f64, f64) {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// How long each settle pass gives the runtime. Generous next to the app's
+    /// `PUMP_BUDGET`, because a test starts with a cold cache and the style and
+    /// its first tiles have to come over the network.
+    const SETTLE_PUMP: Duration = Duration::from_millis(50);
 
     /// Frames a test renders to let tiles arrive; the production settle window
     /// is a timer, which a test cannot wait on frame by frame.
@@ -1668,10 +1895,13 @@ mod tests {
 
         let mut engine = Engine::new((480, 360));
         // Continuous mode draws whatever has loaded so far, so let the tiles
-        // arrive before comparing anything.
+        // arrive before comparing anything. Pumping is what makes them arrive:
+        // the style load and every tile finish on the runtime, so a loop that
+        // only renders draws an empty map for as long as it runs.
         let settle = |engine: &mut Engine| {
             let mut last = None;
             for _ in 0..TEST_SETTLE_FRAMES {
+                engine.pump(Some(SETTLE_PUMP));
                 engine.mark_dirty();
                 last = engine.render();
             }
@@ -1714,6 +1944,7 @@ mod tests {
         let size = probe_size();
         let mut engine = Engine::new(size);
         for _ in 0..TEST_SETTLE_FRAMES {
+            engine.pump(Some(SETTLE_PUMP));
             engine.mark_dirty();
             engine.render().expect("warm-up frame");
         }
@@ -1725,6 +1956,9 @@ mod tests {
             let mut frames = 0u32;
             while started.elapsed() < BUDGET {
                 step(engine, frames);
+                // As the render thread does: without it the map never finishes
+                // loading and this times an empty frame.
+                engine.pump(Some(PUMP_BUDGET));
                 engine.mark_dirty();
                 if engine.render().is_some() {
                     frames += 1;
@@ -1768,6 +2002,7 @@ mod tests {
         let mut engine = Engine::new(size);
         // Warm up so every band has a layer and the tiles are cached.
         for _ in 0..TEST_SETTLE_FRAMES {
+            engine.pump(Some(SETTLE_PUMP));
             engine.mark_dirty();
             engine.render().expect("warm-up frame");
         }

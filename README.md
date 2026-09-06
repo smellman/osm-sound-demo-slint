@@ -137,13 +137,36 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
 ### Rendering backend
 
 The map runs on [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)'s
-Rust binding. Its backend is chosen per platform in `Cargo.toml`, because the crate's
-backend features are mutually exclusive:
+Rust binding. Its backend features are mutually exclusive — the crate ships a separate
+prebuilt native artifact for each — so one has to be named at build time:
 
-| Platform | Feature | Device created by |
+| Feature | Platform | Device created by |
 | --- | --- | --- |
-| macOS | `metal` | `MTLCreateSystemDefaultDevice` |
-| Linux, others | `vulkan` | `ash`, headless: instance, physical device with a graphics queue, and a one-queue logical device — no surface and no swapchain |
+| `opengl` | Linux | EGL on Mesa's surfaceless platform: an ES 3 context on the render thread, which the session joins as a share group |
+| `vulkan` | Linux | `ash`, headless: instance, physical device with a graphics queue, and a one-queue logical device — no surface and no swapchain |
+| `metal` | macOS | `MTLCreateSystemDefaultDevice` |
+
+```bash
+cargo run --release --features opengl
+```
+
+There is no default, because defaulting to one would silently break the platforms it does
+not suit; naming none, or naming two, stops the build with a message rather than a linker
+error.
+
+**On this hardware OpenGL is several times faster than Vulkan.** Measured at 1920x1200 in
+release on an AMD RENOIR integrated GPU, with `report_playing_frame_rate`:
+
+| Backend | still | camera only | camera + 16 bands |
+| --- | --- | --- | --- |
+| `opengl` | 19.8 fps | 27.3 fps | **25.1 fps** |
+| `vulkan` | 6.5 fps | 6.5 fps | 5.8 fps |
+
+The whole app agrees: about 20 fps against Vulkan's 5.9, both read with
+`OSM_SOUND_DEMO_FPS=1`. Whether that gap is this GPU's Vulkan driver or something the
+binding does on the Vulkan path has not been chased down; the numbers are simply what
+this machine does, and worth re-measuring on other hardware before reading anything
+general into them.
 
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`

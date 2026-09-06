@@ -3946,6 +3946,8 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "gilrs",
+ "glutin_egl_sys",
+ "libloading",
  "maplibre-native-ffi",
  "objc2 0.5.2",
  "objc2-metal 0.2.2",
