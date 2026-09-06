@@ -1,0 +1,24 @@
+# Pinned to match the toolchain `maplibre-native-ffi` builds its prebuilt
+# artifacts with — its own `mise.toml` sets `rust_version = "1.95.0"`.
+#
+# This is not a preference. `libmln_ffi_platform.a`, which ships inside the
+# prebuilt native install and which `maplibre-native-ffi-sys` links statically,
+# is a Rust crate built as `crate-type = ["staticlib"]`, so it carries a whole
+# copy of the Rust runtime — std, compiler_builtins and the rest, 590 objects.
+# Linking that into a Rust binary puts two copies of std on the link line. When
+# both were built by the same rustc the symbol names match and the linker
+# resolves everything from the first archive, so nothing collides. When they
+# differ, both get pulled in and the link fails on the symbols that are not
+# hash-mangled:
+#
+#     rust-lld: error: duplicate symbol: rust_eh_personality
+#       >>> std-d1237ef7159db0a2 ... in libmaplibre_native_ffi_sys-*.rlib
+#       >>> std-2e38004a9ef1deab ... in .../libstd-2e38004a9ef1deab.rlib
+#
+# So a rustup update breaks the build until this pin catches up with whatever
+# `maplibre-native-ffi` is pinned to. The way off this pin is to build the
+# native side locally against the current toolchain and point
+# `MAPLIBRE_NATIVE_C_INSTALL_DIR` at it, rather than taking the prebuilt.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

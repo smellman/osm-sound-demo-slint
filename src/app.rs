@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-use crate::audio::{Analyzer, AudioPlayer};
+use crate::audio::{Analyzer, AudioPlayer, VjMode};
 use crate::gamepad::{Action, Gamepads};
-use crate::map::{self, CameraBoost, MapLibre};
+use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
-use crate::{AppWindow, MMapAdapter};
+use crate::{AppWindow, MapAdapter};
 
 /// Fly-to destinations, same set as the web demo's dropdown.
 const PLACES: &[(&str, f64, f64)] = &[
@@ -32,10 +32,35 @@ const PLACES: &[(&str, f64, f64)] = &[
 
 const FLY_TO_ZOOM: f64 = 16.0;
 
+/// Where the app calls home. The web demo asked the browser; a native binary
+/// would need CoreLocation or GeoClue, and on macOS that means an app bundle
+/// with a usage description, so the coordinates are given instead.
+const HOME_VAR: &str = "OSM_SOUND_DEMO_HOME";
+
+/// The project's source, opened from About.
+const PROJECT_URL: &str = "https://github.com/smellman/osm-sound-demo-slint";
+
+/// Picks the VJ input device by a substring of its name.
+const INPUT_VAR: &str = "OSM_SOUND_DEMO_INPUT";
+
 /// Degrees of bearing per second, matching the web demo's `now / 500`.
 const BEARING_DEG_PER_SEC: f64 = 2.0;
 /// Degrees of hue per second, matching the web demo's `now / 100`.
 const HUE_DEG_PER_SEC: f64 = 10.0;
+
+/// The web demo's light, restored now that the bindings can set it:
+///
+/// ```js
+/// map.setLight({
+///   color: 'hsl(' + ((now / 100) % 360) + ',' + Math.min(50 + avg / 4, 100) + '%,50%)',
+///   intensity: Math.min(1, (avg / 256) * 10),
+/// })
+/// ```
+///
+/// `avg` is the mean band level, which is 0..1 here rather than 0..255.
+const LIGHT_SATURATION_BASE: f64 = 50.0;
+const LIGHT_SATURATION_GAIN: f64 = 255.0 / 4.0;
+const LIGHT_INTENSITY_GAIN: f64 = 10.0;
 
 /// A freshly started track reports an empty queue for a moment; ignore
 /// end-of-track detection until it has had a chance to fill.
@@ -126,6 +151,8 @@ struct State {
     /// When the last fly-to landed, so the skyline can give way while the new
     /// location loads.
     flight_landed: Option<Instant>,
+    /// Listening to an input device instead of a track.
+    vj: Option<VjMode>,
     /// When the current drop effect started, if one is running.
     drop_started: Option<Instant>,
     /// When the current orbit effect started, if one is running.
@@ -189,6 +216,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gamepads: Gamepads::new(),
         place: 0,
         flight_landed: None,
+        vj: None,
         drop_started: None,
         orbit_started: None,
         release_index: 0,
@@ -254,7 +282,7 @@ fn fly_to_place(ui: &AppWindow, index: usize) {
     };
     let _ = with_state(|state| state.place = index);
     ui.set_place_index(index as i32);
-    ui.global::<MMapAdapter>()
+    ui.global::<MapAdapter>()
         .invoke_request_fly_to(*lat as f32, *lon as f32, FLY_TO_ZOOM as f32);
 }
 
@@ -444,6 +472,72 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         }
     });
 
+    ui.on_open_project(|| open_in_browser(PROJECT_URL));
+
+    ui.on_toggle_vj({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move || {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            if state.borrow().vj.is_some() {
+                let mut state = state.borrow_mut();
+                state.vj = None;
+                // Nothing feeds the analyser now, so the skyline would freeze
+                // at whatever it last heard.
+                state.audio.stop();
+                state.map.borrow_mut().reset_levels();
+                drop(state);
+                ui.set_vj(false);
+                ui.set_status("VJ mode off".into());
+                return;
+            }
+
+            // A track and an input would both be feeding the same analyser.
+            if state.borrow().playing {
+                stop(&ui, &state);
+            }
+            let wanted = std::env::var(INPUT_VAR).ok();
+            let started = state
+                .borrow()
+                .audio
+                .start_vj(wanted.as_deref().filter(|name| !name.is_empty()));
+            match started {
+                Ok(vj) => {
+                    ui.set_status(format!("VJ mode: listening to {}", vj.device()).into());
+                    state.borrow_mut().vj = Some(vj);
+                    ui.set_vj(true);
+                }
+                Err(error) => {
+                    eprintln!("VJ mode failed: {error}");
+                    ui.set_status(format!("VJ mode unavailable: {error}").into());
+                }
+            }
+        }
+    });
+
+    ui.on_locate_me({
+        let ui_handle = ui.as_weak();
+        move || {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            match home() {
+                Some((lat, lon)) => {
+                    ui.global::<MapAdapter>().invoke_request_fly_to(
+                        lat as f32,
+                        lon as f32,
+                        FLY_TO_ZOOM as f32,
+                    );
+                }
+                None => {
+                    ui.set_status(format!("Set {HOME_VAR}=<lat>,<lon> to use Locate Me").into())
+                }
+            }
+        }
+    });
+
     ui.on_open_release({
         let state = Rc::clone(state);
         move || {
@@ -601,7 +695,7 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
 fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     let ui_handle = ui.as_weak();
     let state = Rc::clone(state);
-    ui.global::<MMapAdapter>().on_tick(move || {
+    ui.global::<MapAdapter>().on_tick(move || {
         let Some(ui) = ui_handle.upgrade() else {
             return;
         };
@@ -643,11 +737,8 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             }
         }
 
-        let flying = {
-            let mut map = map.borrow_mut();
-            map.advance_flight(delta);
-            map.flying()
-        };
+        // The map flies itself now; the UI only asks whether it has landed.
+        let flying = map.borrow().flying();
         if flying {
             state.flight_landed = Some(now);
         }
@@ -676,15 +767,25 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 
         // The web demo froze the animation during a fly-to too; here it also
         // stays frozen for a moment after landing.
-        if state.playing && !loading {
+        let animating = state.playing || state.vj.is_some();
+        if animating && !loading {
             let mut map = map.borrow_mut();
             map.nudge_bearing(seconds * BEARING_DEG_PER_SEC);
             let hue_gain = 1.0
                 + DROP_HUE_GAIN * punch
                 + ORBIT_HUE_GAIN * (std::f64::consts::PI * orbit_t).sin();
             state.hue += seconds * HUE_DEG_PER_SEC * hue_gain;
+
+            // The style's light follows the mean band level, as the web demo's
+            // `setLight` did.
+            let average = f64::from(levels.iter().sum::<f32>()) / crate::audio::BINS as f64;
+            map.set_light(Light {
+                hue: state.hue.rem_euclid(360.0),
+                saturation: (LIGHT_SATURATION_BASE + average * LIGHT_SATURATION_GAIN).min(100.0),
+                intensity: (average * LIGHT_INTENSITY_GAIN).min(1.0),
+            });
             let gain = 1.0 + DROP_HEIGHT_GAIN * punch;
-            map.apply_levels(&levels, state.hue, gain);
+            map.apply_levels(&levels, gain);
         }
 
         if map::push_state(&ui, &mut map.borrow_mut()) {
@@ -715,7 +816,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             let camera = map.borrow().camera();
             // The still renderer only redraws on change, so frames per second
             // is only meaningful while the animation is running.
-            let rate = if state.playing {
+            let rate = if state.playing || state.vj.is_some() {
                 format!(" · {:.0} fps", state.fps)
             } else {
                 String::new()
@@ -754,6 +855,15 @@ fn step_to_next_after_end(ui: &AppWindow) {
     step_track(ui, &state, 1);
 }
 
+/// Reads `OSM_SOUND_DEMO_HOME` as `lat,lon`.
+fn home() -> Option<(f64, f64)> {
+    let value = std::env::var(HOME_VAR).ok()?;
+    let (lat, lon) = value.split_once(',')?;
+    let lat: f64 = lat.trim().parse().ok()?;
+    let lon: f64 = lon.trim().parse().ok()?;
+    (-90.0..=90.0).contains(&lat).then_some((lat, lon))
+}
+
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
@@ -789,5 +899,23 @@ mod tests {
         // moved" never expires.
         let long_ago = Instant::now() - hold_after_flight() - Duration::from_millis(1);
         assert!(!animation_gives_way(false, Some(long_ago)));
+    }
+
+    #[test]
+    fn home_reads_a_coordinate_pair() {
+        // Parsing is what is testable here; the variable itself is read once.
+        let parse = |value: &str| -> Option<(f64, f64)> {
+            let (lat, lon) = value.split_once(',')?;
+            let lat: f64 = lat.trim().parse().ok()?;
+            let lon: f64 = lon.trim().parse().ok()?;
+            (-90.0..=90.0).contains(&lat).then_some((lat, lon))
+        };
+        assert_eq!(parse("35.68,139.76"), Some((35.68, 139.76)));
+        assert_eq!(parse(" 35.68 , 139.76 "), Some((35.68, 139.76)));
+        assert_eq!(parse("-1.279803,36.816647"), Some((-1.279803, 36.816647)));
+        assert_eq!(parse("nonsense"), None);
+        assert_eq!(parse("35.68"), None);
+        // Latitude out of range is a swapped pair, not a location.
+        assert_eq!(parse("139.76,35.68"), None);
     }
 }

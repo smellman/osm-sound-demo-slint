@@ -1,7 +1,7 @@
 import { Button, ComboBox, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
-import { MMapView, MMapAdapter } from "@maplibre-native-slint/maplibre.slint";
+import { MapView, MapAdapter } from "map-view.slint";
 
-export { MMapAdapter }
+export { MapAdapter }
 
 // Pixel size of the map view, pushed to the backend so the headless renderer
 // can be rebuilt at the matching resolution.
@@ -39,6 +39,7 @@ export component AppWindow inherits Window {
     in property <bool> playing: false;
     in property <bool> busy: false;
     in property <bool> has-release: false;
+    in property <bool> vj: false;
     // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
     in-out property <int> place-index: 0;
     // Two-way so the gamepad's D-pad moves the release dropdown too.
@@ -54,6 +55,9 @@ export component AppWindow inherits Window {
     callback prev-track();
     callback volume-changed(/* 0.0 - 1.0 */ float);
     callback open-release();
+    callback open-project();
+    callback locate-me();
+    callback toggle-vj();
     callback quit();
 
     property <bool> about-open: false;
@@ -80,13 +84,7 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
 
                 VerticalLayout {
-                    map := MMapView {
-                        style-url: "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
-                        center-lat: 35.680655;
-                        center-lon: 139.767165;
-                        zoom: 16;
-                        pitch: 60;
-                    }
+                    map := MapView { }
                 }
 
                 // --- overlay: top-left "About" ---
@@ -130,7 +128,45 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // --- overlay: bottom-left status line ---
+                // --- overlay: top-right "VJ Mode" ---
+            Rectangle {
+                x: parent.width - self.width - 360px;
+                y: 12px;
+                width: 110px;
+                height: 32px;
+                background: root.vj ? #1f6feb : #0d0f13cc;
+                border-radius: 6px;
+
+                Button {
+                    width: 100%;
+                    height: 100%;
+                    text: root.vj ? "VJ: on" : "VJ Mode";
+                    clicked => {
+                        root.toggle-vj();
+                    }
+                }
+            }
+
+            // --- overlay: top-right "Locate Me" ---
+            Rectangle {
+                x: parent.width - self.width - 244px;
+                y: 12px;
+                width: 110px;
+                height: 32px;
+                background: #0d0f13cc;
+                border-radius: 6px;
+
+                Button {
+                    width: 100%;
+                    height: 100%;
+                    text: "Locate Me";
+                    clicked => {
+                        root.locate-me();
+                    }
+                }
+            }
+
+            // --- overlay: bottom-left status line ---
                 Rectangle {
                     x: 12px;
                     y: parent.height - self.height - 12px;
@@ -151,7 +187,7 @@ export component AppWindow inherits Window {
                     x: 12px;
                     y: 56px;
                     width: min(520px, parent.width - 24px);
-                    height: about-text.preferred-height + 32px;
+                    height: about-text.preferred-height + 72px;
                     background: #0d0f13e6;
                     border-radius: 8px;
                     border-width: 1px;
@@ -171,7 +207,21 @@ export component AppWindow inherits Window {
                             + "Developed by Taro Matsuzawa (smellman).\n\n"
                             + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
                             + "A drops, B orbits, D-pad picks track and release, L2/R2 set volume.\n"
-                            + "Escape leaves full screen, F toggles it, Q quits.";
+                            + "Escape leaves full screen, F toggles it, Q quits.\n\n"
+                            + "VJ mode drives the map from whatever the input device hears instead of "
+                            + "from a track, so it follows a live mix. Route the sound you are playing "
+                            + "into an input first: Loopback.app on macOS, Helvum with PipeWire on Linux. "
+                            + "OSM_SOUND_DEMO_INPUT picks the device by name.";
+                    }
+
+                    Button {
+                        x: 16px;
+                        y: about-text.preferred-height + 24px;
+                        width: 200px;
+                        text: "Source on GitHub";
+                        clicked => {
+                            root.open-project();
+                        }
                     }
                 }
             }
@@ -233,14 +283,35 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 2;
                         background: #0d0f13;
                         border-radius: 4px;
+                        clip: true;
 
-                        Text {
-                            x: 8px;
-                            width: parent.width - 16px;
+                        property <string> line: root.busy ? "Loading… " + root.track-title : root.track-title;
+                        // Only scroll a title that does not fit; a short one
+                        // sits still rather than sliding for no reason.
+                        property <bool> scrolling: title.preferred-width > self.width - 16px;
+                        // How far the text travels before starting over: its
+                        // own width plus the box, so it leaves on the left
+                        // before returning on the right.
+                        property <length> span: title.preferred-width + self.width;
+                        property <length> travelled: 0px;
+
+                        // Driven by a timer rather than `animation-tick`, which
+                        // only advances while something else is animating.
+                        Timer {
+                            interval: 32ms;
+                            running: parent.scrolling;
+                            triggered => {
+                                parent.travelled = parent.travelled >= parent.span
+                                    ? 0px
+                                    : parent.travelled + 2px;
+                            }
+                        }
+
+                        title := Text {
+                            x: parent.scrolling ? parent.width - parent.travelled : 8px;
                             height: 100%;
-                            text: root.busy ? "Loading… " + root.track-title : root.track-title;
+                            text: parent.line;
                             color: #e8ecf3;
-                            overflow: elide;
                             vertical-alignment: center;
                         }
                     }

@@ -1,0 +1,120 @@
+// The map's UI surface: a frame the backend renders into, and the pointer
+// input that drives it.
+//
+// Adapted from the reusable components in
+// https://github.com/maplibre/maplibre-native-slint, trimmed to what this app
+// uses. That project's contract exists to be filled by its own C++ backend;
+// this app fills it with maplibre-native-ffi instead (see `src/map/renderer.rs`),
+// so there is nothing left to track and the parts it does not need are gone:
+// the `initial-*` handshake that published a declared camera (the starting
+// camera lives in `renderer.rs` now), `style-loaded` and `map-idle` (the FFI
+// reports both as real runtime events), and `request-zoom-change`.
+
+// Bridges MapView and the renderer on the Rust side.
+export global MapAdapter {
+    // --- Backend -> UI: rendered frame ---
+    in-out property <image> frame;
+
+    // --- Backend -> UI: camera state ---
+    in-out property <float> current-lat;
+    in-out property <float> current-lon;
+    in-out property <float> current-zoom;
+    in-out property <float> current-bearing;
+    in-out property <float> current-pitch;
+
+    // --- UI -> Backend: render loop ---
+    callback tick();
+
+    // --- UI -> Backend: user interactions ---
+    callback mouse-pressed(/* x */ float, /* y */ float);
+    callback mouse-released(/* x */ float, /* y */ float);
+    callback mouse-moved(/* x */ float, /* y */ float);
+    callback wheel-zoomed(/* x */ float, /* y */ float, /* delta */ float);
+    callback double-clicked(/* x */ float, /* y */ float, /* shift */ bool);
+
+    // --- UI -> Backend: commands ---
+    callback request-style-change(/* url */ string);
+    callback request-fly-to(/* lat */ float, /* lon */ float, /* zoom */ float);
+    callback request-pitch-change(/* pitch */ float);
+    callback request-bearing-change(/* bearing */ float);
+}
+
+export component MapView {
+    in property <bool> interactive: true;
+
+    // --- out: reactive camera state ---
+    out property <float> current-lat: MapAdapter.current-lat;
+    out property <float> current-lon: MapAdapter.current-lon;
+    out property <float> current-zoom: MapAdapter.current-zoom;
+    out property <float> current-bearing: MapAdapter.current-bearing;
+    out property <float> current-pitch: MapAdapter.current-pitch;
+
+    public function fly-to(lat: float, lon: float, zoom: float) {
+        MapAdapter.request-fly-to(lat, lon, zoom);
+    }
+
+    public function set-pitch(pitch: float) {
+        MapAdapter.request-pitch-change(pitch);
+    }
+
+    public function set-bearing(bearing: float) {
+        MapAdapter.request-bearing-change(bearing);
+    }
+
+    public function set-style-url(url: string) {
+        MapAdapter.request-style-change(url);
+    }
+
+    // --- internal: render loop ---
+    Timer {
+        interval: 16ms;
+        running: true;
+        triggered => {
+            MapAdapter.tick();
+        }
+    }
+
+    // --- internal: map image display ---
+    Image {
+        source: MapAdapter.frame;
+        width: 100%;
+        height: 100%;
+
+        touch := TouchArea {
+            mouse-cursor: self.pressed ? grabbing : grab;
+
+            pointer-event(e) => {
+                if !root.interactive {
+                    return;
+                }
+                if e.kind == PointerEventKind.down {
+                    MapAdapter.mouse-pressed(self.mouse-x / 1px, self.mouse-y / 1px);
+                } else if e.kind == PointerEventKind.up {
+                    MapAdapter.mouse-released(self.mouse-x / 1px, self.mouse-y / 1px);
+                } else if e.kind == PointerEventKind.move && self.pressed {
+                    MapAdapter.mouse-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+            }
+
+            double-clicked => {
+                if !root.interactive {
+                    return;
+                }
+                // TODO: detect shift from the last pointer event.
+                MapAdapter.double-clicked(self.mouse-x / 1px, self.mouse-y / 1px, false);
+            }
+
+            scroll-event(event) => {
+                if !root.interactive {
+                    return reject;
+                }
+                MapAdapter.wheel-zoomed(
+                    self.mouse-x / 1px,
+                    self.mouse-y / 1px,
+                    event.delta-y / 1px,
+                );
+                return accept;
+            }
+        }
+    }
+}
