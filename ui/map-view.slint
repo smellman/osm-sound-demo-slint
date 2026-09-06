@@ -34,7 +34,8 @@ export global MapAdapter {
 
     // --- UI -> Backend: commands ---
     callback request-style-change(/* url */ string);
-    callback request-fly-to(/* lat */ float, /* lon */ float, /* zoom */ float);
+    // Longitude first, as MapLibre and GeoJSON order a position.
+    callback request-fly-to(/* lon */ float, /* lat */ float, /* zoom */ float);
     callback request-pitch-change(/* pitch */ float);
     callback request-bearing-change(/* bearing */ float);
 }
@@ -49,8 +50,8 @@ export component MapView {
     out property <float> current-bearing: MapAdapter.current-bearing;
     out property <float> current-pitch: MapAdapter.current-pitch;
 
-    public function fly-to(lat: float, lon: float, zoom: float) {
-        MapAdapter.request-fly-to(lat, lon, zoom);
+    public function fly-to(lon: float, lat: float, zoom: float) {
+        MapAdapter.request-fly-to(lon, lat, zoom);
     }
 
     public function set-pitch(pitch: float) {

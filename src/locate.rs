@@ -16,19 +16,22 @@ use std::time::Duration;
 use crate::otherman::Error;
 
 /// Returns `{"loc": "35.6895,139.6917", "city": "Tokyo", "country": "JP", ...}`.
+///
+/// Note that `loc` is latitude first — that is the service's format, not this
+/// app's, which orders a position longitude first as MapLibre and GeoJSON do.
 const ENDPOINT: &str = "https://ipinfo.io/json";
 
 /// Give up rather than leave the button looking stuck.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Set to `lat,lon` to answer without asking anyone.
+/// Set to `lon,lat` to answer without asking anyone.
 pub const HOME_VAR: &str = "OSM_SOUND_DEMO_HOME";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Located {
-    pub lat: f64,
     pub lon: f64,
+    pub lat: f64,
     /// What to call the place in the status line.
     pub label: String,
 }
@@ -39,13 +42,13 @@ pub fn home() -> Option<Located> {
 }
 
 fn parse_home(value: &str) -> Option<Located> {
-    let (lat, lon) = value.split_once(',')?;
-    let lat: f64 = lat.trim().parse().ok()?;
+    let (lon, lat) = value.split_once(',')?;
     let lon: f64 = lon.trim().parse().ok()?;
-    // A latitude outside the range is a swapped pair, not a location.
+    let lat: f64 = lat.trim().parse().ok()?;
+    // A latitude outside the range is a pair the wrong way round.
     (-90.0..=90.0).contains(&lat).then(|| Located {
-        lat,
         lon,
+        lat,
         label: HOME_VAR.to_owned(),
     })
 }
@@ -66,6 +69,7 @@ pub fn lookup() -> Result<Located, Error> {
 }
 
 fn parse_lookup(response: &serde_json::Value) -> Option<Located> {
+    // The service's `loc` is latitude first.
     let (lat, lon) = response.get("loc")?.as_str()?.split_once(',')?;
     let lat: f64 = lat.trim().parse().ok()?;
     let lon: f64 = lon.trim().parse().ok()?;
@@ -84,9 +88,9 @@ fn parse_lookup(response: &serde_json::Value) -> Option<Located> {
         (Some(city), Some(country)) => format!("{city}, {country}"),
         (Some(city), None) => city,
         (None, Some(country)) => country,
-        (None, None) => format!("{lat:.4}, {lon:.4}"),
+        (None, None) => format!("{lon:.4}, {lat:.4}"),
     };
-    Some(Located { lat, lon, label })
+    Some(Located { lon, lat, label })
 }
 
 #[cfg(test)]
@@ -94,15 +98,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn home_reads_a_coordinate_pair() {
-        let parsed = parse_home("35.68,139.76").expect("a pair");
-        assert_eq!((parsed.lat, parsed.lon), (35.68, 139.76));
-        assert_eq!(parse_home(" -1.28 , 36.81 ").map(|p| p.lat), Some(-1.28));
+    fn home_reads_a_position_longitude_first() {
+        let parsed = parse_home("139.76,35.68").expect("a pair");
+        assert_eq!((parsed.lon, parsed.lat), (139.76, 35.68));
+        assert_eq!(parse_home(" 36.81 , -1.28 ").map(|p| p.lat), Some(-1.28));
 
         assert_eq!(parse_home("nonsense"), None);
-        assert_eq!(parse_home("35.68"), None);
-        // Latitude out of range means the pair is the wrong way round.
-        assert_eq!(parse_home("139.76,35.68"), None);
+        assert_eq!(parse_home("139.76"), None);
+        // Latitude out of range means the pair is the wrong way round — the
+        // Google Maps order, which this deliberately does not accept.
+        assert_eq!(parse_home("35.68,139.76"), None);
     }
 
     #[test]
@@ -114,8 +119,10 @@ mod tests {
             "country": "JP",
             "loc": "43.0621,141.3544",
         });
+        // The service says latitude first; this reads it into a
+        // longitude-first position.
         let located = parse_lookup(&response).expect("a location");
-        assert_eq!((located.lat, located.lon), (43.0621, 141.3544));
+        assert_eq!((located.lon, located.lat), (141.3544, 43.0621));
         assert_eq!(located.label, "Sapporo, JP");
     }
 
@@ -124,7 +131,7 @@ mod tests {
         let unnamed = serde_json::json!({ "loc": "43.0621,141.3544" });
         assert_eq!(
             parse_lookup(&unnamed).expect("a location").label,
-            "43.0621, 141.3544"
+            "141.3544, 43.0621"
         );
 
         let country_only = serde_json::json!({ "loc": "43.0621,141.3544", "country": "JP" });

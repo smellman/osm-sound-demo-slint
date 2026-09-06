@@ -15,20 +15,21 @@ use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
 use crate::{AppWindow, MapAdapter};
 
-/// Fly-to destinations, same set as the web demo's dropdown.
+/// Fly-to destinations, same set as the web demo's dropdown. Longitude first,
+/// as MapLibre and GeoJSON order a position.
 const PLACES: &[(&str, f64, f64)] = &[
-    ("Tokyo / Japan", 35.680655, 139.767165),
-    ("Osaka / Japan", 34.7034131, 135.4975879),
-    ("Sapporo / Japan", 43.06868, 141.35079),
-    ("Hiroshima / Japan", 34.394377, 132.455486),
-    ("Fukuoka / Japan", 33.5898988, 130.4017509),
-    ("Sendai / Japan", 38.260128, 140.883518),
-    ("Kyoto / Japan", 34.985034, 135.759535),
-    ("Shimane / Japan", 35.463968, 133.064008),
-    ("Firenze / Italy", 43.777424, 11.248662),
-    ("Prishtina / Kosovo", 42.663895, 21.163569),
-    ("Nairobi / Kenya", -1.279803, 36.816647),
-    ("Manila / Philippines", 14.656875, 121.067019),
+    ("Tokyo / Japan", 139.767165, 35.680655),
+    ("Osaka / Japan", 135.4975879, 34.7034131),
+    ("Sapporo / Japan", 141.35079, 43.06868),
+    ("Hiroshima / Japan", 132.455486, 34.394377),
+    ("Fukuoka / Japan", 130.4017509, 33.5898988),
+    ("Sendai / Japan", 140.883518, 38.260128),
+    ("Kyoto / Japan", 135.759535, 34.985034),
+    ("Shimane / Japan", 133.064008, 35.463968),
+    ("Firenze / Italy", 11.248662, 43.777424),
+    ("Prishtina / Kosovo", 21.163569, 42.663895),
+    ("Nairobi / Kenya", 36.816647, -1.279803),
+    ("Manila / Philippines", 121.067019, 14.656875),
 ];
 
 const FLY_TO_ZOOM: f64 = 16.0;
@@ -285,21 +286,21 @@ fn setup_places(ui: &AppWindow) {
 /// Flies to one of `PLACES` and keeps the dropdown in step, so the map and the
 /// UI agree however the choice was made.
 fn fly_to_place(ui: &AppWindow, index: usize) {
-    let Some((_, lat, lon)) = PLACES.get(index) else {
+    let Some((_, lon, lat)) = PLACES.get(index) else {
         return;
     };
     let _ = with_state(|state| state.place = index);
     ui.set_place_index(index as i32);
     ui.global::<MapAdapter>()
-        .invoke_request_fly_to(*lat as f32, *lon as f32, FLY_TO_ZOOM as f32);
+        .invoke_request_fly_to(*lon as f32, *lat as f32, FLY_TO_ZOOM as f32);
 }
 
 /// Flies to a located position and says where it went.
 fn fly_to_located(ui: &AppWindow, located: &locate::Located) {
     notify(ui, format!("Flying to {}", located.label));
     ui.global::<MapAdapter>().invoke_request_fly_to(
-        located.lat as f32,
         located.lon as f32,
+        located.lat as f32,
         FLY_TO_ZOOM as f32,
     );
 }
@@ -873,7 +874,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 ui.set_status(
                     format!(
                         "{:.4}, {:.4} · z{:.1}{rate} · {input}",
-                        camera.lat, camera.lon, camera.zoom
+                        camera.lon, camera.lat, camera.zoom
                     )
                     .into(),
                 );

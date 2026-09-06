@@ -107,10 +107,10 @@ pub fn init(ui: &AppWindow, map: &Rc<RefCell<MapLibre>>) {
 
     adapter.on_request_fly_to({
         let map = Rc::downgrade(map);
-        move |lat, lon, zoom| {
+        move |lon, lat, zoom| {
             if let Some(map) = map.upgrade() {
                 map.borrow_mut()
-                    .fly_to(f64::from(lat), f64::from(lon), f64::from(zoom));
+                    .fly_to(f64::from(lon), f64::from(lat), f64::from(zoom));
             }
         }
     });

@@ -106,8 +106,8 @@ fn fly_duration_ms() -> Option<f64> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapCamera {
-    pub lat: f64,
     pub lon: f64,
+    pub lat: f64,
     pub zoom: f64,
     pub bearing: f64,
     pub pitch: f64,
@@ -116,8 +116,8 @@ pub struct MapCamera {
 impl Default for MapCamera {
     fn default() -> Self {
         Self {
-            lat: 35.680655,
             lon: 139.767165,
+            lat: 35.680655,
             zoom: 16.0,
             bearing: 0.0,
             pitch: DEFAULT_PITCH,
@@ -228,7 +228,7 @@ impl CameraController {
     }
 
     #[cfg(test)]
-    fn jump_for_test(&mut self, lat: f64, lon: f64, zoom: f64) {
+    fn jump_for_test(&mut self, lon: f64, lat: f64, zoom: f64) {
         self.camera.lat = clamp_lat(lat);
         self.camera.lon = normalize_lon(lon);
         self.camera.zoom = clamp_zoom(zoom);
@@ -408,7 +408,7 @@ impl MapLibre {
     /// to, and [`MapLibre::take_frame`] follows along. Anything that moves the
     /// camera from here — a drag, the sticks, an effect — cancels the flight,
     /// because it sends an absolute camera the map has to obey.
-    pub fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
+    pub fn fly_to(&mut self, lon: f64, lat: f64, zoom: f64) {
         self.controller.drag_state = None;
         self.flight_id += 1;
         self.flying = true;
@@ -1680,9 +1680,9 @@ mod tests {
         )
     }
 
-    fn controller_at(lat: f64, lon: f64, zoom: f64) -> CameraController {
+    fn controller_at(lon: f64, lat: f64, zoom: f64) -> CameraController {
         let mut controller = CameraController::default();
-        controller.jump_for_test(lat, lon, zoom);
+        controller.jump_for_test(lon, lat, zoom);
         controller
     }
 
@@ -1728,11 +1728,11 @@ mod tests {
 
     #[test]
     fn stick_pan_matches_a_drag_of_the_same_delta() {
-        let mut dragged = controller_at(35.0, 139.0, 12.0);
+        let mut dragged = controller_at(139.0, 35.0, 12.0);
         dragged.drag_state = Some(DragState { x: 0.0, y: 0.0 });
         dragged.mouse_moved(12.0, -7.0);
 
-        let mut panned = controller_at(35.0, 139.0, 12.0);
+        let mut panned = controller_at(139.0, 35.0, 12.0);
         panned.pan_by(12.0, -7.0);
 
         assert_eq!(dragged.camera, panned.camera);
@@ -1757,7 +1757,7 @@ mod tests {
 
     #[test]
     fn a_boost_shifts_the_camera_on_screen_without_moving_the_base() {
-        let mut controller = controller_at(35.0, 139.0, 16.0);
+        let mut controller = controller_at(139.0, 35.0, 16.0);
         controller.camera.bearing = 10.0;
         controller.boost = CameraBoost {
             zoom: -2.0,
