@@ -20,6 +20,23 @@ targets:
             # well, or iOS asks the view controller instead and ignores this.
             UIStatusBarHidden: true
             UIViewControllerBasedStatusBarAppearance: false
+            # Landscape only on iPhone. Portrait leaves too little width for
+            # the release dropdown to be usable, and the top-right controls run
+            # off the edge: they need 470pt and an iPhone gives 440. iOS picks
+            # the launch orientation from this list, so restricting it is what
+            # makes the app open the right way round.
+            #
+            # The iPad key has to be spelled out as well. Without it the phone's
+            # list applies to both and the iPad loses portrait, which it has the
+            # width to use.
+            UISupportedInterfaceOrientations:
+                - UIInterfaceOrientationLandscapeLeft
+                - UIInterfaceOrientationLandscapeRight
+            UISupportedInterfaceOrientations~ipad:
+                - UIInterfaceOrientationPortrait
+                - UIInterfaceOrientationPortraitUpsideDown
+                - UIInterfaceOrientationLandscapeLeft
+                - UIInterfaceOrientationLandscapeRight
             UILaunchScreen:
                 - ImageRespectSafeAreaInsets: false
             NSMicrophoneUsageDescription:
