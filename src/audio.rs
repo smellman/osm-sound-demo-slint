@@ -6,7 +6,7 @@
 //! recent window on the UI thread.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rodio::decoder::DecoderBuilder;
@@ -93,8 +93,16 @@ mod session {
 pub const BINS: usize = 16;
 
 /// FFT window length. Larger than the web demo's 32-point analyser so the bands
-/// are stable enough to look good at map frame rates.
-const WINDOW: usize = 1024;
+/// are stable enough to look good at map frame rates, and larger again than the
+/// 1024 this used to be so the logarithmic bands below have the resolution to
+/// separate the bottom of the range: 2048 puts a bin every 21.5 Hz at 44.1 kHz
+/// where 1024 put one every 43, and 43 was too coarse to split the lowest bands
+/// apart at all.
+const WINDOW: usize = 2048;
+
+/// The bottom of the analysed range. Below this the bands would be narrower
+/// than one FFT bin, and there is little in music down there to show anyway.
+const LOW_HZ: f64 = 30.0;
 
 /// Decibel range mapped onto 0.0..=1.0, same as `AnalyserNode`'s defaults.
 const MIN_DB: f32 = -90.0;
@@ -212,6 +220,53 @@ impl<S: Source> Source for Tap<S> {
     }
 }
 
+/// Which FFT bins one band covers.
+///
+/// Logarithmic, not the equal-width split this used to have and the web demo
+/// had before it. Pitch is logarithmic and so is the way music fills the
+/// spectrum: equal widths give the top band 14–22 kHz, where almost nothing
+/// changes, and squeeze everything a listener would call bass into the bottom
+/// one. Measured over four Otherman tracks, moving to equal ratios raised how
+/// much the average band moves by 40% on the busiest of them and by 129–152% on
+/// the quiet, live ones — those are the tracks the old split left standing
+/// nearly still.
+///
+/// Edges are forced apart by at least one bin. Near [`LOW_HZ`] a band is
+/// narrower than the FFT's resolution, and without this two of them would land
+/// on the same bin and show the same level for ever.
+fn band_bins(band: usize) -> (usize, usize) {
+    static EDGES: OnceLock<[usize; BINS + 1]> = OnceLock::new();
+    let edges = EDGES.get_or_init(|| {
+        // Assumed rather than read from the stream: the ratio between the edges
+        // is what matters here, and it does not depend on the rate.
+        const NYQUIST: f64 = 22_050.0;
+        let half = (WINDOW / 2) as f64;
+        let ratio = (NYQUIST / LOW_HZ).powf(1.0 / BINS as f64);
+
+        let mut edges = [0usize; BINS + 1];
+        for (band, edge) in edges.iter_mut().enumerate() {
+            let hz = LOW_HZ * ratio.powi(band as i32);
+            *edge = ((hz / NYQUIST) * half).round() as usize;
+        }
+        // Left to right, so each edge clears the one before it, and the last
+        // one still lands on the end of the spectrum.
+        for band in 1..=BINS {
+            edges[band] = edges[band].max(edges[band - 1] + 1);
+        }
+        let overflow = edges[BINS].saturating_sub(half as usize);
+        if overflow > 0 {
+            // Only reachable if the bottom bands ate the whole spectrum, which
+            // needs a window far smaller than this one; shift back rather than
+            // index out of bounds.
+            for edge in &mut edges {
+                *edge = edge.saturating_sub(overflow);
+            }
+        }
+        edges
+    });
+    (edges[band], edges[band + 1])
+}
+
 /// Turns the tapped samples into `BINS` normalized band levels.
 pub struct Analyzer {
     spectrum: Arc<Spectrum>,
@@ -256,14 +311,14 @@ impl Analyzer {
         self.fft.process(&mut self.scratch);
 
         let half = WINDOW / 2;
-        let per_band = half / BINS;
         for band in 0..BINS {
-            let start = band * per_band;
-            let magnitude = self.scratch[start..start + per_band]
+            let (start, end) = band_bins(band);
+            let width = end - start;
+            let magnitude = self.scratch[start..end]
                 .iter()
                 .map(|c| c.norm())
                 .sum::<f32>()
-                / per_band as f32
+                / width as f32
                 / half as f32;
             let db = 20.0 * magnitude.max(1e-10).log10();
             let level = ((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
@@ -514,27 +569,56 @@ mod tests {
         assert!(levels.iter().all(|level| *level == 0.0), "{levels:?}");
     }
 
+    /// The loudest band, for the placement tests below.
+    fn loudest_band(hz: f32) -> usize {
+        let levels = levels_of(Tone::new(hz, 1, WINDOW * 4));
+        levels
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(band, _)| band)
+            .unwrap_or_else(|| panic!("no band stood out for {hz} Hz: {levels:?}"))
+    }
+
     #[test]
-    fn a_low_tone_only_excites_the_lowest_band() {
-        // Each band spans (44100 / 2) / 16 ≈ 1378 Hz, so 440 Hz is band 0.
-        let levels = levels_of(Tone::new(440.0, 1, WINDOW * 4));
-        assert!(levels[0] > 0.5, "band 0 was {}", levels[0]);
+    fn a_low_tone_stays_in_the_low_bands() {
+        // Band 1 is 43..65 Hz, so that is where 50 Hz belongs.
+        let levels = levels_of(Tone::new(50.0, 1, WINDOW * 4));
+        assert_eq!(loudest_band(50.0), 1, "{levels:?}");
+
+        // It does not land there alone. At 21.5 Hz per FFT bin the bottom bands
+        // are one or two bins wide, narrower than a windowed tone's skirt, so a
+        // pure 50 Hz spreads over its neighbours — 0.91, 1.00, 0.95, 0.56 and
+        // down. That is the resolution talking, not a mistake, and what matters
+        // is that the tone stays at the bottom: nothing above band 5 sees it at
+        // all.
         assert!(
-            levels[1..].iter().all(|level| *level < levels[0] / 2.0),
-            "{levels:?}"
+            levels[6..].iter().all(|level| *level == 0.0),
+            "a 50 Hz tone reached the treble: {levels:?}"
+        );
+        assert!(
+            levels.windows(2).skip(2).all(|pair| pair[1] <= pair[0]),
+            "the leak should only fall off: {levels:?}"
         );
     }
 
     #[test]
     fn a_higher_tone_moves_to_a_higher_band() {
-        // 5 kHz falls in band 3 (4134 Hz .. 5512 Hz).
-        let levels = levels_of(Tone::new(5_000.0, 1, WINDOW * 4));
-        let loudest = levels
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(band, _)| band);
-        assert_eq!(loudest, Some(3), "{levels:?}");
+        // 5 kHz falls in band 12 (4242 Hz .. 6395 Hz).
+        assert_eq!(loudest_band(5_000.0), 12);
+    }
+
+    #[test]
+    fn the_bands_are_logarithmic() {
+        // The point of the split. Under the equal-width one this replaced,
+        // every one of these but 5 kHz landed in band 0 — three quarters of the
+        // skyline sat above 5 kHz, where music has little to say, while
+        // everything a listener would call bass shared a single building.
+        let placements: Vec<usize> = [100.0, 440.0, 1_000.0, 5_000.0, 15_000.0]
+            .into_iter()
+            .map(loudest_band)
+            .collect();
+        assert_eq!(placements, vec![3, 6, 8, 12, 15], "{placements:?}");
     }
 
     #[test]

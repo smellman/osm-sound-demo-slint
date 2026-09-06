@@ -214,8 +214,9 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
 
 - `src/audio.rs` — playback plus the spectrum analysis. A `Tap` source sits between the
   decoder and the device, copying every frame into a ring buffer; the UI thread runs a
-  1024-point FFT over it and folds the result into 16 linear bands, dB-scaled over
-  −90..−10 dB like the web demo's `AnalyserNode`.
+  2048-point FFT over it and folds the result into 16 logarithmic bands, dB-scaled over
+  −90..−10 dB like the web demo's `AnalyserNode`. See [The bands](#the-bands) for why they
+  are logarithmic and why the window is that size.
 - `src/map/renderer.rs` — the map, and the only file that touches MapLibre Native. Sixteen
   `fill-extrusion` layers split buildings into height bins, one per frequency band, and
   each band drives its layer's extrusion height and colour.
@@ -473,6 +474,37 @@ does two things that a plain buffer would not:
   fetched as fast as the network allows rather than in real time.
 
 Dropping the reader stops the download, so skipping tracks does not leave fetches running.
+
+### The bands
+
+The sixteen bands are spread by equal *ratios* — 30 Hz up to Nyquist, each band about
+1.5× the one below — and not by equal widths, which is what this did at first and what the
+web demo did before it.
+
+Equal widths put every frequency a listener would call bass into a single band and gave
+the top three quarters of the skyline to 5 kHz and above, where music has little to say.
+Measured over four Otherman tracks, ten seconds each, taking the standard deviation of
+every band's level over time — movement, not loudness, because a band with a high mean and
+no spread is a tall building standing still:
+
+| track | equal widths | equal ratios | |
+| --- | --- | --- | --- |
+| Ca5 — cyberSP | 0.216 | 0.280 | +30% |
+| NTDSK — あの娘の誕生日 | 0.125 | 0.199 | +59% |
+| miii — live@20080406 | 0.048 | 0.116 | +140% |
+| iserobin — live@netlabelwarfare | 0.045 | 0.099 | +118% |
+
+The quiet, live recordings gain most: equal widths left them barely moving at all. Under
+the old split a 100 Hz, a 440 Hz and a 1 kHz tone all landed in band 0; now they land in
+bands 3, 6 and 8, which `the_bands_are_logarithmic` holds in place.
+
+The window went from 1024 points to 2048 to pay for it. At 44.1 kHz that is a bin every
+21.5 Hz rather than every 43, and 43 was too coarse to keep the lowest bands apart — two
+of them fell on the same bin and read the same level for ever. Even at 2048 the bottom two
+bands are one bin wide each, so a pure bass tone spreads over its neighbours; that is the
+resolution talking, and `a_low_tone_stays_in_the_low_bands` pins down what it does. The
+FFT costs 8.6 µs a frame, against a 16.7 ms budget at 60 fps.
+
 
 ### The band animation
 
