@@ -1,0 +1,32 @@
+name: OpenStreetMap Sound Demo
+options:
+  bundleIdPrefix: org.smellman
+settings:
+  ENABLE_USER_SCRIPT_SANDBOXING: NO
+  # The personal team, so the App ID lands in a personal account rather than an
+  # employer's. Automatic signing creates the profile on first device build.
+  DEVELOPMENT_TEAM: 2ZZ93JSHT3
+targets:
+  OSMSoundDemo:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.3"
+    info:
+        path: Info.plist
+        properties:
+            CFBundleDisplayName: OSM Sound Demo
+            # The map runs edge to edge, so the clock and battery are in the
+            # way. UIViewControllerBasedStatusBarAppearance has to go off as
+            # well, or iOS asks the view controller instead and ignores this.
+            UIStatusBarHidden: true
+            UIViewControllerBasedStatusBarAppearance: false
+            UILaunchScreen:
+                - ImageRespectSafeAreaInsets: false
+            NSMicrophoneUsageDescription:
+                VJ mode drives the buildings and the style's light from what it hears.
+    sources: []
+    postCompileScripts:
+      - script: |
+          ./build_for_ios_with_cargo.bash osm-sound-demo-slint --features metal
+        outputFileLists:
+            $TARGET_BUILD_DIR/$EXECUTABLE_PATH

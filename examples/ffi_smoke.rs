@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn metal_device() -> Result<NativePointer, Box<dyn std::error::Error>> {
     use objc2::rc::Retained;
     use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -140,7 +140,7 @@ fn metal_device() -> Result<NativePointer, Box<dyn std::error::Error>> {
     Ok(pointer)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 fn metal_device() -> Result<NativePointer, Box<dyn std::error::Error>> {
-    Err("this smoke test is macOS only".into())
+    Err("this smoke test needs a Metal device".into())
 }

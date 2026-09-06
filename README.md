@@ -44,6 +44,87 @@ sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang l
 
 That is the list a Raspberry Pi OS image needed in practice.
 
+### iOS
+
+The `metal` feature builds for iOS, following Slint's
+[iOS guide](https://docs.slint.dev/latest/docs/slint/guide/platforms/mobile/ios/). The
+simulator needs nothing beyond the target:
+
+```bash
+cargo build --release --features metal --target=aarch64-apple-ios-sim
+```
+
+The device triple needs the native library built from source, because
+`maplibre-native-ffi` publishes a prebuilt artifact for `ios-simulator-arm64` and none for
+`aarch64-apple-ios`.
+
+What gets built is **maplibre-native-ffi**, not MapLibre Native. MapLibre Native arrives as
+that repository's `third_party/maplibre-native` submodule, with five patches from
+`patches/maplibre-native/` applied on top, and `MAPLIBRE_NATIVE_C_INSTALL_DIR` points at
+the prefix holding the FFI project's own C API — `include/maplibre_native_c.h` and
+`lib/libmaplibre-native-c.a`. A standalone MapLibre Native checkout has neither.
+
+Clone it beside this one and check out the commit `Cargo.lock` resolves
+`maplibre-native-ffi` to. The build script feeds the prefix's headers straight to bindgen
+when the variable is set, with no version check of its own, so a prefix built from a
+different commit is how the C API and the Rust crate drift apart:
+
+```bash
+git -C ../maplibre-native-ffi checkout --detach <the rev from Cargo.lock>
+# Checks out the pinned submodule and applies the patches. The submodule is marked
+# `update = none` so that Cargo skips it, so plain `git submodule update` will not do.
+bash ../maplibre-native-ffi/.mise/bin/sync-submodules
+cmake --workflow --preset ios-arm64-metal   # run from ../maplibre-native-ffi
+```
+
+That needs CMake and Ninja, takes a few minutes, and installs into
+`build/ios-arm64-metal/install`. Then:
+
+```bash
+MAPLIBRE_NATIVE_C_INSTALL_DIR=$PWD/../maplibre-native-ffi/build/ios-arm64-metal/install \
+  cargo build --release --features metal --target=aarch64-apple-ios
+```
+
+Set that variable on the command itself and nowhere else. The build script reads it for
+whatever target is being built, so exporting it in a shell profile silently points a macOS
+or simulator build at the iOS device archive.
+
+The deployment target comes from `.cargo/config.toml`. Rust's default for the triple
+predates `___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so
+without it the link fails on an undefined symbol.
+
+`project.yml` and `build_for_ios_with_cargo.bash` drive the app bundle, following the same
+guide. `xcodegen generate` writes the Xcode project and the `Info.plist`; the script picks
+the triple from what Xcode is building and supplies the device prefix above, defaulting to
+the sibling checkout and taking `MAPLIBRE_NATIVE_C_INSTALL_DIR` as an override.
+
+To put it on a device, with the device connected and `DEVELOPMENT_TEAM` in `project.yml`
+set to yours:
+
+```bash
+xcodegen generate
+xcrun devicectl list devices            # take the identifier of the one you want
+xcodebuild -project "OpenStreetMap Sound Demo.xcodeproj" -scheme OSMSoundDemo \
+  -configuration Release -destination 'id=<device>' \
+  -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
+  -derivedDataPath build/ios build
+xcrun devicectl device install app --device <device> \
+  build/ios/Build/Products/Release-iphoneos/OSMSoundDemo.app
+xcrun devicectl device process launch --device <device> org.smellman.OSMSoundDemo
+```
+
+Both provisioning flags matter: the first lets Xcode create the profile, and without the
+second a device that is not already in the developer account is refused rather than
+registered. On a free personal team the installed app stops launching after seven days,
+and building again is what renews it.
+
+One thing does not carry over to a device: gamepads. `gilrs` reports "gamepad input is not
+supported on this platform" there, so the pad bindings below do nothing and the keyboard
+ones need a hardware keyboard. Touch drives the map, links open in Safari through
+`UIApplication` rather than `open`, and VJ mode works because
+`NSMicrophoneUsageDescription` is in the generated `Info.plist` — without it iOS kills the
+app the moment it starts listening.
+
 ### Environment
 
 | Variable | Effect |

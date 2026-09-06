@@ -872,6 +872,36 @@ fn step_to_next_after_end(ui: &AppWindow) {
     step_track(ui, &state, 1);
 }
 
+/// iOS has no `open` and no process spawning to run it with, so a URL goes to
+/// `UIApplication`, which hands it to whichever app claims the scheme — Safari,
+/// for the https links here.
+#[cfg(target_os = "ios")]
+fn open_in_browser(url: &str) {
+    use objc2_foundation::{NSDictionary, NSString, NSURL};
+    use objc2_ui_kit::UIApplication;
+    use objc2_v06::MainThreadMarker;
+
+    // UIKit insists on the main thread, which is where Slint runs callbacks.
+    let Some(main_thread) = MainThreadMarker::new() else {
+        eprintln!("could not open {url}: not on the main thread");
+        return;
+    };
+    let Some(target) = NSURL::URLWithString(&NSString::from_str(url)) else {
+        eprintln!("could not open {url}: UIKit does not read it as a URL");
+        return;
+    };
+    // SAFETY: the options dictionary is empty, so it holds no value whose type
+    // could be the wrong one, and no completion handler is passed.
+    unsafe {
+        UIApplication::sharedApplication(main_thread).openURL_options_completionHandler(
+            &target,
+            &NSDictionary::new(),
+            None,
+        );
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
