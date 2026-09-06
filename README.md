@@ -183,6 +183,7 @@ line. Anything the pad does, the mouse can still do.
 | A | The drop — see [the effects](#the-effects) |
 | B | The orbit |
 | Y | Switch how the skyline is coloured — see [the effects](#the-effects) |
+| X | Switch how finely the skyline is cut, 16 slices or 64 |
 | L1 / R1 | Fly to the previous / next city (the dropdown follows) |
 | L2 / R2 | Volume down / up (the slider follows) |
 | Left stick | Pan |
@@ -217,9 +218,9 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
   2048-point FFT over it and folds the result into 16 logarithmic bands, dB-scaled over
   −90..−10 dB like the web demo's `AnalyserNode`. See [The bands](#the-bands) for why they
   are logarithmic and why the window is that size.
-- `src/map/renderer.rs` — the map, and the only file that touches MapLibre Native. Sixteen
-  `fill-extrusion` layers split buildings into height bins, one per frequency band, and
-  each band drives its layer's extrusion height and colour.
+- `src/map/renderer.rs` — the map, and the only file that touches MapLibre Native. Sixty-four
+  `fill-extrusion` layers split buildings into height slices; how many are shown is what X
+  switches, and each shown layer drives its own extrusion height and colour.
 - `src/otherman.rs` — the release API client. The native build talks to
   otherman-records.com and archive.org directly; the web demo needed a CORS proxy.
 - `src/stream.rs` — tracks are streamed, not downloaded first. rodio's decoder needs
@@ -453,6 +454,26 @@ Switching costs sixteen `fill-extrusion-color` sets and no layer churn, and it i
 hand rather than animated, so it does not touch the per-frame path. The hue goes on
 accumulating while painted, so going back to lit resumes the light's animation instead of
 jumping to a new phase.
+
+**X — how finely the skyline is cut.** Sixteen height slices or sixty-four. The style
+carries all sixty-four layers from the moment it loads and the coarse setting hides all but
+every fourth, widening those to cover the gap. Hiding rather than removing is the point:
+changing the layer set is what makes MapLibre Native re-run tile layout for the building
+source, which is what once left the map blank while a track played.
+
+The sixteen frequency bands are spread over however many slices are shown by
+interpolation, not by repeating each band four times — repeating gives four identical
+slices in a row and the skyline comes out as steps, which is what a finer cut is supposed
+to remove.
+
+Sixty-four costs about 11% of the frame rate, not the two thirds a first guess suggested:
+the slices do not overlap, so the same buildings are drawn either way and what is paid is
+per-layer overhead rather than drawing anything twice.
+
+| | 16 slices | 64 slices |
+| --- | --- | --- |
+| 1280x800 | 89.8, 89.6 fps | 79.7, 80.8 fps |
+| 1920x1200 | 71.0, 73.2 fps | 61.6, 66.5 fps |
 
 `a_palette_colours_the_buildings` holds both ends of that: the style underneath is toner
 and the resting buildings are grey, so the map is monochrome until something colours it.
