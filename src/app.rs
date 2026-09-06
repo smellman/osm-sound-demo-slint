@@ -10,6 +10,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::audio::{Analyzer, AudioPlayer, VjMode};
 use crate::gamepad::{Action, Gamepads};
+use crate::locate;
 use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
 use crate::{AppWindow, MapAdapter};
@@ -31,11 +32,6 @@ const PLACES: &[(&str, f64, f64)] = &[
 ];
 
 const FLY_TO_ZOOM: f64 = 16.0;
-
-/// Where the app calls home. The web demo asked the browser; a native binary
-/// would need CoreLocation or GeoClue, and on macOS that means an app bundle
-/// with a usage description, so the coordinates are given instead.
-const HOME_VAR: &str = "OSM_SOUND_DEMO_HOME";
 
 /// The project's source, opened from About.
 const PROJECT_URL: &str = "https://github.com/smellman/osm-sound-demo-slint";
@@ -104,6 +100,12 @@ fn hold_after_flight() -> Duration {
     })
 }
 
+/// How long a message to the user holds the status line before the ambient
+/// readout takes it back. Without this the line is rewritten within
+/// `STATUS_INTERVAL`, so anything said there is gone before it can be read —
+/// which is why Locate Me looked like it did nothing at all.
+const NOTICE_LINGER: Duration = Duration::from_secs(5);
+
 /// The status line is refreshed on a timer rather than every tick: it is only
 /// read by a human, and rebuilding it 60 times a second repaints the overlay
 /// for nothing.
@@ -153,6 +155,10 @@ struct State {
     flight_landed: Option<Instant>,
     /// Listening to an input device instead of a track.
     vj: Option<VjMode>,
+    /// A message holding the status line, and when it was posted.
+    notice: Option<(String, Instant)>,
+    /// A location lookup is in flight, so the button does not stack them up.
+    locating: bool,
     /// When the current drop effect started, if one is running.
     drop_started: Option<Instant>,
     /// When the current orbit effect started, if one is running.
@@ -217,6 +223,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         place: 0,
         flight_landed: None,
         vj: None,
+        notice: None,
+        locating: false,
         drop_started: None,
         orbit_started: None,
         release_index: 0,
@@ -284,6 +292,16 @@ fn fly_to_place(ui: &AppWindow, index: usize) {
     ui.set_place_index(index as i32);
     ui.global::<MapAdapter>()
         .invoke_request_fly_to(*lat as f32, *lon as f32, FLY_TO_ZOOM as f32);
+}
+
+/// Flies to a located position and says where it went.
+fn fly_to_located(ui: &AppWindow, located: &locate::Located) {
+    notify(ui, format!("Flying to {}", located.label));
+    ui.global::<MapAdapter>().invoke_request_fly_to(
+        located.lat as f32,
+        located.lon as f32,
+        FLY_TO_ZOOM as f32,
+    );
 }
 
 /// Steps through `PLACES` for the gamepad's L1 / R1 bumpers.
@@ -490,7 +508,7 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 state.map.borrow_mut().reset_levels();
                 drop(state);
                 ui.set_vj(false);
-                ui.set_status("VJ mode off".into());
+                notify(&ui, "VJ mode off");
                 return;
             }
 
@@ -505,13 +523,13 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 .start_vj(wanted.as_deref().filter(|name| !name.is_empty()));
             match started {
                 Ok(vj) => {
-                    ui.set_status(format!("VJ mode: listening to {}", vj.device()).into());
+                    notify(&ui, format!("VJ mode: listening to {}", vj.device()));
                     state.borrow_mut().vj = Some(vj);
                     ui.set_vj(true);
                 }
                 Err(error) => {
                     eprintln!("VJ mode failed: {error}");
-                    ui.set_status(format!("VJ mode unavailable: {error}").into());
+                    notify(&ui, format!("VJ mode unavailable: {error}"));
                 }
             }
         }
@@ -523,18 +541,31 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             let Some(ui) = ui_handle.upgrade() else {
                 return;
             };
-            match home() {
-                Some((lat, lon)) => {
-                    ui.global::<MapAdapter>().invoke_request_fly_to(
-                        lat as f32,
-                        lon as f32,
-                        FLY_TO_ZOOM as f32,
-                    );
-                }
-                None => {
-                    ui.set_status(format!("Set {HOME_VAR}=<lat>,<lon> to use Locate Me").into())
-                }
+            // The variable answers without asking anyone, which is what to use
+            // at a venue or offline.
+            if let Some(home) = locate::home() {
+                fly_to_located(&ui, &home);
+                return;
             }
+            if with_state(|state| std::mem::replace(&mut state.locating, true)) != Some(false) {
+                return;
+            }
+
+            notify(&ui, "Locating…");
+            let ui_handle = ui.as_weak();
+            std::thread::spawn(move || {
+                let result = locate::lookup();
+                let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                    let _ = with_state(|state| state.locating = false);
+                    match result {
+                        Ok(located) => fly_to_located(&ui, &located),
+                        Err(error) => {
+                            eprintln!("locating failed: {error}");
+                            notify(&ui, format!("Could not work out where you are: {error}"));
+                        }
+                    }
+                });
+            });
         }
     });
 
@@ -590,6 +621,13 @@ fn select_release(ui: &AppWindow, index: usize) {
             }
         });
     });
+}
+
+/// Puts a message on the status line and keeps it there for a moment.
+fn notify(ui: &AppWindow, message: impl Into<String>) {
+    let message = message.into();
+    ui.set_status(message.clone().into());
+    let _ = with_state(|state| state.notice = Some((message, Instant::now())));
 }
 
 fn refresh_title(ui: &AppWindow) {
@@ -826,13 +864,20 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 Some(name) => format!("🎮 {name}"),
                 None => "drag to pan, scroll to zoom".to_owned(),
             };
-            ui.set_status(
-                format!(
-                    "{:.4}, {:.4} · z{:.1}{rate} · {input}",
-                    camera.lat, camera.lon, camera.zoom
-                )
-                .into(),
-            );
+            let fresh = state
+                .notice
+                .as_ref()
+                .is_some_and(|(_, posted)| posted.elapsed() < NOTICE_LINGER);
+            if !fresh {
+                state.notice = None;
+                ui.set_status(
+                    format!(
+                        "{:.4}, {:.4} · z{:.1}{rate} · {input}",
+                        camera.lat, camera.lon, camera.zoom
+                    )
+                    .into(),
+                );
+            }
         }
 
         // Auto-advance at the end of a track, like the web demo's `ended` event.
@@ -853,15 +898,6 @@ fn step_to_next_after_end(ui: &AppWindow) {
     };
     // `playing` is still set here, so `step_track` restarts on the next track.
     step_track(ui, &state, 1);
-}
-
-/// Reads `OSM_SOUND_DEMO_HOME` as `lat,lon`.
-fn home() -> Option<(f64, f64)> {
-    let value = std::env::var(HOME_VAR).ok()?;
-    let (lat, lon) = value.split_once(',')?;
-    let lat: f64 = lat.trim().parse().ok()?;
-    let lon: f64 = lon.trim().parse().ok()?;
-    (-90.0..=90.0).contains(&lat).then_some((lat, lon))
 }
 
 fn open_in_browser(url: &str) {
@@ -899,23 +935,5 @@ mod tests {
         // moved" never expires.
         let long_ago = Instant::now() - hold_after_flight() - Duration::from_millis(1);
         assert!(!animation_gives_way(false, Some(long_ago)));
-    }
-
-    #[test]
-    fn home_reads_a_coordinate_pair() {
-        // Parsing is what is testable here; the variable itself is read once.
-        let parse = |value: &str| -> Option<(f64, f64)> {
-            let (lat, lon) = value.split_once(',')?;
-            let lat: f64 = lat.trim().parse().ok()?;
-            let lon: f64 = lon.trim().parse().ok()?;
-            (-90.0..=90.0).contains(&lat).then_some((lat, lon))
-        };
-        assert_eq!(parse("35.68,139.76"), Some((35.68, 139.76)));
-        assert_eq!(parse(" 35.68 , 139.76 "), Some((35.68, 139.76)));
-        assert_eq!(parse("-1.279803,36.816647"), Some((-1.279803, 36.816647)));
-        assert_eq!(parse("nonsense"), None);
-        assert_eq!(parse("35.68"), None);
-        // Latitude out of range is a swapped pair, not a location.
-        assert_eq!(parse("139.76,35.68"), None);
     }
 }

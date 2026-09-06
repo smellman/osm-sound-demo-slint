@@ -51,7 +51,7 @@ That is the list a Raspberry Pi OS image needed in practice.
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
-| `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me |
+| `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me, answering without the network |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
 | `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). Nothing needs this any more — see [The band animation](#the-band-animation) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
@@ -79,7 +79,7 @@ its tile cache properly rather than being cut off mid-write.
 | Escape / F | Leave full screen / toggle it |
 | Q | Quit |
 | Fly To | Fly to one of twelve cities |
-| Locate Me | Fly to `OSM_SOUND_DEMO_HOME` |
+| Locate Me | Fly to where this machine appears to be |
 | VJ Mode | Follow an input device instead of a track |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |
@@ -260,9 +260,12 @@ Some of these are deliberate, some are limits of the current Rust bindings.
   silently gives 60 back.
 - **Vector tiles come from the style's own source**, not from `planet.pmtiles` — there is no
   `pmtiles://` protocol to register on the native side.
-- **Locate Me reads a coordinate**, `OSM_SOUND_DEMO_HOME`, rather than asking the OS. The
-  web demo asked the browser; CoreLocation on macOS would mean shipping an app bundle with
-  a usage description.
+- **Locate Me asks a service, not the OS.** The web demo asked the browser, which asks the
+  OS; CoreLocation on macOS would mean shipping an app bundle with a usage description. So
+  the button looks the machine up by its public address instead — **pressing it sends that
+  address to `ipinfo.io`**, and the answer is accurate to about a city. Setting
+  `OSM_SOUND_DEMO_HOME=lat,lon` answers from that instead and never touches the network,
+  which is what to use at a venue or offline.
 - **No QR code.** It pointed at the web version; About links to the source instead.
 
 ### VJ mode

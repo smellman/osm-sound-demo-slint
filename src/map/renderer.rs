@@ -30,12 +30,12 @@ use maplibre_native_ffi::{
     NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
     RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
-#[cfg(feature = "metal")]
-use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
 #[cfg(feature = "opengl")]
 use maplibre_native_ffi::{
     EglContextDescriptor, OpenGLContextDescriptor, OpenGLOwnedTextureDescriptor,
 };
+#[cfg(feature = "metal")]
+use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
 #[cfg(feature = "vulkan")]
 use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor};
 
@@ -1174,10 +1174,11 @@ fn attach_render_target(
         pointer(egl.config),
         pointer(egl.context),
     );
-    map.attach_ref()?.attach_opengl_owned_texture(&OpenGLOwnedTextureDescriptor::new(
-        extent,
-        OpenGLContextDescriptor::Egl(context),
-    ))
+    map.attach_ref()?
+        .attach_opengl_owned_texture(&OpenGLOwnedTextureDescriptor::new(
+            extent,
+            OpenGLContextDescriptor::Egl(context),
+        ))
 }
 
 /// The EGL handles a render target borrows, as plain addresses for the same
@@ -1201,7 +1202,8 @@ fn egl_context() -> EglContext {
     thread_local! {
         static CONTEXT: std::cell::OnceCell<EglContext> = const { std::cell::OnceCell::new() };
     }
-    CONTEXT.with(|cell| *cell.get_or_init(|| create_egl_context().expect("creating an EGL context")))
+    CONTEXT
+        .with(|cell| *cell.get_or_init(|| create_egl_context().expect("creating an EGL context")))
 }
 
 #[cfg(feature = "opengl")]
@@ -1248,17 +1250,21 @@ fn create_egl_context() -> Result<EglContext, Box<dyn std::error::Error>> {
     };
     if display == egl::NO_DISPLAY {
         // SAFETY: EGL is loaded; GetError needs no live display.
-        return Err(format!("eglGetPlatformDisplayEXT failed with 0x{:x}", unsafe {
+        return Err(
+            format!("eglGetPlatformDisplayEXT failed with 0x{:x}", unsafe {
+                egl.GetError()
+            })
+            .into(),
+        );
+    }
+    // SAFETY: display was just obtained.
+    if unsafe { egl.Initialize(display, std::ptr::null_mut(), std::ptr::null_mut()) } == egl::FALSE
+    {
+        // SAFETY: EGL is loaded.
+        return Err(format!("eglInitialize failed with 0x{:x}", unsafe {
             egl.GetError()
         })
         .into());
-    }
-    // SAFETY: display was just obtained.
-    if unsafe { egl.Initialize(display, std::ptr::null_mut(), std::ptr::null_mut()) }
-        == egl::FALSE
-    {
-        // SAFETY: EGL is loaded.
-        return Err(format!("eglInitialize failed with 0x{:x}", unsafe { egl.GetError() }).into());
     }
 
     let config_attributes = [
@@ -1339,21 +1345,25 @@ fn create_egl_context() -> Result<EglContext, Box<dyn std::error::Error>> {
         egl::NONE as EGLint,
     ];
     // SAFETY: display and config are live, and the attribute list is terminated.
-    let surface =
-        unsafe { egl.CreatePbufferSurface(display, config, surface_attributes.as_ptr()) };
+    let surface = unsafe { egl.CreatePbufferSurface(display, config, surface_attributes.as_ptr()) };
     if surface == egl::NO_SURFACE {
         // SAFETY: EGL is loaded.
-        return Err(format!("eglCreatePbufferSurface failed with 0x{:x}", unsafe {
-            egl.GetError()
-        })
-        .into());
+        return Err(
+            format!("eglCreatePbufferSurface failed with 0x{:x}", unsafe {
+                egl.GetError()
+            })
+            .into(),
+        );
     }
     // Shared ownership means the session joins whatever is current here, so
     // this has to be current before any session attaches.
     // SAFETY: every handle was created on this display.
     if unsafe { egl.MakeCurrent(display, surface, surface, context) } == egl::FALSE {
         // SAFETY: EGL is loaded.
-        return Err(format!("eglMakeCurrent failed with 0x{:x}", unsafe { egl.GetError() }).into());
+        return Err(format!("eglMakeCurrent failed with 0x{:x}", unsafe {
+            egl.GetError()
+        })
+        .into());
     }
 
     let handles = EglContext {
