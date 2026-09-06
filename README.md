@@ -53,7 +53,6 @@ That is the list a Raspberry Pi OS image needed in practice.
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_HOME` | `lat,lon` for Locate Me, answering without the network |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
-| `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). Nothing needs this any more — see [The band animation](#the-band-animation) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
@@ -334,9 +333,9 @@ a track played left the map blank until the music was stopped. Working around it
 rate cap on the animation and a hold after every fly-to. A property set has none of that
 behind it, so the cap is gone and the bands update every frame.
 
-`OSM_SOUND_DEMO_BAND_HOLD_MS` still freezes the skyline after a fly-to, but nothing needs
-it any more; it is left in place pending a look at whether the animation now rides through
-a fly cleanly.
+The hold is gone with it. What remains is the freeze during a fly-to itself, which is not
+a workaround but what the web demo does: its `draw` returns early while a `flyTo` is in
+flight and resumes on `moveend`.
 
 
 ### Frame cost

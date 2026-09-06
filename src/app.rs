@@ -63,42 +63,12 @@ const LIGHT_INTENSITY_GAIN: f64 = 10.0;
 /// end-of-track detection until it has had a chance to fill.
 const END_OF_TRACK_GRACE: Duration = Duration::from_millis(750);
 
-/// How long the skyline stays frozen after a fly-to lands, by default.
-///
-/// Rewriting the band layers makes MapLibre Native re-run tile layout for the
-/// building source, which restarts whatever tiles are still in flight. Doing
-/// that sixteen times a frame kept a map that had just flown somewhere new
-/// permanently at the start line — it stayed blank until playback stopped. So
-/// the animation gives way until the new location has had time to load.
-///
-/// Only a fly-to counts: the demo spins the bearing continuously while playing,
-/// so treating every camera change as a move would freeze the skyline for good.
-/// `OSM_SOUND_DEMO_BAND_HOLD_MS` overrides this; `0` restores the old
-/// behaviour, which is how to A/B the fix.
-const HOLD_AFTER_FLIGHT: Duration = Duration::from_millis(2500);
-
 /// Whether `OSM_SOUND_DEMO_FPS` asked for the frame rate on stderr. The status
 /// line only shows it while a track plays, which is no help when the question
 /// is why the map is slow in the first place.
 fn fps_logging() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OSM_SOUND_DEMO_FPS").is_some())
-}
-
-/// Whether the band animation should give way: a fly-to is in progress, or one
-/// landed recently enough that its tiles may still be arriving.
-fn animation_gives_way(flying: bool, landed: Option<Instant>) -> bool {
-    flying || landed.is_some_and(|landed| landed.elapsed() < hold_after_flight())
-}
-
-fn hold_after_flight() -> Duration {
-    static HOLD: OnceLock<Duration> = OnceLock::new();
-    *HOLD.get_or_init(|| {
-        std::env::var("OSM_SOUND_DEMO_BAND_HOLD_MS")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .map_or(HOLD_AFTER_FLIGHT, Duration::from_millis)
-    })
 }
 
 /// How long a message to the user holds the status line before the ambient
@@ -151,9 +121,6 @@ struct State {
     gamepads: Gamepads,
     /// Which entry of `PLACES` L1/R1 steps through.
     place: usize,
-    /// When the last fly-to landed, so the skyline can give way while the new
-    /// location loads.
-    flight_landed: Option<Instant>,
     /// Listening to an input device instead of a track.
     vj: Option<VjMode>,
     /// A message holding the status line, and when it was posted.
@@ -222,7 +189,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         analyzer,
         gamepads: Gamepads::new(),
         place: 0,
-        flight_landed: None,
         vj: None,
         notice: None,
         locating: false,
@@ -778,10 +744,6 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 
         // The map flies itself now; the UI only asks whether it has landed.
         let flying = map.borrow().flying();
-        if flying {
-            state.flight_landed = Some(now);
-        }
-        let loading = animation_gives_way(flying, state.flight_landed);
 
         // The drop is applied whether or not a track is playing, so the A
         // button always does something.
@@ -804,10 +766,11 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             bearing: DROP_BEARING * (std::f64::consts::PI * drop_t).sin() + 360.0 * turn,
         });
 
-        // The web demo froze the animation during a fly-to too; here it also
-        // stays frozen for a moment after landing.
+        // Frozen for the duration of a fly-to, as the web demo's `draw` was:
+        // it returned early while its own `flyTo` flag was set, and cleared the
+        // flag on `moveend`.
         let animating = state.playing || state.vj.is_some();
-        if animating && !loading {
+        if animating && !flying {
             let mut map = map.borrow_mut();
             map.nudge_bearing(seconds * BEARING_DEG_PER_SEC);
             let hue_gain = 1.0
@@ -922,27 +885,5 @@ fn open_in_browser(url: &str) {
         .spawn()
     {
         eprintln!("could not open {url}: {error}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_animation_gives_way_only_around_a_fly_to() {
-        // Nothing has flown yet, so nothing holds the skyline.
-        assert!(!animation_gives_way(false, None));
-
-        // Mid-flight, and for a moment after landing, it gives way.
-        assert!(animation_gives_way(true, None));
-        assert!(animation_gives_way(false, Some(Instant::now())));
-
-        // Once the new location has had time to load, it animates again. This
-        // is the regression that froze the buildings: the demo spins the
-        // bearing every tick while playing, so anything keyed on "the camera
-        // moved" never expires.
-        let long_ago = Instant::now() - hold_after_flight() - Duration::from_millis(1);
-        assert!(!animation_gives_way(false, Some(long_ago)));
     }
 }
