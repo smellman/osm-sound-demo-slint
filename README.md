@@ -12,20 +12,37 @@ press play, and the buildings around you rise and fall with the music.
 ## How to run
 
 ```bash
-cargo run --release
+cargo run --release --features opengl
 ```
 
-The first build compiles MapLibre Native from source through `maplibre_native`, which
-takes a while. Debug builds work but render the map at a few frames per second — use
-`--release` for anything you actually want to look at.
+A rendering backend has to be named — `opengl`, `vulkan` or `metal`. See
+[Rendering backend](#rendering-backend) for which to pick and why there is no default.
 
-That C++ build is memory-hungry, and Cargo hands CMake one job per core. On a 16-core,
-38 GB machine the default parallelism runs the box out of memory and the build is killed,
-so cap it:
+Debug builds work but render the map at a few frames per second, so use `--release` for
+anything you actually want to look at. The toolchain is pinned by `rust-toolchain.toml`
+and rustup will fetch it on first build; the pin is not a preference, and the file says
+what breaks without it.
+
+### Prerequisites
+
+`maplibre-native-ffi` downloads a prebuilt native artifact rather than building MapLibre
+Native from source, so there is no C++ toolchain to set up and a clean build takes about a
+minute. What is still needed is the system libraries the Rust crates link against and the
+one that generates the FFI bindings. On Debian and Raspberry Pi OS:
 
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
+sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang libclang-dev
 ```
+
+| Package | Wanted by |
+| --- | --- |
+| `libfontconfig-dev` | Slint, to find the fonts it draws the UI text with |
+| `libasound2-dev` | ALSA, which `rodio` plays through |
+| `libudev-dev` | `gilrs`, to enumerate gamepads |
+| `libssl-dev` | OpenSSL, pulled in through `ureq`'s `native-tls` |
+| `clang`, `libclang-dev` | `bindgen`, which generates the FFI bindings from the native library's C header at build time |
+
+That is the list a Raspberry Pi OS image needed in practice.
 
 ### Environment
 
