@@ -93,6 +93,33 @@ pub fn init(ui: &AppWindow, map: &Rc<RefCell<MapLibre>>) {
         }
     });
 
+    adapter.on_pinch_started({
+        let map = Rc::downgrade(map);
+        move || {
+            if let Some(map) = map.upgrade() {
+                map.borrow_mut().pinch_started();
+            }
+        }
+    });
+
+    adapter.on_pinch_zoomed({
+        let map = Rc::downgrade(map);
+        move |scale| {
+            if let Some(map) = map.upgrade() {
+                map.borrow_mut().pinch_zoomed(scale);
+            }
+        }
+    });
+
+    adapter.on_pinch_ended({
+        let map = Rc::downgrade(map);
+        move || {
+            if let Some(map) = map.upgrade() {
+                map.borrow_mut().pinch_ended();
+            }
+        }
+    });
+
     adapter.on_wheel_zoomed({
         let map = Rc::downgrade(map);
         move |_x, _y, delta| {

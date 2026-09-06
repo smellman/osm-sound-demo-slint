@@ -370,6 +370,8 @@ pub struct MapLibre {
     flight_id: u64,
     /// How many height slices the skyline is shown at; one of [`SLICE_MODES`].
     slices: usize,
+    /// The zoom a pinch started from, while one is in progress.
+    pinch_from: Option<f64>,
 }
 
 impl MapLibre {
@@ -397,6 +399,7 @@ impl MapLibre {
             flying: false,
             flight_id: 0,
             slices: SLICE_MODES[0],
+            pinch_from: None,
         }
     }
 
@@ -515,6 +518,44 @@ impl MapLibre {
     }
 
     /// Adds to the zoom level. Used by the gamepad's D-pad.
+    /// Starts a pinch, remembering the zoom it began from.
+    ///
+    /// The gesture reports a scale cumulative from its own start rather than a
+    /// step, so the zoom it means is only knowable against that starting point.
+    /// Nudging by the difference each time would drift, because the zoom is
+    /// clamped and a nudge that was clipped is never given back.
+    pub fn pinch_started(&mut self) {
+        self.pinch_from = Some(self.controller.camera.zoom);
+    }
+
+    /// Zooms to where a pinch has reached. `scale` is the gesture's cumulative
+    /// factor, 1.0 at the start.
+    ///
+    /// Doubling the distance between the fingers is one zoom level, which is
+    /// what a map is expected to do: zoom is already a log scale, so the two
+    /// line up exactly.
+    pub fn pinch_zoomed(&mut self, scale: f32) {
+        let Some(from) = self.pinch_from else { return };
+        if let Some(zoom) = pinched_zoom(from, scale) {
+            self.set_zoom(zoom);
+        }
+    }
+
+    pub fn pinch_ended(&mut self) {
+        self.pinch_from = None;
+    }
+
+    /// Zooms to an absolute level, as a pinch does.
+    pub fn set_zoom(&mut self, zoom: f64) {
+        let zoom = clamp_zoom(zoom);
+        if self.controller.camera.zoom == zoom {
+            return;
+        }
+        self.flying = false;
+        self.controller.camera.zoom = zoom;
+        self.push_camera();
+    }
+
     pub fn nudge_zoom(&mut self, delta: f64) {
         if delta == 0.0 {
             return;
@@ -1764,6 +1805,20 @@ fn metal_device() -> NativePointer {
     unsafe { NativePointer::from_address(address) }
 }
 
+/// Where a pinch has zoomed to, from the zoom it started at and the gesture's
+/// cumulative scale.
+///
+/// Doubling the distance between the fingers is one zoom level. Zoom is already
+/// a log scale — each level halves the ground a pixel covers — so a factor maps
+/// onto it by its logarithm and the two line up exactly, which is what makes
+/// the map feel like it is being pulled by the fingers rather than driven.
+///
+/// A scale of zero or less is not a gesture that happened; the fingers cannot
+/// meet, and a zero would take the logarithm to negative infinity.
+fn pinched_zoom(from: f64, scale: f32) -> Option<f64> {
+    (scale > 0.0).then(|| from + f64::from(scale).log2())
+}
+
 /// Spreads `BINS` frequency levels across `shown` height slices.
 ///
 /// Linear interpolation rather than repeating each band `shown / BINS` times:
@@ -2188,6 +2243,25 @@ mod tests {
             json["paint"]["fill-extrusion-color"],
             serde_json::json!(BUILDING_COLOR)
         );
+    }
+
+    #[test]
+    fn a_pinch_maps_a_doubling_onto_one_zoom_level() {
+        // The gesture starts at 1.0 and the map must not move for it.
+        assert_eq!(pinched_zoom(12.0, 1.0), Some(12.0));
+        // Fingers twice as far apart, one level in; half as far, one level out.
+        assert_eq!(pinched_zoom(12.0, 2.0), Some(13.0));
+        assert_eq!(pinched_zoom(12.0, 0.5), Some(11.0));
+        assert_eq!(pinched_zoom(12.0, 4.0), Some(14.0));
+    }
+
+    #[test]
+    fn a_pinch_that_could_not_have_happened_moves_nothing() {
+        // Zero would take the logarithm to negative infinity and the clamp
+        // would land the map at the minimum zoom, which is not what a pinch
+        // that never happened should do.
+        assert_eq!(pinched_zoom(12.0, 0.0), None);
+        assert_eq!(pinched_zoom(12.0, -1.0), None);
     }
 
     #[test]

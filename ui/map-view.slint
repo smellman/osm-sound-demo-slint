@@ -30,6 +30,10 @@ export global MapAdapter {
     callback mouse-released(/* x */ float, /* y */ float);
     callback mouse-moved(/* x */ float, /* y */ float);
     callback wheel-zoomed(/* x */ float, /* y */ float, /* delta */ float);
+    // Two-finger pinch. `scale` is cumulative from the start of the gesture.
+    callback pinch-started();
+    callback pinch-zoomed(/* scale */ float);
+    callback pinch-ended();
     callback double-clicked(/* x */ float, /* y */ float, /* shift */ bool);
 
     // --- UI -> Backend: commands ---
@@ -76,45 +80,69 @@ export component MapView {
     }
 
     // --- internal: map image display ---
-    Image {
-        source: MapAdapter.frame;
-        width: 100%;
-        height: 100%;
-
-        touch := TouchArea {
-            mouse-cursor: self.pressed ? grabbing : grab;
-
-            pointer-event(e) => {
-                if !root.interactive {
-                    return;
-                }
-                if e.kind == PointerEventKind.down {
-                    MapAdapter.mouse-pressed(self.mouse-x / 1px, self.mouse-y / 1px);
-                } else if e.kind == PointerEventKind.up {
-                    MapAdapter.mouse-released(self.mouse-x / 1px, self.mouse-y / 1px);
-                } else if e.kind == PointerEventKind.move && self.pressed {
-                    MapAdapter.mouse-moved(self.mouse-x / 1px, self.mouse-y / 1px);
-                }
+    //
+    // The pinch handler wraps the image rather than sitting beside it: it only
+    // recognises gestures inside its own geometry, and a two-finger pinch has
+    // to be seen wherever the map is. Single-finger drags go on reaching the
+    // TouchArea inside it.
+    ScaleRotateGestureHandler {
+        started => {
+            if root.interactive {
+                MapAdapter.pinch-started();
             }
-
-            double-clicked => {
-                if !root.interactive {
-                    return;
-                }
-                // TODO: detect shift from the last pointer event.
-                MapAdapter.double-clicked(self.mouse-x / 1px, self.mouse-y / 1px, false);
+        }
+        updated => {
+            if root.interactive {
+                MapAdapter.pinch-zoomed(self.scale);
             }
+        }
+        ended => {
+            MapAdapter.pinch-ended();
+        }
+        cancelled => {
+            MapAdapter.pinch-ended();
+        }
 
-            scroll-event(event) => {
-                if !root.interactive {
-                    return reject;
+        Image {
+            source: MapAdapter.frame;
+            width: 100%;
+            height: 100%;
+
+            touch := TouchArea {
+                mouse-cursor: self.pressed ? grabbing : grab;
+
+                pointer-event(e) => {
+                    if !root.interactive {
+                        return;
+                    }
+                    if e.kind == PointerEventKind.down {
+                        MapAdapter.mouse-pressed(self.mouse-x / 1px, self.mouse-y / 1px);
+                    } else if e.kind == PointerEventKind.up {
+                        MapAdapter.mouse-released(self.mouse-x / 1px, self.mouse-y / 1px);
+                    } else if e.kind == PointerEventKind.move && self.pressed {
+                        MapAdapter.mouse-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
                 }
-                MapAdapter.wheel-zoomed(
-                    self.mouse-x / 1px,
-                    self.mouse-y / 1px,
-                    event.delta-y / 1px,
-                );
-                return accept;
+
+                double-clicked => {
+                    if !root.interactive {
+                        return;
+                    }
+                    // TODO: detect shift from the last pointer event.
+                    MapAdapter.double-clicked(self.mouse-x / 1px, self.mouse-y / 1px, false);
+                }
+
+                scroll-event(event) => {
+                    if !root.interactive {
+                        return reject;
+                    }
+                    MapAdapter.wheel-zoomed(
+                        self.mouse-x / 1px,
+                        self.mouse-y / 1px,
+                        event.delta-y / 1px,
+                    );
+                    return accept;
+                }
             }
         }
     }
