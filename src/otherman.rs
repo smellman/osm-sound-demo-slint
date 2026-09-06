@@ -141,13 +141,65 @@ pub fn fetch_release(id: &str) -> Result<Release, Error> {
     Ok(metadata_agent().get(&url).call()?.body_mut().read_json()?)
 }
 
-/// Track URLs come back protocol-relative (`//archive.org/...`).
+/// Turns a track URL from the API into one that can actually be requested.
+///
+/// The API hands these back in three shapes, and a release will happily mix
+/// them: protocol-relative (`//archive.org/...`), absolute and already
+/// percent-encoded, and — this is the one that used to fail — protocol-relative
+/// with the file name left raw, spaces and all. A raw one never reached the
+/// network at all: `ureq` rejected it as `invalid uri character` before opening
+/// a connection, so every track on such a release was silently unplayable.
+///
+/// Encoding has to leave the already-encoded ones alone, because `%20` run
+/// through a naive encoder becomes `%2520` and asks for a file that does not
+/// exist. So a `%` that already introduces a valid escape is passed through
+/// whole, and only a stray one is encoded.
 pub fn absolute_url(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("//") {
-        format!("https://{rest}")
-    } else {
-        url.to_string()
+    let absolute = match url.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    };
+
+    // Only the part after the authority is escaped; a scheme and a host have
+    // their own rules and arrive well-formed.
+    let split = absolute
+        .find("://")
+        .and_then(|scheme| absolute[scheme + 3..].find('/').map(|at| scheme + 3 + at));
+    let Some(split) = split else {
+        return absolute;
+    };
+    let (head, path) = absolute.split_at(split);
+    format!("{head}{}", escape_path(path))
+}
+
+/// Percent-encodes what a URL path may not carry literally, passing existing
+/// escapes through untouched.
+fn escape_path(path: &str) -> String {
+    /// `pchar` plus the delimiters that separate a path from a query, none of
+    /// which should be touched where they appear.
+    const KEEP: &str = "-._~!$&'()*+,;=:@/?#";
+
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let escaped = byte == b'%'
+            && bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit));
+        if escaped {
+            out.push_str(&path[index..index + 3]);
+            index += 3;
+        } else if byte.is_ascii_alphanumeric() || KEEP.as_bytes().contains(&byte) {
+            out.push(byte as char);
+            index += 1;
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+            index += 1;
+        }
     }
+    out
 }
 
 /// Starts streaming a track and returns a reader the decoder can begin on
@@ -179,4 +231,67 @@ pub fn stream(url: &str) -> Result<StreamingRead, Error> {
 
     reader.wait_for(PREBUFFER_BYTES)?;
     Ok(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_protocol_relative_url_gains_a_scheme() {
+        assert_eq!(
+            absolute_url("//www.archive.org/download/OTMN001/01_Ca5_-_cyberSP.mp3"),
+            "https://www.archive.org/download/OTMN001/01_Ca5_-_cyberSP.mp3"
+        );
+    }
+
+    #[test]
+    fn a_raw_path_is_escaped() {
+        // The shape that used to be unplayable: spaces and non-ASCII straight
+        // from the API, which `ureq` refuses as an invalid URI before it opens
+        // a connection.
+        let escaped = absolute_url("//example.org/download/OTMN083/01. A - 劇.mp3");
+        assert_eq!(
+            escaped,
+            "https://example.org/download/OTMN083/01.%20A%20-%20%E5%8A%87.mp3"
+        );
+    }
+
+    #[test]
+    fn an_escaped_path_is_left_alone() {
+        // Some releases come back already encoded. Encoding again would turn
+        // `%20` into `%2520` and ask for a file that is not there.
+        let url = "https://archive.org/download/OTMN100/01.%20bypass%20%26%20co.mp3";
+        assert_eq!(absolute_url(url), url);
+    }
+
+    #[test]
+    fn a_stray_percent_is_escaped() {
+        // A percent that introduces nothing is a literal one, and has to be
+        // encoded or it reads as the start of an escape that is not there.
+        assert_eq!(
+            absolute_url("https://example.org/a/100%25/b%zz/c"),
+            "https://example.org/a/100%25/b%25zz/c"
+        );
+    }
+
+    #[test]
+    fn a_url_without_a_path_is_untouched() {
+        assert_eq!(absolute_url("https://example.org"), "https://example.org");
+    }
+
+    /// Opt-in: the shape that started this, end to end.
+    #[test]
+    fn the_release_that_would_not_play_now_streams() {
+        if std::env::var_os("OSM_SOUND_DEMO_NETWORK_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_NETWORK_TESTS=1 to run");
+            return;
+        }
+        let release = fetch_release("OTMN083").expect("the release");
+        let track = release.tracklist.first().expect("a track");
+        let url = absolute_url(&track.url);
+        assert!(url.is_ascii(), "the request URL is still raw: {url}");
+        let reader = stream(&url).expect("the track streams");
+        assert!(reader.byte_len().is_some_and(|len| len > 0), "empty track");
+    }
 }
