@@ -2,7 +2,7 @@
 
 A native rebuild of [osm-sound-demo](https://github.com/smellman/osm-sound-demo) — the
 "dancing buildings" OpenStreetMap visualiser — on Rust, with
-[MapLibre Native](https://github.com/maplibre/maplibre-native-rs) for the map,
+[MapLibre Native](https://github.com/maplibre/maplibre-native-ffi) for the map,
 [Slint](https://slint.dev/) for the UI and [rodio](https://github.com/RustAudio/rodio)
 for audio. No browser, no Web Audio, no DOM.
 
@@ -10,17 +10,6 @@ Pick a release from the [Otherman Records](https://www.otherman-records.com/) ca
 press play, and the buildings around you rise and fall with the music.
 
 ## How to run
-
-The reusable Slint map components come from a submodule, so clone with it:
-
-```bash
-git clone --recurse-submodules <this repo>
-# or, in an existing clone:
-git submodule update --init vendor/maplibre-native-slint
-```
-
-Only that submodule's `.slint` files are used, so `--recursive` is not needed — its own
-submodules (maplibre-native and friends) stay unfetched.
 
 ```bash
 cargo run --release
@@ -45,13 +34,11 @@ CMAKE_BUILD_PARALLEL_LEVEL=4 cargo build -j 4 --release
 | `MAPLIBRE_STYLE_URL` | Override the initial style URL |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
-| `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). `0` restores the old behaviour — see [Why the skyline pauses](#why-the-skyline-pauses-after-a-fly-to) |
+| `OSM_SOUND_DEMO_BAND_HOLD_MS` | How long the skyline stays frozen after a fly-to lands (default 2500). Nothing needs this any more — see [The band animation](#the-band-animation) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
-| `OSM_SOUND_DEMO_RUN_LOOP_TICKS` | Run-loop turns per render pass (default 1). Raising it measures worse — see the comment on `RUN_LOOP_TICKS_PER_FRAME` |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
 | `OSM_SOUND_DEMO_RENDER_SCALE` | Render the map at this fraction of its on-screen size and let Slint scale it up (default 1.0, floor 0.25). The single biggest thing you can trade for frame rate — see [Frame rate](#frame-rate) |
-| `OSM_SOUND_DEMO_BAND_INTERVAL_MS` | Shortest gap between rewrites of the band layers (default 150). `0` rewrites on every pass, which is what the map used to do |
 
 ## Controls
 
@@ -122,9 +109,9 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
   decoder and the device, copying every frame into a ring buffer; the UI thread runs a
   1024-point FFT over it and folds the result into 16 linear bands, dB-scaled over
   −90..−10 dB like the web demo's `AnalyserNode`.
-- `src/map/renderer.rs` — the map. Sixteen `fill-extrusion` layers split buildings into
-  height bins, one per frequency band, and each band drives its layer's extrusion height
-  and colour.
+- `src/map/renderer.rs` — the map, and the only file that touches MapLibre Native. Sixteen
+  `fill-extrusion` layers split buildings into height bins, one per frequency band, and
+  each band drives its layer's extrusion height and colour.
 - `src/otherman.rs` — the release API client. The native build talks to
   otherman-records.com and archive.org directly; the web demo needed a CORS proxy.
 - `src/stream.rs` — tracks are streamed, not downloaded first. rodio's decoder needs
@@ -135,51 +122,38 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
   carries the SDL_GameControllerDB mappings, so `Button::Start` really is Start on
   whatever pad is plugged in. Reading raw HID instead would give button *indices* that
   only line up on XInput-style controllers.
-- `ui/app.slint` — the window. `MMapView` and `MMapAdapter` are imported as
-  `@maplibre-native-slint/maplibre.slint` from the
-  [maplibre-native-slint](https://github.com/maplibre/maplibre-native-slint) submodule in
-  `vendor/`; `build.rs` wires that alias up.
+- `ui/app.slint` — the window. `ui/map-view.slint` holds `MapView` and `MapAdapter`: the
+  frame the renderer draws into and the pointer input that drives it. They started as the
+  reusable components from
+  [maplibre-native-slint](https://github.com/maplibre/maplibre-native-slint) and were
+  trimmed to what this app uses when the map moved to the FFI binding — that project's
+  contract is meant to be filled by its own C++ backend, so there was nothing left to
+  track.
 
 ### Rendering backend
 
-The backend is chosen per platform in `Cargo.toml`, because `maplibre_native`'s backend
-features are mutually exclusive:
+The map runs on [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)'s
+Rust binding. Its backend is chosen per platform in `Cargo.toml`, because the crate's
+backend features are mutually exclusive:
 
-| Platform | Feature | MapLibre Native backend |
-| --- | --- | --- |
-| macOS | `metal` | `MLN_WITH_METAL` |
-| Linux, others | `vulkan` | `MLN_WITH_VULKAN` |
+| Platform | Feature |
+| --- | --- |
+| macOS | `metal` |
+| Linux, others | `vulkan` |
 
-Vulkan because it measures fastest on the load this app puts on the map. At 1920x1200
-in release, from `report_playing_frame_rate`:
+Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
+caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
+creates the device (`MTLCreateSystemDefaultDevice` on macOS), attaches an *owned texture*
+render target at the map's size, and reads the frame back with
+`read_premultiplied_rgba8_into` for Slint. The binding downloads a prebuilt native
+artifact, so a clean build takes well under a minute rather than compiling MapLibre Native
+from source.
 
-| Backend | still | camera only | camera + 16 bands |
-| --- | --- | --- | --- |
-| `vulkan` | 11.7 fps | 11.2 fps | **7.2 fps** |
-| `wgpu` | 12.0 fps | 10.8 fps | 2.8 fps |
+The map runs in `MapMode::Continuous`, and the render thread drives it with
+`RuntimeHandle::pump` plus `drain_events`. Those events are what tell it whether to draw
+again — `MapRenderUpdateAvailable`, and `needs_repaint` on `MapRenderFrameFinished` — and
+when the style has loaded, which is when the band layers can be added.
 
-The two draw at the same speed. They part company under the band animation, which
-rewrites sixteen extrusion layers and makes MapLibre Native re-run tile layout for the
-building source, rebuilding buffers and textures constantly. On the `wgpu` path every one
-of those goes through `webgpu-shim`'s FFI and wgpu's validation; Vulkan talks to the
-driver directly.
-
-`wgpu` is otherwise the more appealing shape, and the one to revisit if that shim gets
-cheaper: it is the only backend that can hand Slint the rendered texture directly
-(`ImageRenderer::take_texture` into `slint::Image::try_from`, with Slint on
-`unstable-wgpu-29` so both sides share one WGPU device), which removes the full-screen
-CPU read-back the others need. With an idle map that is worth about 1.7x — but it does
-not come close to covering the resource churn above.
-
-`opengl` cannot run this app at all: `gl::HeadlessBackend::readStillImage` reaches
-`getContext()` with no `gfx::BackendScope` around it. Still mode gets away with it because
-`HeadlessFrontend::render(Map&)` wraps the whole call, but continuous mode reads outside
-that scope, so a debug build trips `assert(BackendScope::exists())` and a release build
-reads a GL context that is no longer current.
-
-The map runs in MapLibre Native's **continuous** mode, not still (`renderStill`) mode.
-That matters a lot here: still mode re-lays out the building tiles on every change to the
-layer set, and this demo changes sixteen layers at a time.
 
 ### Frame rate
 
@@ -201,30 +175,21 @@ included, and on a large display that dominates:
 It is 1.0 by default: a Mac on Metal does not need it, and nobody should have the map go
 blurry without asking.
 
-**The band layers.** Rewriting one makes MapLibre Native re-run tile layout for the
-building source. What matters is how often a pass touches the layer set at all, not how
-many layers it touches — rewriting a single band per pass and rewriting all sixteen
-measured the same, 8.3 fps against 8.1, because either way the whole source is laid out
-again. So the bands move together, no more often than `OSM_SOUND_DEMO_BAND_INTERVAL_MS`;
-passes in between render at the map's own speed. At 1920x1200:
+**The band layers — under the old bindings.** Rewriting one made MapLibre Native re-run
+tile layout for the building source, and what mattered was whether a pass touched the
+layer set at all, not how many layers it touched: rewriting one band per pass and
+rewriting all sixteen measured the same, 8.3 fps against 8.1. Holding the bands to one
+batch per 150 ms took 1920x1200 from 7.0 fps to 9.8, and 1280x800 to 20.4.
 
-| Interval | camera + 16 bands | Skyline updates |
-| --- | --- | --- |
-| 0 (every pass) | 7.0 fps | every pass |
-| 150 ms (default) | 9.8 fps | 6.7 / sec |
-| 250 ms | 10.4 fps | 4 / sec |
-| 400 ms | 11.4 fps | 2.5 / sec |
-
-Past 150 ms the frame rate stops improving much and the skyline starts to step visibly,
-which for something that follows music reads as broken.
-
-Together, at 1280x800 with the default interval, the same load runs at **20.4 fps against
-the 7.0 fps it started at**.
+None of that applies now. `set_layer_property` does not touch the layer set, so the bands
+update every frame and the interval knob is gone. The numbers are kept here because they
+are why the app moved to the FFI binding.
 
 Things that turned out not to be the problem, in case they look tempting: turning
 MapLibre Native's run loop more times per pass (worse — 21 fps at one turn, 6 at eight,
 3 at thirty-two), and dropping frames at the render-thread channel (never happened;
 `OSM_SOUND_DEMO_FPS` shows `shown` and `rendered` matching).
+
 
 ### Differences from the web demo
 
@@ -281,39 +246,29 @@ does two things that a plain buffer would not:
 
 Dropping the reader stops the download, so skipping tracks does not leave fetches running.
 
-### Why the skyline pauses after a fly-to
+### The band animation
 
-Each of the sixteen band layers is rewritten by removing and re-adding it, because the Rust
-bindings expose no paint-property setters. Every change to the layer set makes MapLibre
-Native re-run tile layout for the building source — which restarts the tiles still in
-flight. Sixteen rewrites a frame at 60 Hz therefore keep a *loading* map permanently at the
-start line: flying while a track played left the map blank until the music was stopped.
+Each of the sixteen band layers is created once, and the animation then sets
+`fill-extrusion-height` and `fill-extrusion-color` on it with `set_layer_property`.
 
-So the animation gives way while a fly-to is in the air and for
-`OSM_SOUND_DEMO_BAND_HOLD_MS` after it lands, and the rewrites are rate capped to one batch
-per 50 ms the rest of the time.
+That is the reason this app moved to the FFI binding. The older `maplibre_native` crate had
+no paint-property setter, so a band update meant removing and re-adding the layer — and
+every change to the layer set makes MapLibre Native re-run tile layout for the building
+source. Sixteen of those a frame starved tile loading outright: flying somewhere new while
+a track played left the map blank until the music was stopped. Working around it cost a
+rate cap on the animation and a hold after every fly-to. A property set has none of that
+behind it, so the cap is gone and the bands update every frame.
 
-Only a fly-to counts as a move. Keying this on "the camera changed" instead does not work:
-the demo spins the bearing on every tick while a track plays, so the window never expires
-and the buildings stop moving altogether.
+`OSM_SOUND_DEMO_BAND_HOLD_MS` still freezes the skyline after a fly-to, but nothing needs
+it any more; it is left in place pending a look at whether the animation now rides through
+a fly cleanly.
+
 
 ### Frame cost
 
-Measured in a release build at 960×640 on an Apple Silicon Mac, one frame carrying both a
-camera change and all sixteen band layers being swapped:
+Measured on an Apple Silicon Mac in release, at 1024x720 with a track playing and the band
+animation running every frame: **58 fps**, including the CPU read-back of every frame.
 
-| Renderer mode | per frame |
-| --- | --- |
-| Still (`render_static`) | ~58 ms |
-| Continuous (`render_once`) | ~15 ms |
-
-In continuous mode the layer swaps are effectively free — a steady frame costs about 4 ms
-whether zero, one or sixteen bands moved, so the bands are simply synced every frame. In
-still mode any change to the layer set cost a fixed ~40 ms re-layout, which capped the demo
-at roughly 22 fps and needed a batching heuristic to hide. The app now holds 60 fps at
-1024×720 while playing.
-
-`report_frame_costs` and `report_static_vs_continuous` re-measure both on your machine.
 
 ## Tests
 

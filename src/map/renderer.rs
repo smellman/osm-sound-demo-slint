@@ -17,19 +17,19 @@
 //! picks up finished frames.
 
 use std::cell::RefCell;
-use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use maplibre_native::tile_server_options::TileServerOptions;
-use maplibre_native::{
-    AnyLayer, CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng,
-    ResourceOptions, RunLoopHandle,
+use maplibre_native_ffi::{
+    CameraOptions, LatLng, MapHandle, MapMode, MapOptions, MetalContextDescriptor,
+    MetalOwnedTextureDescriptor, NativePointer, RenderSessionHandle, RenderTargetExtent,
+    RuntimeEventMask, RuntimeEventPayload, RuntimeEventSource, RuntimeEventType, RuntimeHandle,
+    RuntimeOptions,
 };
 
 use crate::Size;
@@ -37,6 +37,15 @@ use crate::audio::BINS;
 
 pub const DEFAULT_STYLE_URL: &str =
     "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
+
+/// The style the map opens with, `MAPLIBRE_STYLE_URL` overriding it.
+fn default_style_url() -> String {
+    std::env::var("MAPLIBRE_STYLE_URL")
+        .ok()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_STYLE_URL.to_owned())
+}
 
 /// Vector source and source-layer holding building footprints in the
 /// OpenMapTiles schema used by tile.openstreetmap.jp.
@@ -47,59 +56,19 @@ const BUILDING_SOURCE_LAYER: &str = "building";
 /// frequency band drives its own slice of the skyline.
 const MAX_BUILDING_HEIGHT: f64 = 200.0;
 
-/// Rewriting the layer is not free, so a band counts as unchanged until its
-/// target moves by more than this many metres, or this many degrees of hue.
+/// A band counts as unchanged until its target moves by more than this many
+/// metres, or this many degrees of hue, which keeps the animation from setting
+/// properties that would not be visible.
 const HEIGHT_EPSILON: f64 = 2.0;
 const HUE_EPSILON: f64 = 4.0;
 
-/// Floor on how often the band layers are rewritten.
-///
-/// Rewriting a layer makes MapLibre Native re-run tile layout for the building
-/// source, and that is the most expensive thing this demo asks of the map: at
-/// 1920x1200 it takes the frame rate from 14.0 fps to 8.2.
-///
-/// What matters is how often a pass touches the layer set at all, not how many
-/// layers it touches — one swap and sixteen measured the same (8.3 fps against
-/// 8.1), because either way the whole source is laid out again. So rewriting a
-/// few bands per pass, round-robin, bought nothing and is not what this does;
-/// the bands all move together, less often. Passes in between then render at
-/// the map's own speed.
-///
-/// The interval has to clear the frame time to do anything: at 8 fps a pass
-/// arrives every 125 ms, so anything under that lets every pass rewrite. At
-/// 1920x1200 the band load cost 7.0 fps on every pass, 9.8 at this interval,
-/// and 11.4 at 400 ms — but 400 ms leaves the skyline stepping 2.5 times a
-/// second, which for something following music reads as broken. This is the
-/// point where most of the frame rate is back and the animation still moves.
-///
-/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overrides it, `0` rewriting every pass.
-const BAND_REWRITE_INTERVAL: Duration = Duration::from_millis(150);
-
-/// How long the map keeps rendering after the last change. Tiles arrive
-/// asynchronously, so stopping at the first frame after a move would leave
-/// whatever landed later undrawn.
-const SETTLE_WINDOW: Duration = Duration::from_secs(3);
-
-/// Run-loop turns per render pass. One, on every platform.
-///
-/// Draining harder looks like it should help — a pass queues far more work than
-/// one turn dispatches, since each of the sixteen layer swaps re-runs tile
-/// layout for the building source — but it measures worse, and not only on
-/// Darwin, where `RunLoop::runOnce` parks rather than returning straight away
-/// and 32 turns cost about 100 ms a pass against 4 ms for one. On Linux, where
-/// a turn is `UV_RUN_NOWAIT` and returns immediately, the map idled at 21 fps
-/// on one turn, 6 on eight, and 3 on thirty-two: the turns dispatch the layout
-/// work a render then waits on anyway, so doing more per pass only moves the
-/// wait.
-///
-/// `OSM_SOUND_DEMO_RUN_LOOP_TICKS` overrides it, which is how that was
-/// measured.
-const RUN_LOOP_TICKS_PER_FRAME: u32 = 1;
-
-/// How long the render thread waits for a command before ticking MapLibre
-/// Native's run loop anyway, so in-flight tile requests keep progressing while
-/// the map is otherwise idle.
+/// How long the render thread waits for a command before turning the runtime
+/// anyway, so in-flight tile requests keep progressing while the map is idle.
 const IDLE_TICK: Duration = Duration::from_millis(16);
+
+/// How long each runtime pump may block waiting for work. Short, because the
+/// thread has a frame to draw afterwards.
+const PUMP_BUDGET: Duration = Duration::from_millis(2);
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
@@ -287,10 +256,6 @@ impl CameraController {
         true
     }
 
-    fn cancel_flight(&mut self) {
-        self.flight = None;
-    }
-
     #[cfg(test)]
     fn jump_for_test(&mut self, lat: f64, lon: f64, zoom: f64) {
         self.flight = None;
@@ -370,8 +335,6 @@ pub struct MapLibre {
     rendered: Arc<AtomicU64>,
     controller: CameraController,
     size: (u32, u32),
-    style_loaded: bool,
-    map_idle: bool,
 }
 
 impl MapLibre {
@@ -396,8 +359,6 @@ impl MapLibre {
             rendered,
             controller: CameraController::default(),
             size,
-            style_loaded: false,
-            map_idle: false,
         }
     }
 
@@ -427,14 +388,6 @@ impl MapLibre {
         self.push_camera();
     }
 
-    pub fn style_loaded(&self) -> bool {
-        self.style_loaded
-    }
-
-    pub fn map_idle(&self) -> bool {
-        self.map_idle
-    }
-
     /// Frames finished by the render thread since startup. The UI counts the
     /// ones it actually showed, and the gap between the two is the number of
     /// frames dropped for want of a taker.
@@ -449,46 +402,10 @@ impl MapLibre {
         while let Ok(frame) = self.frames.try_recv() {
             newest = Some(frame);
         }
-        if newest.is_some() {
-            self.style_loaded = true;
-            self.map_idle = true;
-        }
         newest
     }
 
-    /// Applies the style and camera declared on the Slint `MMapView`.
-    /// `MAPLIBRE_STYLE_URL` overrides the declared style, matching the
-    /// maplibre-native-slint demos.
-    pub fn apply_initial(
-        &mut self,
-        style_url: &str,
-        lat: f64,
-        lon: f64,
-        zoom: f64,
-        bearing: f64,
-        pitch: f64,
-    ) {
-        let style_url = std::env::var("MAPLIBRE_STYLE_URL")
-            .ok()
-            .map(|url| url.trim().to_owned())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| style_url.to_owned());
-        if !style_url.is_empty() {
-            self.send(Command::Style(style_url));
-        }
-        self.controller.cancel_flight();
-        self.controller.camera = MapCamera {
-            lat: clamp_lat(lat),
-            lon: normalize_lon(lon),
-            zoom: clamp_zoom(zoom),
-            bearing: normalize_bearing(bearing),
-            pitch: clamp_pitch(pitch),
-        };
-        self.push_camera();
-    }
-
     pub fn load_style(&mut self, style_url: &str) {
-        self.style_loaded = false;
         self.send(Command::Style(style_url.to_owned()));
     }
 
@@ -527,11 +444,6 @@ impl MapLibre {
 
     pub fn set_bearing(&mut self, bearing: f64) {
         self.controller.camera.bearing = normalize_bearing(bearing);
-        self.push_camera();
-    }
-
-    pub fn set_zoom(&mut self, zoom: f64) {
-        self.controller.camera.zoom = clamp_zoom(zoom);
         self.push_camera();
     }
 
@@ -635,47 +547,54 @@ pub fn create_map(size: Size) -> Rc<RefCell<MapLibre>> {
 }
 
 /// Owns the MapLibre Native renderer for the lifetime of the render thread.
+/// Owns the MapLibre Native runtime, map and render session for the lifetime of
+/// the render thread. All three handles are thread-affine, so they never leave
+/// it.
 struct Engine {
-    renderer: Option<ImageRenderer<Continuous>>,
-    /// MapLibre Native delivers tile loads and layer layouts through the run
-    /// loop of the thread that owns the map, so it has to be turned for a
-    /// render to pick up anything new.
-    run_loop: RunLoopHandle,
-    /// How many run-loop turns each pass takes. One turn dispatches one queued
-    /// task, and a moving camera plus per-frame layer swaps queue far more than
-    /// that, so the loop is drained rather than nudged.
-    ticks_per_frame: u32,
+    runtime: Option<RuntimeHandle>,
+    map: Option<Attached>,
     cache: PathBuf,
     size: (u32, u32),
     style_url: String,
     camera: MapCamera,
     bands: [Band; BINS],
     applied: [Option<Band>; BINS],
-    /// Shortest gap between rewrites of the layer set.
-    rewrite_interval: Duration,
-    /// When the layers were last rewritten, for the interval above.
-    bands_written: Instant,
+    /// Something the UI asked for has not been drawn yet.
     dirty: bool,
-    /// Until when the map keeps rendering so late-arriving tiles get drawn.
-    settling_until: Instant,
+    /// MapLibre Native says it has more to draw — tiles still arriving, or a
+    /// transition in flight. Unlike the old bindings, this is a real signal
+    /// rather than a settle timer.
+    wants_repaint: bool,
+    /// Reused between frames; the read-back is the same size every time.
+    pixels: Vec<u8>,
+}
+
+/// A map with a render target attached. Kept together because the session is
+/// bound to the map, and a resize replaces both.
+struct Attached {
+    map: MapHandle,
+    session: RenderSessionHandle,
+    /// The band layers exist and can be updated in place.
+    layers: bool,
+    /// The style has finished loading, so its sources exist and layers
+    /// referring to them can be added.
+    style_loaded: bool,
 }
 
 impl Engine {
     fn new(size: (u32, u32)) -> Self {
         Self {
-            renderer: None,
-            run_loop: RunLoopHandle::current(),
-            ticks_per_frame: run_loop_ticks(),
+            runtime: None,
+            map: None,
             cache: cache_path(),
             size,
-            style_url: DEFAULT_STYLE_URL.to_owned(),
+            style_url: default_style_url(),
             camera: MapCamera::default(),
             bands: [Band::default(); BINS],
             applied: [None; BINS],
-            rewrite_interval: band_rewrite_interval(),
-            bands_written: Instant::now() - SETTLE_WINDOW,
             dirty: true,
-            settling_until: Instant::now() + SETTLE_WINDOW,
+            wants_repaint: false,
+            pixels: Vec::new(),
         }
     }
 
@@ -684,18 +603,24 @@ impl Engine {
             Command::Resize(width, height) => {
                 if self.size != (width, height) {
                     self.size = (width, height);
-                    // Continuous mode can be resized in place, so the renderer
-                    // and its layers survive.
-                    if let Some(renderer) = self.renderer.as_mut() {
-                        renderer.set_map_size(maplibre_native::Size { width, height });
-                    }
+                    // A map's size is fixed at creation and an owned texture is
+                    // allocated at one extent, so a resize replaces both. The
+                    // runtime, and with it the tile cache, survives.
+                    self.map = None;
+                    self.applied = [None; BINS];
                     self.mark_dirty();
                 }
             }
             Command::Style(url) => {
                 if self.style_url != url {
                     self.style_url = url;
-                    self.renderer = None;
+                    if let Some(attached) = &mut self.map {
+                        if let Err(error) = attached.map.set_style_url(&self.style_url) {
+                            eprintln!("style load failed: {error}");
+                        }
+                        attached.layers = false;
+                        attached.style_loaded = false;
+                    }
                     self.applied = [None; BINS];
                     self.mark_dirty();
                 }
@@ -717,145 +642,245 @@ impl Engine {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
-        self.settling_until = Instant::now() + SETTLE_WINDOW;
     }
 
-    /// Whether another frame is worth rendering: something changed, or the map
-    /// is still settling after the last change.
-    ///
-    /// MapLibre Native's own signals are no help here: in continuous mode
-    /// `needs_repaint` never clears, and `onDidBecomeIdle` never fires (checked
-    /// against 0.8.7). So the settle window is a timer.
+    /// Whether another frame is worth rendering.
     fn wants_frame(&self) -> bool {
-        self.dirty || self.settling_until > Instant::now()
+        self.dirty || self.wants_repaint
     }
 
-    /// Turns the run loop, dispatching up to `ticks_per_frame` queued tasks.
-    fn tick(&self) {
-        for _ in 0..self.ticks_per_frame {
-            self.run_loop.tick();
+    /// Turns the runtime, letting tile loads and transitions make progress, and
+    /// picks up whether the map wants another frame.
+    fn pump(&mut self, timeout: Option<Duration>) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        if let Err(error) = runtime.pump(timeout, None) {
+            eprintln!("pumping the map runtime failed: {error}");
+            return;
+        }
+
+        let Some(attached) = &self.map else { return };
+        let source = RuntimeEventSource::Map(attached.map.id());
+        let batch = match runtime.drain_events(0) {
+            Ok(batch) => batch,
+            Err(error) => {
+                eprintln!("draining map events failed: {error}");
+                return;
+            }
+        };
+        let mut wants_repaint = false;
+        let mut style_loaded = false;
+        for event in batch.iter() {
+            if event.source() != source {
+                continue;
+            }
+            match event.event_type() {
+                RuntimeEventType::MapRenderUpdateAvailable => wants_repaint = true,
+                RuntimeEventType::MapStyleLoaded => style_loaded = true,
+                RuntimeEventType::MapRenderFrameFinished => {
+                    if let RuntimeEventPayload::RenderFrame(frame) = event.payload() {
+                        wants_repaint |= frame.needs_repaint;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.wants_repaint = wants_repaint;
+        if style_loaded && let Some(attached) = &mut self.map {
+            attached.style_loaded = true;
+            // The style's sources exist now, so the band layers can go on.
+            self.dirty = true;
         }
     }
 
-    /// Renders one frame, first syncing any band whose layer has fallen behind.
+    /// Renders one frame, first bringing the band layers up to date.
     fn render(&mut self) -> Option<Frame> {
-        self.ensure_renderer()?;
+        self.ensure_map()?;
         self.sync_bands();
-        self.tick();
 
-        let camera = camera_update(self.camera);
-        let renderer = self.renderer.as_mut()?;
-        renderer.update_camera(&camera);
-        renderer.render_once();
+        let camera = camera_options(self.camera);
+        let attached = self.map.as_ref()?;
+        if let Err(error) = attached.map.jump_to(&camera) {
+            eprintln!("moving the camera failed: {error}");
+        }
+        if let Err(error) = attached.session.render_update() {
+            eprintln!("rendering failed: {error}");
+            self.dirty = false;
+            return None;
+        }
 
-        let image = renderer.read_still_image();
-        let size = image.size();
-        let buffer = image.buffer();
+        let (width, height) = self.size;
+        let expected = width as usize * height as usize * 4;
+        if self.pixels.len() != expected {
+            self.pixels = vec![0; expected];
+        }
+        let info = match attached
+            .session
+            .read_premultiplied_rgba8_into(&mut self.pixels)
+        {
+            Ok(info) => info,
+            Err(error) => {
+                eprintln!("reading the frame back failed: {error}");
+                self.dirty = false;
+                return None;
+            }
+        };
 
         self.dirty = false;
 
         // Slint builds the pixel buffer from the reported dimensions, so a
-        // short buffer would panic the UI thread rather than show a bad frame.
-        let expected = size.width as usize * size.height as usize * 4;
-        if buffer.len() != expected {
+        // mismatch would panic the UI thread rather than show a bad frame.
+        if (info.width, info.height) != (width, height) {
             eprintln!(
-                "skipping a {}x{} frame: got {} bytes, expected {expected}",
-                size.width,
-                size.height,
-                buffer.len()
+                "skipping a frame: read back {}x{}, expected {width}x{height}",
+                info.width, info.height
             );
             return None;
         }
 
         Some(Frame {
-            width: size.width,
-            height: size.height,
-            rgba: buffer.to_vec(),
+            width,
+            height,
+            rgba: self.pixels.clone(),
         })
     }
 
-    fn ensure_renderer(&mut self) -> Option<()> {
-        if self.renderer.is_some() {
+    /// Brings up the runtime, map and render session, and loads the style.
+    fn ensure_map(&mut self) -> Option<()> {
+        if self.runtime.is_none() {
+            let mut options = RuntimeOptions::default();
+            options.cache_path = Some(self.cache.to_string_lossy().into_owned());
+            match RuntimeHandle::with_options(&options) {
+                Ok(runtime) => self.runtime = Some(runtime),
+                Err(error) => {
+                    eprintln!("creating the map runtime failed: {error}");
+                    return None;
+                }
+            }
+        }
+        if self.map.is_some() {
             return Some(());
         }
-        let url = match self.style_url.parse() {
-            Ok(url) => url,
+
+        let runtime = self.runtime.as_ref()?;
+        let (width, height) = self.size;
+        let mut options = MapOptions::new(width, height, 1.0);
+        options.mode = MapMode::Continuous;
+        let map = match MapHandle::with_options(runtime, &options) {
+            Ok(map) => map,
             Err(error) => {
-                eprintln!("invalid style URL {}: {error}", self.style_url);
+                eprintln!("creating the map failed: {error}");
                 return None;
             }
         };
-        let mut renderer = build_renderer(self.size, &self.cache);
-        if let Err(error) = renderer.load_style_from_url(&url).wait() {
+
+        // A map queues no event of an unselected type, so this comes before the
+        // style load.
+        if let Err(error) = map.set_event_mask(
+            RuntimeEventMask::MAP_RENDER_UPDATE_AVAILABLE
+                | RuntimeEventMask::MAP_RENDER_FRAME_FINISHED
+                | RuntimeEventMask::MAP_STYLE_LOADED,
+        ) {
+            eprintln!("selecting map events failed: {error}");
+        }
+        if let Err(error) = map.set_style_url(&self.style_url) {
             eprintln!("style load failed: {error}");
         }
-        self.renderer = Some(renderer);
+
+        let session = match attach_render_target(&map, self.size) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("attaching the render target failed: {error}");
+                return None;
+            }
+        };
+        self.map = Some(Attached {
+            map,
+            session,
+            layers: false,
+            style_loaded: false,
+        });
         Some(())
     }
 
-    /// Rewrites the band layers that have fallen behind their targets, no more
-    /// often than [`Engine::rewrite_interval`].
+    /// Brings the band layers up to date.
     ///
-    /// Every change to the layer set makes MapLibre Native re-run tile layout
-    /// for the layer's source, which restarts whatever tiles are still in
-    /// flight. Doing that on every pass kept a loading map permanently at the
-    /// start line — flying while a track played left the map blank until the
-    /// music stopped — and costs a third of the frame rate besides.
-    ///
-    /// Giving way for longer than this, while tiles from a move are still
-    /// landing, is [`crate::app`]'s job: it knows when a fly-to is in flight,
-    /// whereas the engine only sees a stream of camera updates and cannot tell
-    /// a fly-to from the demo's own bearing spin.
+    /// The layers are created once and then their paint properties are set in
+    /// place. That is the whole reason this app moved to the FFI bindings: the
+    /// old ones had no property setter, so a band update meant removing and
+    /// re-adding the layer, and every change to the layer set makes MapLibre
+    /// Native re-run tile layout for the building source. Sixteen of those a
+    /// frame starved tile loading outright — flying while a track played left
+    /// the map blank until the music stopped — and cost a third of the frame
+    /// rate besides. None of that applies to a property set.
     fn sync_bands(&mut self) {
-        let may_update = self.bands_written.elapsed() >= self.rewrite_interval;
-        let mut wrote = false;
+        let Some(attached) = &self.map else { return };
+        // A layer naming a source the style has not loaded yet is rejected, and
+        // `set_style_url` only starts the load.
+        if !attached.style_loaded {
+            return;
+        }
+        if !attached.layers {
+            for band in 0..BINS {
+                let json = building_layer_json(band, &building_layer_id(band));
+                if let Err(error) = attached
+                    .map
+                    .add_style_layer_json(json.to_string().as_bytes(), None)
+                {
+                    eprintln!("adding building layer {band} failed: {error}");
+                    return;
+                }
+            }
+            if let Some(attached) = &mut self.map {
+                attached.layers = true;
+            }
+            self.applied = [None; BINS];
+        }
+
+        let Some(attached) = &self.map else { return };
         for band in 0..BINS {
             let target = self.bands[band];
-            match self.applied[band] {
-                Some(applied) if applied.close_to(target) => continue,
-                // Holding an update is fine; never having created the layer is
-                // not, so a missing one is always built.
-                Some(_) if !may_update => continue,
-                _ => {}
+            if self.applied[band].is_some_and(|applied| applied.close_to(target)) {
+                continue;
             }
-            if self.set_building_layer(band, target) {
-                self.applied[band] = Some(target);
-                wrote = true;
+            let id = building_layer_id(band);
+            let height = serde_json::json!(target.height).to_string();
+            let color = serde_json::json!(band_color(target)).to_string();
+            let set = attached
+                .map
+                .set_layer_property(&id, "fill-extrusion-height", height.as_bytes())
+                .and_then(|()| {
+                    attached
+                        .map
+                        .set_layer_property(&id, "fill-extrusion-color", color.as_bytes())
+                });
+            match set {
+                Ok(()) => self.applied[band] = Some(target),
+                Err(error) => eprintln!("updating building layer {band} failed: {error}"),
             }
-        }
-        if wrote {
-            self.bands_written = Instant::now();
         }
     }
 
-    /// Replaces one band's layer. There is no paint-property setter in the Rust
-    /// bindings, so the layer is removed and re-added from JSON; either way the
-    /// demo's layers stay on top of the style.
-    fn set_building_layer(&mut self, band: usize, spec: Band) -> bool {
-        let id = building_layer_id(band);
-        let json = building_layer_json(band, &id, spec);
-        let layer = match AnyLayer::from_json_value(&json) {
-            Ok(layer) => layer,
-            Err(error) => {
-                eprintln!("building layer {band} is invalid: {error}");
-                return false;
+    /// Closes the map and runtime in order, so the tile cache is flushed rather
+    /// than cut off.
+    fn close(&mut self) {
+        if let Some(attached) = self.map.take() {
+            drop(attached.session);
+            if let Err(error) = attached.map.close() {
+                eprintln!("closing the map failed: {error}");
             }
-        };
-        let Some(renderer) = self.renderer.as_mut() else {
-            return false;
-        };
-        let mut style = renderer.style();
-        style.remove_layer(&id);
-        if let Err(error) = style.add_layer(layer) {
-            eprintln!("adding building layer {band} failed: {error}");
-            return false;
         }
-        true
+        if let Some(runtime) = self.runtime.take()
+            && let Err(error) = runtime.close()
+        {
+            eprintln!("closing the map runtime failed: {error}");
+        }
     }
 }
 
-/// Render thread body: coalesce whatever commands are pending, tick MapLibre
-/// Native's run loop, then render at most one frame per pass.
+/// Render thread body: coalesce whatever commands are pending, turn the
+/// runtime, then render at most one frame per pass.
 fn render_thread(
     size: (u32, u32),
     commands: Receiver<Command>,
@@ -864,31 +889,34 @@ fn render_thread(
 ) {
     let mut engine = Engine::new(size);
     loop {
-        // Only park when there is nothing to draw. Waiting the idle tick out on
-        // a frame the engine already wants added `IDLE_TICK` to every pass,
-        // which on its own capped the map at 60 fps and, next to a render that
-        // costs a few milliseconds, was most of the frame time. Removing it
-        // took the idling map from 16 fps to 21.
+        // Only park when there is nothing to draw.
         if !engine.wants_frame() {
             match commands.recv_timeout(IDLE_TICK) {
                 Ok(command) => engine.apply(command),
                 Err(RecvTimeoutError::Timeout) => {}
                 // The UI dropped its handle: the app is shutting down.
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        let mut disconnected = false;
         loop {
             match commands.try_recv() {
                 Ok(command) => engine.apply(command),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
+        if disconnected {
+            break;
+        }
 
+        // The runtime has to turn whether or not a frame is wanted: that is how
+        // tile loads finish and how the map says it wants another one.
+        engine.pump(Some(PUMP_BUDGET));
         if !engine.wants_frame() {
-            // Nothing to draw, but in-flight tile requests still need the run
-            // loop turned so they finish and mark the map dirty.
-            engine.tick();
             continue;
         }
         if let Some(frame) = engine.render() {
@@ -898,16 +926,45 @@ fn render_thread(
             let _ = frames.try_send(frame);
         }
     }
+    engine.close();
 }
 
-/// Shortest gap between rewrites of the band layers,
-/// `OSM_SOUND_DEMO_BAND_INTERVAL_MS` overriding the default so the trade
-/// against the frame rate can be measured.
-fn band_rewrite_interval() -> Duration {
-    std::env::var("OSM_SOUND_DEMO_BAND_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .map_or(BAND_REWRITE_INTERVAL, Duration::from_millis)
+/// Attaches a render target the map draws into and this thread reads back.
+///
+/// The backend is chosen at compile time to match the `maplibre-native-ffi`
+/// feature in `Cargo.toml`; the FFI hands the graphics plumbing to the caller,
+/// so the device comes from here.
+#[cfg(target_os = "macos")]
+fn attach_render_target(
+    map: &MapHandle,
+    size: (u32, u32),
+) -> maplibre_native_ffi::Result<RenderSessionHandle> {
+    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
+    let context = MetalContextDescriptor::new(metal_device());
+    map.attach_ref()?
+        .attach_metal_owned_texture(&MetalOwnedTextureDescriptor::new(extent, context))
+}
+
+/// The process-wide Metal device the render target allocates its texture on.
+/// Leaked deliberately: it outlives every map, and the render target only
+/// borrows the pointer.
+#[cfg(target_os = "macos")]
+fn metal_device() -> NativePointer {
+    use objc2::rc::Retained;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    static DEVICE: OnceLock<usize> = OnceLock::new();
+    let address = *DEVICE.get_or_init(|| {
+        // SAFETY: MTLCreateSystemDefaultDevice returns a retained-compatible
+        // Objective-C object.
+        let device = unsafe { Retained::retain(MTLCreateSystemDefaultDevice()) }
+            .expect("MTLCreateSystemDefaultDevice returned nil");
+        let address = Retained::as_ptr(&device) as usize;
+        std::mem::forget(device);
+        address
+    });
+    // SAFETY: the device is leaked, so the address stays valid for the process.
+    unsafe { NativePointer::from_address(address) }
 }
 
 fn building_layer_id(band: usize) -> String {
@@ -918,7 +975,9 @@ fn building_layer_id(band: usize) -> String {
 /// buildings by their true height so the skyline is split into `BINS` slices,
 /// exactly as the web demo did.
 ///
-fn building_layer_json(band: usize, id: &str, spec: Band) -> serde_json::Value {
+/// The paint values here are only the resting state; the animation sets them in
+/// place with `set_layer_property`.
+fn building_layer_json(band: usize, id: &str) -> serde_json::Value {
     let bin_width = MAX_BUILDING_HEIGHT / BINS as f64;
     let low = band as f64 * bin_width;
     let high = (band + 1) as f64 * bin_width;
@@ -929,8 +988,8 @@ fn building_layer_json(band: usize, id: &str, spec: Band) -> serde_json::Value {
         "source-layer": BUILDING_SOURCE_LAYER,
         "filter": ["all", [">", "render_height", low], ["<=", "render_height", high]],
         "paint": {
-            "fill-extrusion-color": band_color(spec),
-            "fill-extrusion-height": spec.height,
+            "fill-extrusion-color": band_color(Band::default()),
+            "fill-extrusion-height": Band::default().height,
             "fill-extrusion-opacity": 0.6,
         },
     })
@@ -996,32 +1055,14 @@ fn render_scale() -> f64 {
     })
 }
 
-fn resource_options(cache: &Path) -> ResourceOptions {
-    ResourceOptions::default()
-        .with_tile_server_options(&TileServerOptions::default())
-        .with_cache_path(cache.to_path_buf())
-}
-
-fn camera_update(camera: MapCamera) -> CameraUpdate {
-    CameraUpdate::new()
-        .center(LatLng {
-            lat: camera.lat,
-            lng: camera.lon,
-        })
-        .zoom(camera.zoom)
-        .bearing(camera.bearing)
-        .pitch(camera.pitch)
-}
-
-fn build_renderer(size: (u32, u32), cache: &Path) -> ImageRenderer<Continuous> {
-    ImageRendererBuilder::new()
-        .with_size(
-            NonZeroU32::new(size.0).unwrap_or(NonZeroU32::MIN),
-            NonZeroU32::new(size.1).unwrap_or(NonZeroU32::MIN),
-        )
-        .with_pixel_ratio(1.0)
-        .with_resource_options(resource_options(cache))
-        .build_continuous_renderer()
+/// The camera as MapLibre Native's FFI wants it.
+fn camera_options(camera: MapCamera) -> CameraOptions {
+    let mut options = CameraOptions::default();
+    options.center = Some(LatLng::new(camera.lat, camera.lon));
+    options.zoom = Some(camera.zoom);
+    options.bearing = Some(camera.bearing);
+    options.pitch = Some(camera.pitch);
+    options
 }
 
 fn clamp_zoom(zoom: f64) -> f64 {
@@ -1061,15 +1102,6 @@ fn fly_duration(travel_degrees: f64) -> Duration {
     (FLY_MIN + scaled).min(FLY_MAX)
 }
 
-/// Run-loop turns per pass, `OSM_SOUND_DEMO_RUN_LOOP_TICKS` overriding the
-/// default so the two can be compared in one sitting.
-fn run_loop_ticks() -> u32 {
-    std::env::var("OSM_SOUND_DEMO_RUN_LOOP_TICKS")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(RUN_LOOP_TICKS_PER_FRAME)
-}
-
 fn normalize_bearing(bearing: f64) -> f64 {
     bearing.rem_euclid(360.0)
 }
@@ -1084,6 +1116,7 @@ fn degrees_per_pixel(zoom: f64, lat: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Frames a test renders to let tiles arrive; the production settle window
     /// is a timer, which a test cannot wait on frame by frame.
@@ -1240,41 +1273,20 @@ mod tests {
 
     #[test]
     fn building_layer_bins_cover_the_height_range() {
-        let first = building_layer_json(0, "a", Band::default());
-        let last = building_layer_json(BINS - 1, "b", Band::default());
+        let first = building_layer_json(0, "a");
+        let last = building_layer_json(BINS - 1, "b");
         assert_eq!(first["filter"][1][2], serde_json::json!(0.0));
         assert_eq!(last["filter"][2][2], serde_json::json!(MAX_BUILDING_HEIGHT));
     }
 
     #[test]
     fn the_building_layers_use_constant_paint() {
-        let json = building_layer_json(3, "a", Band::default());
+        let json = building_layer_json(3, "a");
         let paint = &json["paint"];
         // Data-driven paint (a `step` / `get` expression) would be re-evaluated
         // per building every frame and costs about twenty times as much.
         assert!(paint["fill-extrusion-height"].is_number(), "{paint}");
         assert!(paint["fill-extrusion-color"].is_string(), "{paint}");
-    }
-
-    #[test]
-    fn band_rewrites_are_rate_capped() {
-        assert_eq!(band_rewrite_interval(), BAND_REWRITE_INTERVAL);
-        // An interval under the frame time lets every pass rewrite, which is
-        // the case the cap exists to avoid. 8 fps is 125 ms a pass.
-        assert!(
-            BAND_REWRITE_INTERVAL >= Duration::from_millis(125),
-            "{BAND_REWRITE_INTERVAL:?} is inside a frame"
-        );
-    }
-
-    #[test]
-    fn the_rate_cap_holds_rewrites_well_below_the_tick_rate() {
-        // The UI posts bands every 16 ms; the cap must let through far fewer.
-        let ticks_per_rewrite = BAND_REWRITE_INTERVAL.as_millis() / 16;
-        assert!(
-            ticks_per_rewrite >= 3,
-            "{ticks_per_rewrite} ticks per rewrite"
-        );
     }
 
     #[test]
@@ -1516,102 +1528,6 @@ mod tests {
             one_band / ROUNDS,
             BINS,
             all_bands / ROUNDS,
-        );
-    }
-
-    /// Opt-in comparison of MapLibre Native's two renderer modes, kept as the
-    /// record of why the app uses the continuous one.
-    ///
-    /// `Static` is `renderStill`: it re-renders from scratch and re-lays out the
-    /// building tiles on every change to the layer set. `Continuous` keeps the
-    /// map alive between frames.
-    #[test]
-    fn report_static_vs_continuous() {
-        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
-            return;
-        }
-        const SIZE: (u32, u32) = (960, 640);
-        const ROUNDS: u32 = 5;
-
-        let url = DEFAULT_STYLE_URL.parse().expect("style URL");
-        let mut bands = [Band::default(); BINS];
-
-        // --- Static: one still render per frame ---
-        let mut still = ImageRendererBuilder::new()
-            .with_size(
-                NonZeroU32::new(SIZE.0).unwrap(),
-                NonZeroU32::new(SIZE.1).unwrap(),
-            )
-            .with_pixel_ratio(1.0)
-            .with_resource_options(resource_options(&cache_path()))
-            .build_static_renderer();
-        still.load_style_from_url(&url).wait().expect("style loads");
-        for (band, spec) in bands.iter().enumerate() {
-            let id = building_layer_id(band);
-            let layer = AnyLayer::from_json_value(&building_layer_json(band, &id, *spec))
-                .expect("layer JSON");
-            still.style().add_layer(layer).expect("layer added");
-        }
-        still
-            .render_static(&camera_update(MapCamera::default()))
-            .expect("warm-up frame");
-
-        let mut static_bands = std::time::Duration::ZERO;
-        for step in 1..=ROUNDS {
-            let nudge = f64::from(step);
-            bands = [Band {
-                height: 20.0 * nudge,
-                hue: 30.0 * nudge,
-                level: 0.5,
-            }; BINS];
-            let started = std::time::Instant::now();
-            for (band, spec) in bands.iter().enumerate() {
-                let id = building_layer_id(band);
-                let layer = AnyLayer::from_json_value(&building_layer_json(band, &id, *spec))
-                    .expect("layer JSON");
-                let mut style = still.style();
-                style.remove_layer(&id);
-                style.add_layer(layer).expect("layer added");
-            }
-            still
-                .render_static(&camera_update(MapCamera {
-                    bearing: nudge * 2.0,
-                    ..MapCamera::default()
-                }))
-                .expect("static frame");
-            static_bands += started.elapsed();
-        }
-        drop(still);
-
-        // --- Continuous: the path the app uses ---
-        let mut engine = Engine::new(SIZE);
-        for _ in 0..TEST_SETTLE_FRAMES {
-            engine.mark_dirty();
-            engine.render().expect("warm-up frame");
-        }
-        let mut continuous_bands = std::time::Duration::ZERO;
-        for step in 1..=ROUNDS {
-            let nudge = f64::from(step);
-            engine.apply(Command::Camera(MapCamera {
-                bearing: nudge * 2.0,
-                ..MapCamera::default()
-            }));
-            engine.apply(Command::Bands(Box::new(
-                [Band {
-                    height: 20.0 * nudge + 100.0,
-                    hue: 30.0 * nudge + 5.0,
-                    level: 0.5,
-                }; BINS],
-            )));
-            let started = std::time::Instant::now();
-            engine.render().expect("continuous frame");
-            continuous_bands += started.elapsed();
-        }
-
-        eprintln!(
-            "960x640, camera + 16 layer swaps per frame — static: {:?}, continuous: {:?}",
-            static_bands / ROUNDS,
-            continuous_bands / ROUNDS,
         );
     }
 }

@@ -48,10 +48,12 @@ ureq = { version = "3", features = ["json"] }
 # reads outside that scope, so a debug build trips `assert(BackendScope::
 # exists())` and a release build reads a GL context that is no longer current.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-maplibre_native = { version = "0.8.2", features = ["vulkan"] }
+maplibre-native-ffi = { git = "https://github.com/maplibre/maplibre-native-ffi", features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-maplibre_native = { version = "0.8.2", features = ["metal"] }
+maplibre-native-ffi = { git = "https://github.com/maplibre/maplibre-native-ffi", features = ["metal"] }
+objc2 = "0.5"
+objc2-metal = { version = "0.2", features = ["MTLDevice"] }
 
 [build-dependencies]
 slint-build = "1.16"

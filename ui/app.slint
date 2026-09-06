@@ -1,7 +1,7 @@
 import { Button, ComboBox, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
-import { MMapView, MMapAdapter } from "@maplibre-native-slint/maplibre.slint";
+import { MapView, MapAdapter } from "map-view.slint";
 
-export { MMapAdapter }
+export { MapAdapter }
 
 // Pixel size of the map view, pushed to the backend so the headless renderer
 // can be rebuilt at the matching resolution.
@@ -80,13 +80,7 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
 
                 VerticalLayout {
-                    map := MMapView {
-                        style-url: "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
-                        center-lat: 35.680655;
-                        center-lon: 139.767165;
-                        zoom: 16;
-                        pitch: 60;
-                    }
+                    map := MapView { }
                 }
 
                 // --- overlay: top-left "About" ---

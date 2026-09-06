@@ -12,7 +12,7 @@ use crate::audio::{Analyzer, AudioPlayer};
 use crate::gamepad::{Action, Gamepads};
 use crate::map::{self, CameraBoost, MapLibre};
 use crate::otherman::{self, ListItem, Release};
-use crate::{AppWindow, MMapAdapter};
+use crate::{AppWindow, MapAdapter};
 
 /// Fly-to destinations, same set as the web demo's dropdown.
 const PLACES: &[(&str, f64, f64)] = &[
@@ -254,7 +254,7 @@ fn fly_to_place(ui: &AppWindow, index: usize) {
     };
     let _ = with_state(|state| state.place = index);
     ui.set_place_index(index as i32);
-    ui.global::<MMapAdapter>()
+    ui.global::<MapAdapter>()
         .invoke_request_fly_to(*lat as f32, *lon as f32, FLY_TO_ZOOM as f32);
 }
 
@@ -601,7 +601,7 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
 fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     let ui_handle = ui.as_weak();
     let state = Rc::clone(state);
-    ui.global::<MMapAdapter>().on_tick(move || {
+    ui.global::<MapAdapter>().on_tick(move || {
         let Some(ui) = ui_handle.upgrade() else {
             return;
         };

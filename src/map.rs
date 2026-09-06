@@ -6,7 +6,7 @@ use std::rc::Rc;
 use slint::ComponentHandle;
 
 use crate::AppWindow;
-use crate::MMapAdapter;
+use crate::MapAdapter;
 
 mod renderer;
 pub use renderer::{CameraBoost, MapLibre, create_map};
@@ -14,7 +14,7 @@ pub use renderer::{CameraBoost, MapLibre, create_map};
 /// Publishes the newest rendered frame and the camera state to the UI, and
 /// reports whether a new frame arrived.
 pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
-    let adapter = ui.global::<MMapAdapter>();
+    let adapter = ui.global::<MapAdapter>();
 
     let frame = map.take_frame();
     if let Some(frame) = &frame {
@@ -32,9 +32,6 @@ pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
     adapter.set_current_zoom(camera.zoom as f32);
     adapter.set_current_bearing(camera.bearing as f32);
     adapter.set_current_pitch(camera.pitch as f32);
-    adapter.set_style_loaded(map.style_loaded());
-    adapter.set_map_idle(map.map_idle());
-
     frame.is_some()
 }
 
@@ -42,20 +39,7 @@ pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
 /// owned by [`crate::app`], which also feeds the audio levels into the map.
 pub fn init(ui: &AppWindow, map: &Rc<RefCell<MapLibre>>) {
     let ui_handle = ui.as_weak();
-    let adapter = ui.global::<MMapAdapter>();
-
-    // `MMapView` publishes its declared style and camera on init, before the
-    // backend exists; adopt them so the map opens where the UI asked for.
-    if adapter.get_initial_config_set() {
-        map.borrow_mut().apply_initial(
-            adapter.get_initial_style_url().as_str(),
-            f64::from(adapter.get_initial_lat()),
-            f64::from(adapter.get_initial_lon()),
-            f64::from(adapter.get_initial_zoom()),
-            f64::from(adapter.get_initial_bearing()),
-            f64::from(adapter.get_initial_pitch()),
-        );
-    }
+    let adapter = ui.global::<MapAdapter>();
 
     ui.on_map_size_changed({
         let map = Rc::downgrade(map);
@@ -127,15 +111,6 @@ pub fn init(ui: &AppWindow, map: &Rc<RefCell<MapLibre>>) {
             if let Some(map) = map.upgrade() {
                 map.borrow_mut()
                     .fly_to(f64::from(lat), f64::from(lon), f64::from(zoom));
-            }
-        }
-    });
-
-    adapter.on_request_zoom_change({
-        let map = Rc::downgrade(map);
-        move |zoom| {
-            if let Some(map) = map.upgrade() {
-                map.borrow_mut().set_zoom(f64::from(zoom));
             }
         }
     });
