@@ -1880,8 +1880,7 @@ dependencies = [
 [[package]]
 name = "gilrs"
 version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "902fb00d3f6398e635be22e5c837b303c501835cca7ac11a47bba138f7aafdd8"
+source = "git+https://gitlab.com/smellman/gilrs.git?branch=ios-game-controller-backend#6f25adc5a7ccb819e5812b54e14f4212c7fee71f"
 dependencies = [
  "fnv",
  "gilrs-core",
@@ -1893,8 +1892,7 @@ dependencies = [
 [[package]]
 name = "gilrs-core"
 version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc7f0ce6237abcc0523f2a5502b1e3fe5802daaae47ac14e166fe49551301ea9"
+source = "git+https://gitlab.com/smellman/gilrs.git?branch=ios-game-controller-backend#6f25adc5a7ccb819e5812b54e14f4212c7fee71f"
 dependencies = [
  "inotify",
  "js-sys",
@@ -1902,7 +1900,10 @@ dependencies = [
  "libudev-sys",
  "log",
  "nix",
+ "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-game-controller",
  "objc2-io-kit",
  "uuid",
  "vec_map",
@@ -3728,6 +3729,16 @@ dependencies = [
  "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-game-controller"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1962c1882c5abcedb18e5f01acffeaad7b3cbd0a9d4cd8f5ca259ba8a64cb9a3"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

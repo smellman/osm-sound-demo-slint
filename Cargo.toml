@@ -27,7 +27,10 @@ metal = ["maplibre-native-ffi/metal", "dep:objc2", "dep:objc2-metal"]
 linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
 
 [dependencies]
-gilrs = "0.11"
+# The fork's iOS backend, until it lands upstream: crates.io gilrs has no iOS
+# support at all, so there `Gilrs::new` returns `NotImplemented` and no pad is
+# ever seen. See gilrs-core/src/platform/ios in the branch below.
+gilrs = { git = "https://gitlab.com/smellman/gilrs.git", branch = "ios-game-controller-backend" }
 rodio = { version = "0.22", default-features = false, features = ["playback", "recording", "symphonia-mp3"] }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

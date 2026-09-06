@@ -118,12 +118,16 @@ second a device that is not already in the developer account is refused rather t
 registered. On a free personal team the installed app stops launching after seven days,
 and building again is what renews it.
 
-One thing does not carry over to a device: gamepads. `gilrs` reports "gamepad input is not
-supported on this platform" there, so the pad bindings below do nothing and the keyboard
-ones need a hardware keyboard. Touch drives the map, links open in Safari through
-`UIApplication` rather than `open`, and VJ mode works because
+Touch drives the map, and the keyboard bindings need a hardware keyboard. Links open in
+Safari through `UIApplication` rather than `open`, and VJ mode works because
 `NSMicrophoneUsageDescription` is in the generated `Info.plist` — without it iOS kills the
 app the moment it starts listening.
+
+Gamepads work through the fork `Cargo.toml` points at. Released gilrs has no iOS backend —
+it falls through to a stub, so `Gilrs::new` reports `NotImplemented` and no pad is ever
+seen — and its macOS backend cannot cover iOS because that one reads IOKit HID, which iOS
+does not expose. The fork adds a backend on GameController.framework instead, pending
+[the merge request](https://gitlab.com/smellman/gilrs/-/merge_requests).
 
 ### Environment
 
