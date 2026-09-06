@@ -16,6 +16,78 @@ use crate::stream::StreamingRead;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+/// iOS makes no sound until the app has set up an audio session, and cpal does
+/// not do it: its iOS backend touches `AVAudioSession` only to ask for a buffer
+/// duration, never to choose a category or activate the session. A session
+/// starts out inactive and in the `SoloAmbient` category, so the RemoteIO unit
+/// runs and plays to nothing — the transport looks like it is playing and
+/// nothing comes out of the speaker.
+///
+/// `Playback` rather than `SoloAmbient` also means the ring switch does not
+/// silence it, which is what a demo playing music wants.
+#[cfg(target_os = "ios")]
+mod session {
+    use objc2_avf_audio::{
+        AVAudioSession, AVAudioSessionCategoryOptions, AVAudioSessionCategoryPlayAndRecord,
+        AVAudioSessionCategoryPlayback,
+    };
+
+    pub fn playback() {
+        // SAFETY: the shared session is a framework singleton, and the category
+        // is one of the framework's own constants.
+        unsafe {
+            let session = AVAudioSession::sharedInstance();
+            let Some(category) = AVAudioSessionCategoryPlayback else {
+                return report("AVAudioSessionCategoryPlayback is unavailable");
+            };
+            if let Err(error) = session.setCategory_error(category) {
+                return report(&format!("setting the audio session category: {error}"));
+            }
+            activate(&session);
+        }
+    }
+
+    /// VJ mode listens as well as plays, which is a different category.
+    /// `DefaultToSpeaker` because without it `PlayAndRecord` routes playback to
+    /// the receiver rather than the speaker.
+    pub fn play_and_record() {
+        // SAFETY: as above.
+        unsafe {
+            let session = AVAudioSession::sharedInstance();
+            let Some(category) = AVAudioSessionCategoryPlayAndRecord else {
+                return report("AVAudioSessionCategoryPlayAndRecord is unavailable");
+            };
+            if let Err(error) = session.setCategory_withOptions_error(
+                category,
+                AVAudioSessionCategoryOptions::DefaultToSpeaker,
+            ) {
+                return report(&format!("setting the audio session category: {error}"));
+            }
+            activate(&session);
+        }
+    }
+
+    unsafe fn activate(session: &AVAudioSession) {
+        // SAFETY: the caller holds the shared session.
+        if let Err(error) = unsafe { session.setActive_error(true) } {
+            report(&format!("activating the audio session: {error}"));
+        }
+    }
+
+    /// Reported rather than returned: the session failing is worth saying out
+    /// loud, but it is not a reason to refuse to start.
+    fn report(what: &str) {
+        eprintln!("audio session: {what}; playback will be silent");
+    }
+}
+
+/// Every other platform plays without being asked.
+#[cfg(not(target_os = "ios"))]
+mod session {
+    pub fn playback() {}
+    pub fn play_and_record() {}
+}
+
 /// Number of frequency bands, matching the web demo's `fftSize = BINS * 2`
 /// analyser and the number of building layers on the map.
 pub const BINS: usize = 16;
@@ -213,6 +285,9 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     pub fn new() -> Result<(Self, Analyzer), Error> {
+        // Before the device is opened, so the output unit is built against the
+        // session this app wants rather than the default one.
+        session::playback();
         let mut sink = DeviceSinkBuilder::open_default_sink()?;
         // Quitting drops this on purpose; rodio's warning about it is noise.
         sink.log_on_drop(false);
@@ -292,6 +367,8 @@ impl VjMode {
 
 impl Drop for VjMode {
     fn drop(&mut self) {
+        // Back to a category that only plays, now that nothing is listening.
+        session::playback();
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             // The reader parks on the input's poll interval, so this returns
@@ -307,6 +384,7 @@ impl AudioPlayer {
     /// `wanted` picks the device by a case-insensitive substring of its name;
     /// without it the system default is used.
     pub fn start_vj(&self, wanted: Option<&str>) -> Result<VjMode, Error> {
+        session::play_and_record();
         let builder = rodio::microphone::MicrophoneBuilder::new();
         let (device, name) = match wanted {
             Some(wanted) => {

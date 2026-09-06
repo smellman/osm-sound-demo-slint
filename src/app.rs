@@ -872,6 +872,15 @@ fn step_to_next_after_end(ui: &AppWindow) {
     step_track(ui, &state, 1);
 }
 
+/// iOS has no `open`, and no process spawning to run it with: a URL there goes
+/// through `UIApplication`, which this app does not wire up yet. Saying so beats
+/// falling through to the Linux branch and reporting that `xdg-open` is missing.
+#[cfg(target_os = "ios")]
+fn open_in_browser(url: &str) {
+    eprintln!("opening {url} is not wired up on iOS");
+}
+
+#[cfg(not(target_os = "ios"))]
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);

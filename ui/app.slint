@@ -1,4 +1,4 @@
-import { Button, ComboBox, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, ListView, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
 import { MapView, MapAdapter } from "map-view.slint";
 
 export { MapAdapter }
@@ -8,6 +8,118 @@ export { MapAdapter }
 export struct Size {
     width: length,
     height: length,
+}
+
+
+// A dropdown whose list can be dragged with a finger.
+//
+// `ComboBox` puts its model in a `ScrollView`, and every style leaves that
+// view's `mouse-drag-pan-enabled` — the inner `Flickable`'s `interactive` —
+// off, so the list moves by wheel or scrollbar and not by dragging it. The
+// widget does not expose the property, so with the stock `ComboBox` there is no
+// way to turn it on from outside. `ListView` inherits `ScrollView`, so a popup
+// built here can.
+component TouchComboBox {
+    in property <[string]> model;
+    in-out property <int> current-index: 0;
+    callback selected(/* index */ int);
+
+    // The bottom bar's list has to open upwards; the map overlay's drops down.
+    in property <bool> drop-up: false;
+    // How tall the list may grow before it starts scrolling.
+    in property <length> max-list-height: 260px;
+
+    property <length> row-height: 34px;
+    property <length> list-height: min(root.max-list-height, root.model.length * root.row-height + 8px);
+
+    Rectangle {
+        background: #2a2f38;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: touch.has-hover ? #4a5162 : #3a4150;
+
+        Text {
+            x: 10px;
+            width: parent.width - 34px;
+            height: 100%;
+            text: root.model[root.current-index];
+            color: #e8ecf3;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // The chevron, drawn rather than imported so the widget carries no assets.
+        Text {
+            x: parent.width - 20px;
+            height: 100%;
+            text: "▾";
+            color: #99a2b3;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            clicked => {
+                popup.show();
+            }
+        }
+    }
+
+    popup := PopupWindow {
+        // Without this the default `close-on-click` closes the popup on any
+        // click at all, taking it away before the row's own `TouchArea` sees
+        // the tap — the list disappears and nothing is selected. `ComboBox`
+        // sets the same policy for the same reason.
+        close-policy: close-on-click-outside;
+        x: 0;
+        y: root.drop-up ? -root.list-height - 4px : root.height + 4px;
+        width: root.width;
+        height: root.list-height;
+
+        Rectangle {
+            background: #171a20;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #3a4150;
+
+            list := ListView {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                height: parent.height - 8px;
+                // The whole point: without this the list ignores a drag.
+                mouse-drag-pan-enabled: true;
+
+                for value[index] in root.model: Rectangle {
+                    height: root.row-height;
+                    background: index == root.current-index
+                        ? #1f6feb
+                        : (row-touch.has-hover ? #262b34 : transparent);
+                    border-radius: 4px;
+
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: 100%;
+                        text: value;
+                        color: #e8ecf3;
+                        font-size: 12px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+
+                    row-touch := TouchArea {
+                        clicked => {
+                            root.current-index = index;
+                            root.selected(index);
+                            popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -116,16 +228,13 @@ export component AppWindow inherits Window {
                     y: 12px;
                     width: 220px;
                     height: 32px;
-                    background: #0d0f13cc;
-                    border-radius: 6px;
-
-                    ComboBox {
+                    TouchComboBox {
                         width: 100%;
                         height: 100%;
                         model: root.places;
                         current-index <=> root.place-index;
-                        selected => {
-                            root.place-selected(self.current-index);
+                        selected(index) => {
+                            root.place-selected(index);
                         }
                     }
                 }
@@ -318,12 +427,13 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ComboBox {
+                    TouchComboBox {
                         horizontal-stretch: 3;
                         model: root.releases;
                         current-index <=> root.release-index;
-                        selected => {
-                            root.release-selected(self.current-index);
+                        drop-up: true;
+                        selected(index) => {
+                            root.release-selected(index);
                         }
                     }
 

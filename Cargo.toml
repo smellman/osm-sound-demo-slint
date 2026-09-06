@@ -44,9 +44,18 @@ ash = { version = "0.38", optional = true }
 glutin_egl_sys = { version = "0.7", optional = true }
 libloading = { version = "0.8", optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# Metal is every Apple platform, not just macOS: the same `metal` feature builds
+# for iOS and the simulator (see "iOS" in the README), so gating these on
+# `target_os = "macos"` left `metal` naming dependencies that were not there.
+[target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = { version = "0.5", optional = true }
 objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
+
+# The audio session iOS needs before it will make a sound. cpal pulls this crate
+# in already but never sets a category or activates the session, so the app does
+# it; see the `session` module in src/audio.rs.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-avf-audio = { version = "0.3", features = ["AVAudioSession", "AVAudioSessionTypes"] }
 
 [build-dependencies]
 slint-build = "1.16"

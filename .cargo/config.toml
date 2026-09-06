@@ -1,0 +1,16 @@
+# Rust's `aarch64-apple-ios` targets an iOS far older than the native library
+# does, and the mismatch only surfaces at link time: the MapLibre Native archive
+# is built against iOS 14.3 (`CMAKE_OSX_DEPLOYMENT_TARGET` in the FFI repo's
+# `_ios-arm64` preset) and calls `___chkstk_darwin`, which libSystem only
+# exports from iOS 12 on. Linking with the default left it undefined.
+#
+# 14.3 rather than 12.0 so the app and the library it links agree. Inert on
+# every other platform, and Cargo leaves it alone if the environment already
+# sets it.
+#
+# `MAPLIBRE_NATIVE_C_INSTALL_DIR` deliberately does not live here: the FFI
+# build script reads it for whatever target is being built, so a value set once
+# would point a macOS or simulator build at the iOS device archive. It belongs
+# on the one command that needs it — see "iOS" in the README.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "14.3"
