@@ -26,8 +26,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use maplibre_native_ffi::{
-    BoundOptions, CameraOptions, LatLng, MapHandle, MapMode, MapOptions, NativePointer,
-    RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
+    AnimationOptions, BoundOptions, CameraOptions, LatLng, MapHandle, MapMode, MapOptions,
+    NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload,
     RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
 #[cfg(target_os = "macos")]
@@ -91,21 +91,14 @@ const MAX_ABS_LAT: f64 = 85.0;
 const WHEEL_STEP: f64 = 0.5;
 const DOUBLE_CLICK_STEP: f64 = 1.0;
 
-/// Fly-to duration bounds, and how much duration each degree of travel adds.
-///
-/// The Rust bindings expose only `jumpTo`, so a fly-to is eased here. It is not
-/// merely cosmetic: jumping outruns tile loading and lands on a blank map, the
-/// same problem the Raspberry Pi port describes when it defaults `MAPLIBRE_FLY_MS`
-/// to six seconds. `MAPLIBRE_FLY_MS` overrides the whole duration here too, for
-/// machines that need longer.
-const FLY_MIN: Duration = Duration::from_millis(1500);
-const FLY_MAX: Duration = Duration::from_millis(6000);
-const FLY_MS_PER_DEGREE: f64 = 45.0;
-
-/// How far a long fly-to zooms out at its midpoint, so the trip passes over
-/// coarse tiles that are already cached instead of streaming a whole city.
-const FLY_ARC_MAX_ZOOM_OUT: f64 = 3.0;
-const FLY_ARC_DEGREES_PER_LEVEL: f64 = 12.0;
+/// Fly-to duration. MapLibre Native picks one from the distance when none is
+/// given, which is what the web demo's `flyTo` did; `MAPLIBRE_FLY_MS` overrides
+/// it, as the Raspberry Pi port's knob of the same name does for slow GPUs.
+fn fly_duration_ms() -> Option<f64> {
+    std::env::var("MAPLIBRE_FLY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapCamera {
@@ -147,12 +140,24 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// The map's own camera, reported while it is flying so the UI can follow.
+    pub camera: Option<MapCamera>,
+    /// Whether a fly-to is still in the air.
+    pub flying: bool,
 }
 
 enum Command {
     Resize(u32, u32),
     Style(String),
     Camera(MapCamera),
+    /// Hand the camera to MapLibre Native and let it fly there itself.
+    FlyTo {
+        camera: MapCamera,
+        duration_ms: Option<f64>,
+        /// Matched against the transition-finished event, so a stale one from
+        /// a cancelled flight is ignored.
+        id: u64,
+    },
     Bands(Box<[Band; BINS]>),
     Light(Light),
 }
@@ -183,19 +188,6 @@ struct DragState {
     y: f32,
 }
 
-/// A fly-to in progress.
-#[derive(Debug)]
-struct Flight {
-    from: MapCamera,
-    to: MapCamera,
-    /// Signed shortest-path longitude delta, so a fly can cross the antimeridian.
-    lon_delta: f64,
-    /// Zoom levels to pull back at the midpoint.
-    arc: f64,
-    elapsed: Duration,
-    duration: Duration,
-}
-
 /// Transient camera offsets, currently driven by the drop effect. Kept apart
 /// from the user's camera so an effect can never leave the map somewhere
 /// unexpected once it decays.
@@ -213,7 +205,6 @@ struct CameraController {
     camera: MapCamera,
     boost: CameraBoost,
     drag_state: Option<DragState>,
-    flight: Option<Flight>,
 }
 
 impl CameraController {
@@ -228,55 +219,8 @@ impl CameraController {
         }
     }
 
-    /// Starts an eased fly to the given camera.
-    fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
-        let to = MapCamera {
-            lat: clamp_lat(lat),
-            lon: normalize_lon(lon),
-            zoom: clamp_zoom(zoom),
-            ..self.camera
-        };
-        let lon_delta = shortest_lon_delta(self.camera.lon, to.lon);
-        let travel = (to.lat - self.camera.lat).hypot(lon_delta);
-        self.drag_state = None;
-        self.flight = Some(Flight {
-            from: self.camera,
-            to,
-            lon_delta,
-            arc: (travel / FLY_ARC_DEGREES_PER_LEVEL).min(FLY_ARC_MAX_ZOOM_OUT),
-            elapsed: Duration::ZERO,
-            duration: fly_duration(travel),
-        });
-    }
-
-    /// Advances an in-progress fly-to by `delta`, returning whether the camera
-    /// moved.
-    fn advance_flight(&mut self, delta: Duration) -> bool {
-        let Some(flight) = self.flight.as_mut() else {
-            return false;
-        };
-        flight.elapsed += delta;
-        if flight.elapsed >= flight.duration {
-            let to = flight.to;
-            self.flight = None;
-            self.camera.lat = to.lat;
-            self.camera.lon = to.lon;
-            self.camera.zoom = to.zoom;
-            return true;
-        }
-
-        let t = flight.elapsed.as_secs_f64() / flight.duration.as_secs_f64();
-        let eased = t * t * (3.0 - 2.0 * t);
-        self.camera.lat = clamp_lat(flight.from.lat + (flight.to.lat - flight.from.lat) * eased);
-        self.camera.lon = normalize_lon(flight.from.lon + flight.lon_delta * eased);
-        let target = flight.from.zoom + (flight.to.zoom - flight.from.zoom) * eased;
-        self.camera.zoom = clamp_zoom(target - flight.arc * (std::f64::consts::PI * t).sin());
-        true
-    }
-
     #[cfg(test)]
     fn jump_for_test(&mut self, lat: f64, lon: f64, zoom: f64) {
-        self.flight = None;
         self.camera.lat = clamp_lat(lat);
         self.camera.lon = normalize_lon(lon);
         self.camera.zoom = clamp_zoom(zoom);
@@ -286,7 +230,6 @@ impl CameraController {
         let Some(last) = self.drag_state.as_mut() else {
             return false;
         };
-        self.flight = None;
         let dx = f64::from(x - last.x);
         let dy = f64::from(y - last.y);
         last.x = x;
@@ -307,7 +250,6 @@ impl CameraController {
 
     /// Pans by a screen-space delta in pixels, as a drag would.
     fn pan_by(&mut self, dx: f64, dy: f64) {
-        self.flight = None;
         let view = self.effective();
         let bearing = view.bearing.to_radians();
         let east = dx * bearing.cos() - dy * bearing.sin();
@@ -322,14 +264,12 @@ impl CameraController {
         if delta == 0.0 {
             return false;
         }
-        self.flight = None;
         let direction = if delta > 0.0 { -1.0 } else { 1.0 };
         self.camera.zoom = clamp_zoom(self.camera.zoom + direction * WHEEL_STEP);
         true
     }
 
     fn double_clicked(&mut self, shift: bool) {
-        self.flight = None;
         let step = if shift {
             -DOUBLE_CLICK_STEP
         } else {
@@ -353,6 +293,10 @@ pub struct MapLibre {
     rendered: Arc<AtomicU64>,
     controller: CameraController,
     size: (u32, u32),
+    /// Whether a fly-to is in the air, as last reported by the render thread.
+    flying: bool,
+    /// Identifies each fly-to so a finished one can be matched to its start.
+    flight_id: u64,
 }
 
 impl MapLibre {
@@ -377,6 +321,8 @@ impl MapLibre {
             rendered,
             controller: CameraController::default(),
             size,
+            flying: false,
+            flight_id: 0,
         }
     }
 
@@ -387,7 +333,9 @@ impl MapLibre {
         }
     }
 
-    fn push_camera(&self) {
+    fn push_camera(&mut self) {
+        // An absolute camera cancels a flight, on both sides of the channel.
+        self.flying = false;
         self.send(Command::Camera(self.controller.effective()));
     }
 
@@ -420,6 +368,16 @@ impl MapLibre {
         while let Ok(frame) = self.frames.try_recv() {
             newest = Some(frame);
         }
+        if let Some(frame) = &newest {
+            // While the map is flying it owns the camera; follow it so the
+            // status line and the next drag start from where it actually is.
+            if let Some(camera) = frame.camera {
+                self.controller.camera = camera;
+            }
+            if !frame.flying {
+                self.flying = false;
+            }
+        }
         newest
     }
 
@@ -436,23 +394,30 @@ impl MapLibre {
         self.send(Command::Resize(new_size.0, new_size.1));
     }
 
-    /// Starts an eased fly to the given camera. Advanced by
-    /// [`MapLibre::advance_flight`] from the UI's frame tick.
+    /// Hands the camera to MapLibre Native and lets it fly there.
+    ///
+    /// The map owns the camera until it lands: each frame reports where it got
+    /// to, and [`MapLibre::take_frame`] follows along. Anything that moves the
+    /// camera from here — a drag, the sticks, an effect — cancels the flight,
+    /// because it sends an absolute camera the map has to obey.
     pub fn fly_to(&mut self, lat: f64, lon: f64, zoom: f64) {
-        self.controller.fly_to(lat, lon, zoom);
-    }
-
-    /// Advances an in-progress fly-to. Returns whether the camera moved.
-    pub fn advance_flight(&mut self, delta: Duration) -> bool {
-        if self.controller.advance_flight(delta) {
-            self.push_camera();
-            return true;
-        }
-        false
+        self.controller.drag_state = None;
+        self.flight_id += 1;
+        self.flying = true;
+        self.send(Command::FlyTo {
+            camera: MapCamera {
+                lat: clamp_lat(lat),
+                lon: normalize_lon(lon),
+                zoom: clamp_zoom(zoom),
+                ..self.controller.camera
+            },
+            duration_ms: fly_duration_ms(),
+            id: self.flight_id,
+        });
     }
 
     pub fn flying(&self) -> bool {
-        self.controller.flight.is_some()
+        self.flying
     }
 
     pub fn set_pitch(&mut self, pitch: f64) {
@@ -480,7 +445,7 @@ impl MapLibre {
         if delta == 0.0 {
             return;
         }
-        self.controller.flight = None;
+        self.flying = false;
         self.controller.camera.zoom = clamp_zoom(self.controller.camera.zoom + delta);
         self.push_camera();
     }
@@ -578,6 +543,13 @@ struct Engine {
     applied: [Option<Band>; BINS],
     light: Light,
     applied_light: Option<Light>,
+    /// The transition the map is running, if any.
+    flight_id: Option<u64>,
+    /// A fly-to that arrived before the map existed, or before this pass.
+    pending_fly: Option<(MapCamera, Option<f64>, u64)>,
+    /// Report the camera with the next frame even though nothing is flying,
+    /// so the UI picks up where a flight ended.
+    report_camera: bool,
     /// Something the UI asked for has not been drawn yet.
     dirty: bool,
     /// MapLibre Native says it has more to draw — tiles still arriving, or a
@@ -613,6 +585,9 @@ impl Engine {
             applied: [None; BINS],
             light: Light::default(),
             applied_light: None,
+            flight_id: None,
+            pending_fly: None,
+            report_camera: false,
             dirty: true,
             wants_repaint: false,
             pixels: Vec::new(),
@@ -658,10 +633,28 @@ impl Engine {
                 }
             }
             Command::Camera(camera) => {
+                // An absolute camera is the UI taking the wheel back, so a
+                // flight in the air gives way rather than fighting it.
+                if self.flight_id.take().is_some()
+                    && let Some(attached) = &self.map
+                    && let Err(error) = attached.map.cancel_transitions()
+                {
+                    eprintln!("cancelling the fly-to failed: {error}");
+                }
                 if self.camera != camera {
                     self.camera = camera;
                     self.mark_dirty();
                 }
+            }
+            Command::FlyTo {
+                camera,
+                duration_ms,
+                id,
+            } => {
+                self.camera = camera;
+                self.flight_id = Some(id);
+                self.pending_fly = Some((camera, duration_ms, id));
+                self.mark_dirty();
             }
             Command::Bands(bands) => {
                 if self.bands != *bands {
@@ -709,6 +702,7 @@ impl Engine {
         };
         let mut wants_repaint = false;
         let mut style_loaded = false;
+        let mut landed = false;
         for event in batch.iter() {
             if event.source() != source {
                 continue;
@@ -716,6 +710,13 @@ impl Engine {
             match event.event_type() {
                 RuntimeEventType::MapRenderUpdateAvailable => wants_repaint = true,
                 RuntimeEventType::MapStyleLoaded => style_loaded = true,
+                RuntimeEventType::MapCameraTransitionFinished => {
+                    if let RuntimeEventPayload::CameraTransitionFinished(finished) = event.payload()
+                        && self.flight_id == Some(finished.transition_id)
+                    {
+                        landed = true;
+                    }
+                }
                 RuntimeEventType::MapRenderFrameFinished => {
                     if let RuntimeEventPayload::RenderFrame(frame) = event.payload() {
                         wants_repaint |= frame.needs_repaint;
@@ -725,6 +726,20 @@ impl Engine {
             }
         }
         self.wants_repaint = wants_repaint;
+        if landed {
+            self.flight_id = None;
+            // Take the camera the flight ended on before `jump_to` resumes:
+            // otherwise the next frame pins the map back to the last position
+            // sampled mid-flight.
+            if let Some(attached) = &self.map
+                && let Ok(camera) = attached.map.camera()
+            {
+                self.camera = self.camera.with(&camera);
+            }
+            self.report_camera = true;
+            // One more frame, so the UI sees `flying: false` and stops waiting.
+            self.dirty = true;
+        }
         if style_loaded && let Some(attached) = &mut self.map {
             attached.style_loaded = true;
             // The style's sources exist now, so the band layers can go on.
@@ -738,11 +753,27 @@ impl Engine {
         self.sync_bands();
         self.sync_light();
 
-        let camera = camera_options(self.camera);
-        let attached = self.map.as_ref()?;
-        if let Err(error) = attached.map.jump_to(&camera) {
-            eprintln!("moving the camera failed: {error}");
+        if let Some((camera, duration_ms, id)) = self.pending_fly.take() {
+            let mut animation = AnimationOptions::default();
+            animation.duration_ms = duration_ms;
+            animation.transition_id = Some(id);
+            let attached = self.map.as_ref()?;
+            if let Err(error) = attached
+                .map
+                .fly_to(&camera_options(camera), Some(&animation))
+            {
+                eprintln!("starting the fly-to failed: {error}");
+                self.flight_id = None;
+            }
+        } else if self.flight_id.is_none() {
+            // The map drives its own camera while a flight is in the air.
+            let camera = camera_options(self.camera);
+            let attached = self.map.as_ref()?;
+            if let Err(error) = attached.map.jump_to(&camera) {
+                eprintln!("moving the camera failed: {error}");
+            }
         }
+        let attached = self.map.as_ref()?;
         if let Err(error) = attached.session.render_update() {
             eprintln!("rendering failed: {error}");
             self.dirty = false;
@@ -778,10 +809,33 @@ impl Engine {
             return None;
         }
 
+        // While the map owns the camera, hand it back with the frame so the UI
+        // can follow. `flying` also tells the UI when it has landed.
+        let flying = self.flight_id.is_some();
+        let camera = flying
+            .then(|| self.map.as_ref().and_then(|a| a.map.camera().ok()))
+            .flatten()
+            .map(|camera| MapCamera {
+                lat: camera
+                    .center
+                    .map_or(self.camera.lat, |center| center.latitude),
+                lon: camera
+                    .center
+                    .map_or(self.camera.lon, |center| center.longitude),
+                zoom: camera.zoom.unwrap_or(self.camera.zoom),
+                bearing: camera.bearing.unwrap_or(self.camera.bearing),
+                pitch: camera.pitch.unwrap_or(self.camera.pitch),
+            });
+        if let Some(camera) = camera {
+            self.camera = camera;
+        }
+
         Some(Frame {
             width,
             height,
             rgba: self.pixels.clone(),
+            camera,
+            flying,
         })
     }
 
@@ -819,7 +873,8 @@ impl Engine {
         if let Err(error) = map.set_event_mask(
             RuntimeEventMask::MAP_RENDER_UPDATE_AVAILABLE
                 | RuntimeEventMask::MAP_RENDER_FRAME_FINISHED
-                | RuntimeEventMask::MAP_STYLE_LOADED,
+                | RuntimeEventMask::MAP_STYLE_LOADED
+                | RuntimeEventMask::MAP_CAMERA_TRANSITION_FINISHED,
         ) {
             eprintln!("selecting map events failed: {error}");
         }
@@ -1257,6 +1312,19 @@ fn render_scale() -> f64 {
     })
 }
 
+impl MapCamera {
+    /// This camera with whatever the map reported filled in.
+    fn with(self, reported: &CameraOptions) -> Self {
+        Self {
+            lat: reported.center.map_or(self.lat, |center| center.latitude),
+            lon: reported.center.map_or(self.lon, |center| center.longitude),
+            zoom: reported.zoom.unwrap_or(self.zoom),
+            bearing: reported.bearing.unwrap_or(self.bearing),
+            pitch: reported.pitch.unwrap_or(self.pitch),
+        }
+    }
+}
+
 /// The camera as MapLibre Native's FFI wants it.
 fn camera_options(camera: MapCamera) -> CameraOptions {
     let mut options = CameraOptions::default();
@@ -1282,26 +1350,6 @@ fn clamp_lat(lat: f64) -> f64 {
 fn normalize_lon(lon: f64) -> f64 {
     let wrapped = (lon + 180.0).rem_euclid(360.0) - 180.0;
     if wrapped == -180.0 { 180.0 } else { wrapped }
-}
-
-/// Signed shortest-path delta between two longitudes, so a fly-to crosses the
-/// antimeridian rather than going the long way round.
-fn shortest_lon_delta(from: f64, to: f64) -> f64 {
-    let delta = (to - from).rem_euclid(360.0);
-    if delta > 180.0 { delta - 360.0 } else { delta }
-}
-
-/// Longer trips get longer flights, within bounds. `MAPLIBRE_FLY_MS` overrides
-/// the result outright, matching the Raspberry Pi port's knob for slow GPUs.
-fn fly_duration(travel_degrees: f64) -> Duration {
-    if let Some(ms) = std::env::var("MAPLIBRE_FLY_MS")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-    {
-        return Duration::from_millis(ms);
-    }
-    let scaled = Duration::from_millis((travel_degrees * FLY_MS_PER_DEGREE) as u64);
-    (FLY_MIN + scaled).min(FLY_MAX)
 }
 
 fn normalize_bearing(bearing: f64) -> f64 {
@@ -1414,14 +1462,6 @@ mod tests {
     }
 
     #[test]
-    fn stick_pan_cancels_a_fly_to() {
-        let mut controller = controller_at(0.0, 0.0, 4.0);
-        controller.fly_to(35.0, 139.0, 16.0);
-        controller.pan_by(5.0, 5.0);
-        assert!(controller.flight.is_none());
-    }
-
-    #[test]
     fn a_boost_shifts_the_camera_on_screen_without_moving_the_base() {
         let mut controller = controller_at(35.0, 139.0, 16.0);
         controller.camera.bearing = 10.0;
@@ -1504,62 +1544,116 @@ mod tests {
         assert!(!base.close_to(Band { height: 110.0 }));
     }
 
+    /// Opt-in: MapLibre Native flies the camera itself now, so check that a
+    /// fly-to actually arrives and reports that it finished.
     #[test]
-    fn shortest_longitude_delta_crosses_the_antimeridian() {
-        assert_eq!(shortest_lon_delta(170.0, -170.0), 20.0);
-        assert_eq!(shortest_lon_delta(-170.0, 170.0), -20.0);
-        assert_eq!(shortest_lon_delta(0.0, 90.0), 90.0);
-    }
+    fn a_fly_to_reaches_its_destination() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_RENDERER_TESTS=1 to run");
+            return;
+        }
+        // Generous: the loop has to cover the flight in wall-clock time.
+        const PATIENCE: u32 = 4000;
+        let target = MapCamera {
+            lat: 34.7034131,
+            lon: 135.4975879,
+            zoom: 12.0,
+            ..MapCamera::default()
+        };
 
-    #[test]
-    fn a_fly_to_eases_to_its_destination() {
-        let mut controller = CameraController::default();
-        controller.jump_for_test(35.68, 139.76, 16.0);
-        controller.fly_to(34.70, 135.49, 16.0);
+        let mut engine = Engine::new((480, 360));
+        // Let the map come up before asking it to travel.
+        for _ in 0..30 {
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
 
-        let flight = controller.flight.as_ref().expect("a flight started");
-        let duration = flight.duration;
-        assert!(duration >= FLY_MIN && duration <= FLY_MAX);
+        engine.apply(Command::FlyTo {
+            camera: target,
+            duration_ms: Some(800.0),
+            id: 7,
+        });
 
-        // Halfway there the camera is between the two, and pulled back.
-        assert!(controller.advance_flight(duration / 2));
-        let midpoint = controller.camera;
+        let mut moved_midway = false;
+        let mut landed_after = None;
+        for frame in 0..PATIENCE {
+            engine.pump(Some(Duration::from_millis(4)));
+            let Some(rendered) = engine.render() else {
+                continue;
+            };
+            // The map reports its own camera while it is in the air.
+            if rendered.flying {
+                if let Some(camera) = rendered.camera {
+                    // Somewhere between the start and the destination.
+                    if camera.lon < MapCamera::default().lon - 0.5 && camera.lon > target.lon + 0.5
+                    {
+                        moved_midway = true;
+                    }
+                }
+            } else if engine.flight_id.is_none() {
+                landed_after = Some(frame);
+                break;
+            }
+        }
+
+        let frames = landed_after.unwrap_or_else(|| {
+            panic!(
+                "the fly-to never finished: flight_id {:?}, camera {:?}",
+                engine.flight_id, engine.camera
+            )
+        });
+        eprintln!("flew in {frames} frames, midway sample seen: {moved_midway}");
         assert!(
-            midpoint.lon < 139.76 && midpoint.lon > 135.49,
-            "{midpoint:?}"
+            moved_midway,
+            "the camera jumped rather than flying: no midway position was reported"
         );
         assert!(
-            midpoint.zoom < 16.0,
-            "midpoint should zoom out: {midpoint:?}"
+            (engine.camera.lat - target.lat).abs() < 0.01
+                && (engine.camera.lon - target.lon).abs() < 0.01,
+            "landed at {:?}, wanted {target:?}",
+            engine.camera
         );
-
-        // Overshooting the duration lands exactly on the destination.
-        assert!(controller.advance_flight(duration));
-        assert!(controller.flight.is_none());
-        assert_eq!(controller.camera.lat, 34.70);
-        assert_eq!(controller.camera.lon, 135.49);
-        assert_eq!(controller.camera.zoom, 16.0);
-        assert!(!controller.advance_flight(duration));
     }
 
+    /// Opt-in: an absolute camera from the UI has to take the wheel back.
     #[test]
-    fn a_fly_to_takes_the_short_way_around_the_antimeridian() {
-        let mut controller = CameraController::default();
-        controller.jump_for_test(0.0, 175.0, 4.0);
-        controller.fly_to(0.0, -175.0, 4.0);
-        controller.advance_flight(Duration::from_millis(1));
-        // Going the long way would put the camera near 0°, not past 180°.
-        assert!(controller.camera.lon > 175.0, "{:?}", controller.camera);
-    }
+    fn a_camera_command_cancels_a_fly_to() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        let mut engine = Engine::new((480, 360));
+        for _ in 0..30 {
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
 
-    #[test]
-    fn dragging_cancels_a_fly_to() {
-        let mut controller = CameraController::default();
-        controller.jump_for_test(0.0, 0.0, 4.0);
-        controller.fly_to(35.68, 139.76, 16.0);
-        controller.drag_state = Some(DragState { x: 10.0, y: 10.0 });
-        assert!(controller.mouse_moved(20.0, 20.0));
-        assert!(controller.flight.is_none());
+        engine.apply(Command::FlyTo {
+            camera: MapCamera {
+                lat: -1.279803,
+                lon: 36.816647,
+                zoom: 12.0,
+                ..MapCamera::default()
+            },
+            duration_ms: Some(6000.0),
+            id: 11,
+        });
+        engine.render().expect("a frame starts the flight");
+        assert!(engine.flight_id.is_some(), "the flight never started");
+
+        let taken_back = MapCamera {
+            lat: 43.06868,
+            lon: 141.35079,
+            ..MapCamera::default()
+        };
+        engine.apply(Command::Camera(taken_back));
+        assert!(engine.flight_id.is_none(), "the flight was not cancelled");
+
+        engine.render().expect("a frame after the cancel");
+        assert!(
+            (engine.camera.lon - taken_back.lon).abs() < 0.01,
+            "the map kept flying: {:?}",
+            engine.camera
+        );
     }
 
     /// Opt-in: drives the real renderer to confirm that swapping a band's

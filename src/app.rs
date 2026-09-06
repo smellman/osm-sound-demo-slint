@@ -688,11 +688,8 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             }
         }
 
-        let flying = {
-            let mut map = map.borrow_mut();
-            map.advance_flight(delta);
-            map.flying()
-        };
+        // The map flies itself now; the UI only asks whether it has landed.
+        let flying = map.borrow().flying();
         if flying {
             state.flight_landed = Some(now);
         }
