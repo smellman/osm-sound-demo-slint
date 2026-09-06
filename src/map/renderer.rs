@@ -26,11 +26,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use maplibre_native_ffi::{
-    CameraOptions, LatLng, MapHandle, MapMode, MapOptions, MetalContextDescriptor,
-    MetalOwnedTextureDescriptor, NativePointer, RenderSessionHandle, RenderTargetExtent,
-    RuntimeEventMask, RuntimeEventPayload, RuntimeEventSource, RuntimeEventType, RuntimeHandle,
-    RuntimeOptions,
+    CameraOptions, LatLng, MapHandle, MapMode, MapOptions, NativePointer, RenderSessionHandle,
+    RenderTargetExtent, RuntimeEventMask, RuntimeEventPayload, RuntimeEventSource,
+    RuntimeEventType, RuntimeHandle, RuntimeOptions,
 };
+#[cfg(target_os = "macos")]
+use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
+#[cfg(not(target_os = "macos"))]
+use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor};
 
 use crate::Size;
 use crate::audio::BINS;
@@ -943,6 +946,133 @@ fn attach_render_target(
     let context = MetalContextDescriptor::new(metal_device());
     map.attach_ref()?
         .attach_metal_owned_texture(&MetalOwnedTextureDescriptor::new(extent, context))
+}
+
+/// Attaches a Vulkan owned-texture render target.
+///
+/// Headless: nothing here presents to a surface, so no swapchain and no
+/// surface extensions. MapLibre Native draws into a texture the session owns
+/// and this thread reads it back.
+#[cfg(not(target_os = "macos"))]
+fn attach_render_target(
+    map: &MapHandle,
+    size: (u32, u32),
+) -> maplibre_native_ffi::Result<RenderSessionHandle> {
+    let vulkan = vulkan_context();
+    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
+    // SAFETY: every address below names an object leaked in
+    // `create_vulkan_context`, so all of them outlive this session.
+    let pointer = |address: usize| unsafe { NativePointer::from_address(address) };
+    let mut context = VulkanContextDescriptor::new(
+        pointer(vulkan.instance),
+        pointer(vulkan.physical_device),
+        pointer(vulkan.device),
+        pointer(vulkan.graphics_queue),
+        vulkan.graphics_queue_family_index,
+    );
+    // Let MapLibre Native resolve its entry points through the same loader
+    // rather than assuming a system one.
+    context.get_instance_proc_addr = pointer(vulkan.get_instance_proc_addr);
+    context.get_device_proc_addr = pointer(vulkan.get_device_proc_addr);
+    map.attach_ref()?
+        .attach_vulkan_owned_texture(&VulkanOwnedTextureDescriptor::new(extent, context))
+}
+
+/// The handles a Vulkan render target borrows.
+///
+/// Held as plain addresses because `NativePointer` is deliberately `!Send`, and
+/// this lives in a static. The instance and device behind them are leaked, so
+/// they stay valid for the process — the render target borrows them and a map
+/// may outlive any one session.
+#[cfg(not(target_os = "macos"))]
+struct VulkanContext {
+    instance: usize,
+    physical_device: usize,
+    device: usize,
+    graphics_queue: usize,
+    graphics_queue_family_index: u32,
+    get_instance_proc_addr: usize,
+    get_device_proc_addr: usize,
+}
+
+/// The process-wide Vulkan device the render target allocates its texture on.
+#[cfg(not(target_os = "macos"))]
+fn vulkan_context() -> &'static VulkanContext {
+    static CONTEXT: OnceLock<VulkanContext> = OnceLock::new();
+    CONTEXT.get_or_init(|| create_vulkan_context().expect("creating a Vulkan device"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> {
+    use ash::vk;
+    use ash::vk::Handle;
+    use std::ffi::CString;
+
+    // SAFETY: loads the system Vulkan loader; the entry is leaked below, so
+    // every function pointer taken from it outlives every use.
+    let entry = unsafe { ash::Entry::load()? };
+
+    let name = CString::new("osm-sound-demo-slint")?;
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&name)
+        .engine_name(&name)
+        .api_version(vk::API_VERSION_1_0);
+    let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    // SAFETY: instance_info borrows app_info, which outlives this call.
+    let instance = unsafe { entry.create_instance(&instance_info, None)? };
+
+    // SAFETY: instance was created above and is live.
+    let physical_devices = unsafe { instance.enumerate_physical_devices()? };
+    let picked = physical_devices.into_iter().find_map(|physical_device| {
+        // SAFETY: physical_device came from this instance.
+        let families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        families
+            .iter()
+            .position(|family| family.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .map(|index| (physical_device, index as u32))
+    });
+    let Some((physical_device, graphics_queue_family_index)) = picked else {
+        // SAFETY: instance is live and has no child objects yet.
+        unsafe { instance.destroy_instance(None) };
+        return Err("no Vulkan device with a graphics queue".into());
+    };
+
+    let priorities = [1.0_f32];
+    let queue_info = [vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(graphics_queue_family_index)
+        .queue_priorities(&priorities)];
+    let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+    // SAFETY: physical_device and the queue family were taken from this instance.
+    let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
+        Ok(device) => device,
+        Err(error) => {
+            // SAFETY: instance is live and has no child objects yet.
+            unsafe { instance.destroy_instance(None) };
+            return Err(error.into());
+        }
+    };
+    // SAFETY: the device was created with one queue in this family.
+    let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family_index, 0) };
+
+    // Every handle and function pointer below is kept valid by leaking the
+    // entry, instance and device at the end of this function.
+    let context = VulkanContext {
+        instance: instance.handle().as_raw() as usize,
+        physical_device: physical_device.as_raw() as usize,
+        device: device.handle().as_raw() as usize,
+        graphics_queue: graphics_queue.as_raw() as usize,
+        graphics_queue_family_index,
+        get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as *const () as usize,
+        get_device_proc_addr: instance.fp_v1_0().get_device_proc_addr as *const () as usize,
+    };
+
+    // Deliberate: the render target borrows these for as long as the process
+    // runs, and destroying them under a live session would be a use-after-free.
+    std::mem::forget(device);
+    std::mem::forget(instance);
+    std::mem::forget(entry);
+    Ok(context)
 }
 
 /// The process-wide Metal device the render target allocates its texture on.

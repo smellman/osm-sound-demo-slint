@@ -136,18 +136,23 @@ The map runs on [maplibre-native-ffi](https://github.com/maplibre/maplibre-nativ
 Rust binding. Its backend is chosen per platform in `Cargo.toml`, because the crate's
 backend features are mutually exclusive:
 
-| Platform | Feature |
-| --- | --- |
-| macOS | `metal` |
-| Linux, others | `vulkan` |
+| Platform | Feature | Device created by |
+| --- | --- | --- |
+| macOS | `metal` | `MTLCreateSystemDefaultDevice` |
+| Linux, others | `vulkan` | `ash`, headless: instance, physical device with a graphics queue, and a one-queue logical device — no surface and no swapchain |
 
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
-creates the device (`MTLCreateSystemDefaultDevice` on macOS), attaches an *owned texture*
-render target at the map's size, and reads the frame back with
+creates the device, attaches an *owned texture* render target at the map's size, and reads
+the frame back with
 `read_premultiplied_rgba8_into` for Slint. The binding downloads a prebuilt native
 artifact, so a clean build takes well under a minute rather than compiling MapLibre Native
 from source.
+
+The device is created once and leaked on purpose: a render target borrows those handles,
+and a map outlives any one session. On the Vulkan side the handles are held as plain
+addresses rather than `NativePointer`, which is deliberately `!Send` and so cannot live in
+a static.
 
 The map runs in `MapMode::Continuous`, and the render thread drives it with
 `RuntimeHandle::pump` plus `drain_events`. Those events are what tell it whether to draw
