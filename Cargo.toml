@@ -3,6 +3,12 @@ name = "osm-sound-demo-slint"
 version = "0.1.0"
 edition = "2024"
 
+# `cdylib` is what Android loads — an android-activity app has no `main`, the
+# platform calls `android_main` in a shared library. `lib` alongside it keeps the
+# desktop binary and the tests linking against the same code.
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [features]
 # No default: a backend has to be named. `maplibre-native-ffi` ships one
 # prebuilt native artifact per backend and refuses to have two enabled, so this
@@ -11,7 +17,8 @@ edition = "2024"
 #
 #     cargo run --release --features opengl     # Linux, the fast path here
 #     cargo run --release --features vulkan     # Linux, for comparison
-#     cargo run --release --features metal      # macOS
+#     cargo run --release --features metal      # macOS and iOS
+#     ./build_for_android.sh                    # Android, which is opengl
 #
 # OpenGL, not Vulkan, on this machine: at 1920x1200 in release on an AMD RENOIR
 # integrated GPU the app runs at about 20 fps on OpenGL against 5.9 on Vulkan.
@@ -65,6 +72,60 @@ objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSDictio
 # UIKit is on objc2 0.6 while objc2-metal 0.2 pins 0.5, so rather than disturb
 # the renderer the two majors sit side by side under different names.
 objc2-v06 = { package = "objc2", version = "0.6" }
+
+# Android's windowing and lifecycle come from android-activity, which Slint
+# drives for us; the feature is only meaningful on that target.
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "1.16", features = ["backend-android-activity-06"] }
+# MapLibre Native does its own HTTP on Android and will not touch HTTPS until
+# `mln_android_init` has handed it a JVM and a Context — without that the style
+# never loads and the map stays black while the rest of the app works. The
+# binding keeps its `sys` crate private and wraps no such call, so the raw one
+# is used directly; `jni` and `ndk-context` are what produce the two arguments.
+maplibre-native-ffi-sys = { git = "https://github.com/maplibre/maplibre-native-ffi" }
+jni = "0.21"
+ndk-context = "0.1"
+
+# What cargo-apk writes into the APK's manifest. INTERNET is not optional: the
+# map's tiles and every track come over the network, and an Android app that
+# does not ask for it simply gets no connection. RECORD_AUDIO is VJ mode's, and
+# is requested at runtime as well.
+[package.metadata.android]
+package = "org.smellman.osmsounddemo"
+apk_name = "OSMSoundDemo"
+
+[package.metadata.android.sdk]
+# 26, not lower: cpal plays through AAudio on Android and `libaaudio.so` first
+# appears in the API 26 sysroot, so anything below this fails to link with
+# "unable to find library -laaudio". cargo-apk builds against whatever floor is
+# set here. The native MapLibre library is built against android-24, which a
+# higher floor is free to run on.
+min_sdk_version = 26
+target_sdk_version = 34
+
+# An APK has to be signed even to sit on a developer's own phone. This is a
+# throwaway key the build script makes if it is not there, kept in the project
+# rather than in $HOME so the path can be relative and the same on any machine —
+# cargo-apk resolves it against the manifest. It is not a release signature and
+# nothing signed with it should be published; `build/` is ignored by git.
+[package.metadata.android.signing.release]
+path = "build/android-dev.keystore"
+keystore_password = "android"
+
+[package.metadata.android.application]
+label = "OSM Sound Demo"
+# No action bar. The default theme keeps one, and the activity's content rect
+# starts below it — 154 physical pixels down on a device whose status bar is 42
+# — so the controls that avoid the system bars were avoiding a bar that is not
+# drawn. This is not about hiding the system bars: they stay, and the UI sits
+# above them.
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
 
 [build-dependencies]
 slint-build = "1.16"

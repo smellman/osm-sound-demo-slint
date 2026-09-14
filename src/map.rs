@@ -8,6 +8,9 @@ use slint::ComponentHandle;
 use crate::AppWindow;
 use crate::MapAdapter;
 
+// Android answers MapLibre Native's own requests itself; see the module.
+#[cfg(target_os = "android")]
+mod fetch;
 mod renderer;
 pub use renderer::{CameraBoost, Light, MapLibre, SLICE_MODES, SLICES, create_map};
 

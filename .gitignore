@@ -3,3 +3,6 @@
 # xcodegen writes both from project.yml, so project.yml is the one to edit.
 /*.xcodeproj/
 /Info.plist
+
+# The development signing key and the native build tree.
+/build/

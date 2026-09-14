@@ -1043,7 +1043,14 @@ impl Engine {
             let mut options = RuntimeOptions::default();
             options.cache_path = Some(self.cache.to_string_lossy().into_owned());
             match RuntimeHandle::with_options(&options) {
-                Ok(runtime) => self.runtime = Some(runtime),
+                Ok(runtime) => {
+                    // Before any request goes out, which the style load starts.
+                    #[cfg(target_os = "android")]
+                    if let Err(error) = crate::map::fetch::install(&runtime) {
+                        eprintln!("serving the map's own requests failed: {error}");
+                    }
+                    self.runtime = Some(runtime);
+                }
                 Err(error) => {
                     eprintln!("creating the map runtime failed: {error}");
                     return None;
@@ -1540,28 +1547,43 @@ fn create_egl_context() -> Result<EglContext, Box<dyn std::error::Error>> {
         })
     };
 
-    // Nothing here presents to a window, so the map draws headless on Mesa's
-    // surfaceless platform rather than opening a display server connection.
-    const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
-    if !egl.GetPlatformDisplayEXT.is_loaded() {
-        return Err("eglGetPlatformDisplayEXT is unavailable".into());
-    }
-    // SAFETY: the entry point is loaded, and the attribute list is terminated.
-    let display = unsafe {
-        egl.GetPlatformDisplayEXT(
-            EGL_PLATFORM_SURFACELESS_MESA,
-            egl::DEFAULT_DISPLAY as *mut c_void,
-            [egl::NONE as EGLint].as_ptr(),
-        )
-    };
-    if display == egl::NO_DISPLAY {
-        // SAFETY: EGL is loaded; GetError needs no live display.
-        return Err(
-            format!("eglGetPlatformDisplayEXT failed with 0x{:x}", unsafe {
-                egl.GetError()
-            })
-            .into(),
-        );
+    // Nothing here presents to a window: the map draws into a pbuffer and the
+    // pixels are read back, so no display server connection is wanted.
+    //
+    // How to ask for a display without one differs. On Linux it is Mesa's
+    // surfaceless platform. Android has no such platform and no Mesa — asking
+    // for it there gets a handle its libEGL does not recognise ("cannot find
+    // display ... in displayMap") and `eglInitialize` then fails with
+    // `EGL_BAD_DISPLAY`. Its default display is already headless enough, since
+    // nothing binds a window surface to it.
+    let display = display(&egl)?;
+
+    fn display(egl: &egl::Egl) -> Result<egl::types::EGLDisplay, Box<dyn std::error::Error>> {
+        #[cfg(target_os = "android")]
+        // SAFETY: EGL is loaded.
+        let display = unsafe { egl.GetDisplay(egl::DEFAULT_DISPLAY as *mut c_void) };
+
+        #[cfg(not(target_os = "android"))]
+        let display = {
+            const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+            if !egl.GetPlatformDisplayEXT.is_loaded() {
+                return Err("eglGetPlatformDisplayEXT is unavailable".into());
+            }
+            // SAFETY: the entry point is loaded, and the list is terminated.
+            unsafe {
+                egl.GetPlatformDisplayEXT(
+                    EGL_PLATFORM_SURFACELESS_MESA,
+                    egl::DEFAULT_DISPLAY as *mut c_void,
+                    [egl::NONE as EGLint].as_ptr(),
+                )
+            }
+        };
+
+        if display == egl::NO_DISPLAY {
+            // SAFETY: EGL is loaded; GetError needs no live display.
+            return Err(format!("no EGL display: 0x{:x}", unsafe { egl.GetError() }).into());
+        }
+        Ok(display)
     }
     // SAFETY: display was just obtained.
     if unsafe { egl.Initialize(display, std::ptr::null_mut(), std::ptr::null_mut()) } == egl::FALSE
