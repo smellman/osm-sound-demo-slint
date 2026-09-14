@@ -129,6 +129,57 @@ seen — and its macOS backend cannot cover iOS because that one reads IOKit HID
 does not expose. The fork adds a backend on GameController.framework instead, pending
 [the merge request](https://gitlab.com/smellman/gilrs/-/merge_requests).
 
+### Android
+
+One script does the whole thing:
+
+```bash
+./build_for_android.sh                 # arm64-v8a, what a phone runs
+ABI=x86_64 ./build_for_android.sh      # what an emulator on an Intel host wants
+adb install -r target/release/apk/OSMSoundDemo.apk
+```
+
+It needs the Android SDK and NDK, plus `cargo-apk`, `cargo-about`, CMake and Ninja; it
+checks for each and says what is missing rather than failing deep inside a build. Set
+`ANDROID_HOME` if the SDK is not at `~/Library/Android/sdk` — note that is the directory
+holding `platform-tools` and `ndk`, one below the `~/Library/Android` Android Studio shows.
+
+Three things the script settles that are easy to trip over:
+
+**The native library is built from source**, which is what takes the minutes. The published
+`android-arm64` artifact does not match the Rust binding this app pins — its header renamed
+`MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND` while the binding still asks for
+the old name, so the download does not compile. `FFI_DIR` points at the checkout, which has
+to sit at the commit `Cargo.lock` resolves `maplibre-native-ffi` to.
+
+**Two Rust toolchains are in play.** The FFI checkout carries no `rust-toolchain.toml`, so
+cargo run from there picks the default one, which has no Android target and fails with
+"can't find crate for `std`". The script pins both halves to the channel in this project's
+`rust-toolchain.toml`, which is also the version the FFI repo pins for itself.
+
+**bindgen has to be told the triple separately.** `cargo-apk` sets a bare `clang` as the C
+compiler and passes the API version in `CFLAGS`, which bindgen does not read; the NDK's
+`sys/cdefs.h` then refuses the unversioned target outright. `BINDGEN_EXTRA_CLANG_ARGS_*`
+carries it.
+
+`min_sdk_version` is 26 because cpal plays through AAudio and `libaaudio.so` first appears
+in that sysroot. The APK is signed with a development key the script generates into
+`build/`; it is not a release signature and `build/` is ignored by git.
+
+The app is a `cdylib` here rather than a binary — an android-activity app has no `main`, the
+platform loads a shared library and calls `android_main` — which is why `src/lib.rs` holds
+everything and `src/main.rs` is a thin desktop wrapper.
+
+Two things differ from the other platforms at runtime. **MapLibre Native's own requests are
+answered by this app** (`src/map/fetch.rs`), because Android has no certificate store a C++
+library can read: verification goes out to Java through a class `cargo-apk` cannot compile,
+and every HTTPS request fails with "failed to call native verifier". Serving the requests
+through the `ureq` this app already uses avoids both that and a move to Gradle. **The system
+bar insets are measured here too**, from the activity's content rect, because Slint reads
+them through a Java helper that is not in the APK for the same reason.
+
+Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
+
 ### Environment
 
 | Variable | Effect |
@@ -261,9 +312,9 @@ prebuilt native artifact for each — so one has to be named at build time:
 
 | Feature | Platform | Device created by |
 | --- | --- | --- |
-| `opengl` | Linux | EGL on Mesa's surfaceless platform: an ES 3 context on the render thread, which the session joins as a share group |
+| `opengl` | Linux, Android | EGL: an ES 3 context on the render thread, which the session joins as a share group. Linux asks for Mesa's surfaceless platform, which Android has no equivalent of — there the default display is used, since nothing binds a window surface to it either way |
 | `vulkan` | Linux | `ash`, headless: instance, physical device with a graphics queue, and a one-queue logical device — no surface and no swapchain |
-| `metal` | macOS | `MTLCreateSystemDefaultDevice` |
+| `metal` | macOS, iOS | `MTLCreateSystemDefaultDevice` |
 
 ```bash
 cargo run --release --features opengl

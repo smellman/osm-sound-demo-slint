@@ -419,6 +419,53 @@ fn palette() -> [f64; crate::map::SLICES] {
     std::array::from_fn(|slice| (offset + slice as f64 * step).rem_euclid(360.0))
 }
 
+/// Tells the UI how much of each edge the system bars take, on the platform
+/// that does not tell it itself.
+///
+/// Slint reads Android's insets through a Java helper it ships, and that helper
+/// has to be compiled into the APK — which `cargo-apk` cannot do, since it
+/// builds Rust and a manifest and no Java. So `safe-area-insets` reads as zero
+/// there and the transport bar ends up under the navigation bar.
+///
+/// The activity knows anyway. Its content rect is the part of the window not
+/// covered by system decorations, maintained natively through
+/// `onContentRectChanged`, so the difference between that and the window is the
+/// inset. No JNI, no Java class, and no need to be on the UI thread.
+///
+/// Read every tick rather than once: it changes when the device is turned, and
+/// when the navigation bar comes and goes.
+#[cfg(target_os = "android")]
+fn apply_insets(ui: &AppWindow) {
+    let Some(android) = crate::android_app() else {
+        return;
+    };
+    let Some(window) = android.native_window() else {
+        return;
+    };
+    let (width, height) = (window.width(), window.height());
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let rect = android.content_rect();
+    // An empty content rect is the value it starts at, before the activity has
+    // been told; taking it literally would inset the whole window away.
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+
+    // The rect is in physical pixels and the UI is laid out in logical ones.
+    let scale = ui.window().scale_factor().max(f32::MIN_POSITIVE);
+    let edge = |pixels: i32| (pixels.max(0) as f32) / scale;
+    ui.set_inset_left(edge(rect.left));
+    ui.set_inset_top(edge(rect.top));
+    ui.set_inset_right(edge(width - rect.right));
+    ui.set_inset_bottom(edge(height - rect.bottom));
+}
+
+/// Every other platform reports its own; the properties keep their bindings.
+#[cfg(not(target_os = "android"))]
+fn apply_insets(_ui: &AppWindow) {}
+
 /// What a face button does, whether it came from the pad or the keyboard.
 ///
 /// The keyboard sends the button's name rather than the action, so the two
@@ -984,6 +1031,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             } else {
                 String::new()
             };
+            apply_insets(&ui);
             // Naming the pad is the only feedback that it was picked up at all.
             let input = match state.gamepads.name() {
                 Some(name) => format!("🎮 {name}"),

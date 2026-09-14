@@ -150,6 +150,14 @@ export component AppWindow inherits Window {
     in property <string> status;
     // What the style's sources say has to be credited.
     in property <string> attribution;
+    // How much of each edge the system takes: Android's navigation bar, a
+    // status bar, a notch. The default is what the platform reports, which is
+    // right everywhere but Android — see `insets` in src/app.rs for why Rust
+    // fills these in there.
+    in-out property <length> inset-left: root.safe-area-insets.left;
+    in-out property <length> inset-top: root.safe-area-insets.top;
+    in-out property <length> inset-right: root.safe-area-insets.right;
+    in-out property <length> inset-bottom: root.safe-area-insets.bottom;
     in property <bool> playing: false;
     in property <bool> busy: false;
     in property <bool> has-release: false;
@@ -223,12 +231,19 @@ export component AppWindow inherits Window {
                     map := MapView { }
                 }
 
+                // The system bars overlap the window on a phone — Android's
+                // navigation bar at the bottom, the status bar and any notch at
+                // the top. `safe-area-insets` is how much of each edge they
+                // take. The map is left to fill the window, because a map
+                // behind a translucent bar still reads; it is the controls that
+                // have to come inside, since a button under the home gesture
+                // cannot be pressed.
                 // --- overlay: top-left "About" ---
                 // The overlays sit on the map, whose brightness varies with the
                 // style and the animation, so each gets its own dark backing.
                 Rectangle {
-                    x: 12px;
-                    y: 12px;
+                    x: 12px + root.inset-left;
+                    y: 12px + root.inset-top;
                     width: 88px;
                     height: 32px;
                     background: #0d0f13cc;
@@ -246,8 +261,8 @@ export component AppWindow inherits Window {
 
                 // --- overlay: top-right "Fly To" ---
                 Rectangle {
-                    x: parent.width - self.width - 12px;
-                    y: 12px;
+                    x: parent.width - self.width - 12px - root.inset-right;
+                    y: 12px + root.inset-top;
                     width: 220px;
                     height: 32px;
                     TouchComboBox {
@@ -263,8 +278,8 @@ export component AppWindow inherits Window {
 
                 // --- overlay: top-right "VJ Mode" ---
             Rectangle {
-                x: parent.width - self.width - 360px;
-                y: 12px;
+                x: parent.width - self.width - 360px - root.inset-right;
+                y: 12px + root.inset-top;
                 width: 110px;
                 height: 32px;
                 background: root.vj ? #1f6feb : #0d0f13cc;
@@ -282,8 +297,8 @@ export component AppWindow inherits Window {
 
             // --- overlay: top-right "Locate Me" ---
             Rectangle {
-                x: parent.width - self.width - 244px;
-                y: 12px;
+                x: parent.width - self.width - 244px - root.inset-right;
+                y: 12px + root.inset-top;
                 width: 110px;
                 height: 32px;
                 background: #0d0f13cc;
@@ -301,7 +316,7 @@ export component AppWindow inherits Window {
 
             // --- overlay: bottom-left status line ---
                 Rectangle {
-                    x: 12px;
+                    x: 12px + root.inset-left;
                     y: parent.height - self.height - 12px;
                     width: status-text.preferred-width + 16px;
                     height: status-text.preferred-height + 8px;
@@ -317,8 +332,8 @@ export component AppWindow inherits Window {
 
                 // --- overlay: about panel ---
                 if root.about-open: Rectangle {
-                    x: 12px;
-                    y: 56px;
+                    x: 12px + root.inset-left;
+                    y: 56px + root.inset-top;
                     width: min(520px, parent.width - 24px);
                     height: about-text.preferred-height + 72px;
                     background: #0d0f13e6;
@@ -364,11 +379,14 @@ export component AppWindow inherits Window {
 
             // --- bottom transport bar ---
             Rectangle {
-                height: 64px;
+                height: 64px + root.inset-bottom;
                 background: #1e2128;
 
                 HorizontalBox {
                     padding: 8px;
+                    padding-bottom: 8px + root.inset-bottom;
+                    padding-left: 8px + root.inset-left;
+                    padding-right: 8px + root.inset-right;
                     spacing: 8px;
                     alignment: stretch;
 
