@@ -6,3 +6,9 @@
 
 # The development signing key and the native build tree.
 /build/
+
+# Local copies of the PMTiles archives; see download-pmtiles.sh.
+pmtiles/*.pmtiles
+# Its partial downloads, and the server date each was started against.
+pmtiles/*.part
+pmtiles/*.part.last-modified

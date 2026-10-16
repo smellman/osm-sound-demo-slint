@@ -23,6 +23,18 @@ anything you actually want to look at. The toolchain is pinned by `rust-toolchai
 and rustup will fetch it on first build; the pin is not a preference, and the file says
 what breaks without it.
 
+To read the map's tiles from disk rather than from tile.openstreetmap.jp, fetch the
+archives first:
+
+```bash
+./download-pmtiles.sh                    # planet, takeshima and hoppo into pmtiles/
+./download-pmtiles.sh takeshima hoppo    # just these
+```
+
+`planet.pmtiles` is about 85 GB. An interrupted download resumes, and an archive that
+matches the server's size and date is skipped, so running it again is how to pick up a
+newer planet. Without the archives the map reads them from the server, as before.
+
 ### Prerequisites
 
 `maplibre-native-ffi` downloads a prebuilt native artifact rather than building MapLibre
@@ -443,10 +455,15 @@ Some of these are deliberate, some are limits of the current Rust bindings.
   60° unless `BoundOptions::max_pitch` is raised first — asking for more without that
   silently gives 60 back.
 - **Vector tiles come from `planet.pmtiles`**, as in the web demo. The style is
-  tile.openstreetmap.jp's toner-ja, bundled as `style/style.json` with its `openmaptiles`
-  source pointed at `pmtiles://https://tile.openstreetmap.jp/static/planet.pmtiles`.
+  tile.openstreetmap.jp's toner-ja, bundled as `style/style.json` with its three sources —
+  `openmaptiles`, `takeshima` and `hoppo` — pointed at `pmtiles://asset://pmtiles/*.pmtiles`.
   MapLibre Native reads PMTiles itself, so there is no protocol to register as the web
-  demo had to.
+  demo had to. `asset://` is the way to write a relative path here: the style is handed over
+  as JSON, so nothing resolves a URL against its location, and `file://` takes what follows
+  it as a path from the working directory. `asset://` resolves against the runtime's asset
+  path, which the desktop build sets to this project. An archive that is not there — not
+  downloaded yet, or on Android and iOS, where the asset path is not this project — is read
+  from `https://tile.openstreetmap.jp/static/` instead; the check runs on every style load.
 - **Glyphs and the sprite are compiled in.** `style/fonts` (`migu1c-regular` and
   `migu2m-regular`) and `style/sprites` are copied from
   [osmfj/tileserver-gl-site](https://github.com/osmfj/tileserver-gl-site), which is what

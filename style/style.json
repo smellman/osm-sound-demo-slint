@@ -18,15 +18,15 @@
   "sources": {
     "openmaptiles": {
       "type": "vector",
-      "url": "pmtiles://https://tile.openstreetmap.jp/static/planet.pmtiles"
+      "url": "pmtiles://asset://pmtiles/planet.pmtiles"
     },
     "takeshima": {
       "type": "vector",
-      "url": "https://tile.openstreetmap.jp/data/takeshima.json"
+      "url": "pmtiles://asset://pmtiles/takeshima.pmtiles"
     },
     "hoppo": {
       "type": "vector",
-      "url": "https://tile.openstreetmap.jp/data/hoppo.json"
+      "url": "pmtiles://asset://pmtiles/hoppo.pmtiles"
     }
   },
   "sprite": "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/sprite",

@@ -17,7 +17,7 @@
 //! picks up finished frames.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
@@ -42,11 +42,54 @@ use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor}
 use crate::Size;
 use crate::audio::BINS;
 
-/// The style the map opens with: tile.openstreetmap.jp's toner-ja, with its
-/// `openmaptiles` source read from `planet.pmtiles` rather than through the
-/// TileJSON. Compiled in, so the style itself needs no network; the tiles,
-/// glyphs and sprite still come over it.
+/// The style the map opens with: tile.openstreetmap.jp's toner-ja, its three
+/// sources read from PMTiles archives under `pmtiles/` rather than through
+/// their TileJSON. Compiled in, so the style itself needs no network.
 const BUNDLED_STYLE: &str = include_str!("../../style/style.json");
+
+/// How the bundled style names a local archive: `asset://` resolves against
+/// the runtime's asset path, which [`asset_root`] sets to this project.
+const LOCAL_PMTILES: &str = "pmtiles://asset://";
+
+/// Where an archive is read from when there is no local copy.
+const REMOTE_PMTILES: &str = "pmtiles://https://tile.openstreetmap.jp/static/";
+
+/// The directory `asset://` URLs resolve against, or `None` where the archives
+/// are never local. On the desktop that is this project, so `pmtiles/` is the
+/// directory `download-pmtiles.sh` fills. Android's asset path is the APK, and
+/// an 85 GB planet does not go in one; on iOS the build machine's path does
+/// not exist on the device, so the check below falls back there too.
+fn asset_root() -> Option<&'static str> {
+    if cfg!(target_os = "android") {
+        None
+    } else {
+        Some(env!("CARGO_MANIFEST_DIR"))
+    }
+}
+
+/// The bundled style, each local archive that has not been downloaded pointed
+/// back at the server. Checked on every load, so archives that arrive while
+/// the app runs are used from the next style load on.
+fn bundled_style() -> String {
+    let mut style: serde_json::Value =
+        serde_json::from_str(BUNDLED_STYLE).expect("the bundled style is valid JSON");
+    if let Some(sources) = style["sources"].as_object_mut() {
+        for source in sources.values_mut() {
+            let Some(path) = source["url"]
+                .as_str()
+                .and_then(|url| url.strip_prefix(LOCAL_PMTILES))
+            else {
+                continue;
+            };
+            let local = asset_root().is_some_and(|root| Path::new(root).join(path).is_file());
+            if !local {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                source["url"] = format!("{REMOTE_PMTILES}{name}").into();
+            }
+        }
+    }
+    style.to_string()
+}
 
 /// The style URL `MAPLIBRE_STYLE_URL` asks for, or `None` for the bundled one.
 fn default_style_url() -> Option<String> {
@@ -61,7 +104,7 @@ fn default_style_url() -> Option<String> {
 fn set_style(map: &MapHandle, url: Option<&str>) -> maplibre_native_ffi::Result<()> {
     match url {
         Some(url) => map.set_style_url(url),
-        None => map.set_style_json(BUNDLED_STYLE.as_bytes()),
+        None => map.set_style_json(bundled_style().as_bytes()),
     }
 }
 
@@ -1054,6 +1097,9 @@ impl Engine {
         if self.runtime.is_none() {
             let mut options = RuntimeOptions::default();
             options.cache_path = Some(self.cache.to_string_lossy().into_owned());
+            if let Some(root) = asset_root() {
+                options.asset_path = Some(root.to_owned());
+            }
             match RuntimeHandle::with_options(&options) {
                 Ok(runtime) => {
                     // Before any request goes out, which the style load starts.
@@ -2122,6 +2168,28 @@ mod tests {
         let mut controller = CameraController::default();
         controller.jump_for_test(lon, lat, zoom);
         controller
+    }
+
+    #[test]
+    fn bundled_sources_are_local_only_when_downloaded() {
+        let style: serde_json::Value = serde_json::from_str(&bundled_style()).unwrap();
+        let sources = style["sources"].as_object().unwrap();
+        assert_eq!(sources.len(), 3);
+        for (id, source) in sources {
+            let url = source["url"].as_str().unwrap();
+            if let Some(path) = url.strip_prefix(LOCAL_PMTILES) {
+                let root = asset_root().expect("local only where there is an asset root");
+                assert!(Path::new(root).join(path).is_file(), "{id}: {url}");
+            } else {
+                let name = url.strip_prefix(REMOTE_PMTILES).expect(url);
+                let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("pmtiles").join(name);
+                assert!(
+                    asset_root().is_none() || !local.is_file(),
+                    "{id} went to the server with {} on disk",
+                    local.display()
+                );
+            }
+        }
     }
 
     #[test]
