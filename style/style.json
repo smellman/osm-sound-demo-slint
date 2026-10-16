@@ -1555,6 +1555,9 @@
       "source-layer": "island",
       "layout": {
         "text-field": "{name}",
+        "text-font": [
+          "migu1c-regular"
+        ],
         "text-size": {
           "stops": [
             [
@@ -1598,6 +1601,9 @@
       "source-layer": "island",
       "layout": {
         "text-field": "{name}",
+        "text-font": [
+          "migu1c-regular"
+        ],
         "text-size": {
           "stops": [
             [
