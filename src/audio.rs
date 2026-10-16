@@ -8,8 +8,8 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rodio::decoder::DecoderBuilder;
@@ -107,6 +107,13 @@ const WINDOW: usize = 2048;
 /// than one FFT bin, and there is little in music down there to show anyway.
 const LOW_HZ: f64 = 30.0;
 
+/// The top of the analysed range: the Nyquist frequency of CD audio, which is
+/// what the bands were first drawn for and about where hearing stops.
+const HIGH_HZ: f64 = 22_050.0;
+
+/// The rate assumed before anything has played.
+const REFERENCE_RATE: u32 = 44_100;
+
 /// Decibel range mapped onto 0.0..=1.0, same as `AnalyserNode`'s defaults.
 const MIN_DB: f32 = -90.0;
 const MAX_DB: f32 = -10.0;
@@ -118,6 +125,9 @@ const SMOOTHING: f32 = 0.35;
 #[derive(Debug)]
 pub struct Spectrum {
     ring: Mutex<Ring>,
+    /// The sample rate of what is being written, which decides how many hertz
+    /// one FFT bin is.
+    rate: AtomicU32,
 }
 
 #[derive(Debug)]
@@ -133,7 +143,16 @@ impl Spectrum {
                 samples: Box::new([0.0; WINDOW]),
                 write: 0,
             }),
+            rate: AtomicU32::new(REFERENCE_RATE),
         }
+    }
+
+    fn set_rate(&self, rate: u32) {
+        self.rate.store(rate, Ordering::Relaxed);
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate.load(Ordering::Relaxed)
     }
 
     fn push(&self, sample: f32) {
@@ -170,6 +189,14 @@ struct Tap<S> {
     spectrum: Arc<Spectrum>,
     frame_sum: f32,
     frame_len: u16,
+    /// The source rate last seen, so the spectrum is only told when it changes
+    /// — which a decoder may do between spans.
+    rate: u32,
+    /// How many mono frames are averaged into one before they reach the
+    /// spectrum; see [`decimation`].
+    factor: u32,
+    decimated_sum: f32,
+    decimated_len: u32,
 }
 
 impl<S> Tap<S> {
@@ -179,8 +206,36 @@ impl<S> Tap<S> {
             spectrum,
             frame_sum: 0.0,
             frame_len: 0,
+            rate: 0,
+            factor: 1,
+            decimated_sum: 0.0,
+            decimated_len: 0,
         }
     }
+
+    /// Takes one mono frame, passing every `factor`th average on.
+    fn push_frame(&mut self, frame: f32) {
+        self.decimated_sum += frame;
+        self.decimated_len += 1;
+        if self.decimated_len >= self.factor {
+            self.spectrum
+                .push(self.decimated_sum / self.decimated_len as f32);
+            self.decimated_sum = 0.0;
+            self.decimated_len = 0;
+        }
+    }
+}
+
+/// How many frames to average into one for the analyser, so a high-rate file
+/// is analysed at 44.1 or 48 kHz.
+///
+/// The FFT window is a fixed number of samples, so at 96 kHz it would cover
+/// half the time it does at 48 and each bin would be twice as wide — 47 Hz,
+/// where the bottom bands are 13 Hz apart. Averaging pairs halves the rate
+/// back. It is a crude low-pass, but what it throws away is above 24 kHz, and
+/// only the analyser sees it: the samples played are untouched.
+fn decimation(rate: u32) -> u32 {
+    (rate / REFERENCE_RATE).max(1)
 }
 
 impl<S: Source> Iterator for Tap<S> {
@@ -192,8 +247,15 @@ impl<S: Source> Iterator for Tap<S> {
         self.frame_sum += sample;
         self.frame_len += 1;
         if self.frame_len >= channels {
-            self.spectrum
-                .push(self.frame_sum / f32::from(self.frame_len));
+            let rate = self.inner.sample_rate().get();
+            if rate != self.rate {
+                self.rate = rate;
+                self.factor = decimation(rate);
+                self.decimated_sum = 0.0;
+                self.decimated_len = 0;
+                self.spectrum.set_rate(rate / self.factor);
+            }
+            self.push_frame(self.frame_sum / f32::from(self.frame_len));
             self.frame_sum = 0.0;
             self.frame_len = 0;
         }
@@ -237,37 +299,40 @@ impl<S: Source> Source for Tap<S> {
 /// Edges are forced apart by at least one bin. Near [`LOW_HZ`] a band is
 /// narrower than the FFT's resolution, and without this two of them would land
 /// on the same bin and show the same level for ever.
-fn band_bins(band: usize) -> (usize, usize) {
-    static EDGES: OnceLock<[usize; BINS + 1]> = OnceLock::new();
-    let edges = EDGES.get_or_init(|| {
-        // Assumed rather than read from the stream: the ratio between the edges
-        // is what matters here, and it does not depend on the rate.
-        const NYQUIST: f64 = 22_050.0;
-        let half = (WINDOW / 2) as f64;
-        let ratio = (NYQUIST / LOW_HZ).powf(1.0 / BINS as f64);
+///
+/// The edges are in hertz, so where they fall in the FFT depends on the sample
+/// rate: one bin is `rate / WINDOW` Hz. They used to be worked out for 44.1 kHz
+/// whatever was playing, which put every band of a 48 kHz track about 9% high
+/// and every band of a 96 kHz one an octave high. The range is the same at any
+/// rate — up to [`HIGH_HZ`], or the Nyquist frequency if that is lower — so a
+/// high-rate file spends no bands above what anyone hears.
+fn band_edges(rate: u32) -> [usize; BINS + 1] {
+    let rate = f64::from(rate.max(1));
+    let half = (WINDOW / 2) as f64;
+    let hz_per_bin = rate / WINDOW as f64;
+    let high = HIGH_HZ.min(rate / 2.0);
+    let ratio = (high / LOW_HZ).powf(1.0 / BINS as f64);
 
-        let mut edges = [0usize; BINS + 1];
-        for (band, edge) in edges.iter_mut().enumerate() {
-            let hz = LOW_HZ * ratio.powi(band as i32);
-            *edge = ((hz / NYQUIST) * half).round() as usize;
+    let mut edges = [0usize; BINS + 1];
+    for (band, edge) in edges.iter_mut().enumerate() {
+        let hz = LOW_HZ * ratio.powi(band as i32);
+        *edge = ((hz / hz_per_bin).round() as usize).min(half as usize);
+    }
+    // Left to right, so each edge clears the one before it, and the last one
+    // still lands on the end of the spectrum.
+    for band in 1..=BINS {
+        edges[band] = edges[band].max(edges[band - 1] + 1);
+    }
+    let overflow = edges[BINS].saturating_sub(half as usize);
+    if overflow > 0 {
+        // Only reachable if the bottom bands ate the whole spectrum, which needs
+        // a window far smaller than this one; shift back rather than index out
+        // of bounds.
+        for edge in &mut edges {
+            *edge = edge.saturating_sub(overflow);
         }
-        // Left to right, so each edge clears the one before it, and the last
-        // one still lands on the end of the spectrum.
-        for band in 1..=BINS {
-            edges[band] = edges[band].max(edges[band - 1] + 1);
-        }
-        let overflow = edges[BINS].saturating_sub(half as usize);
-        if overflow > 0 {
-            // Only reachable if the bottom bands ate the whole spectrum, which
-            // needs a window far smaller than this one; shift back rather than
-            // index out of bounds.
-            for edge in &mut edges {
-                *edge = edge.saturating_sub(overflow);
-            }
-        }
-        edges
-    });
-    (edges[band], edges[band + 1])
+    }
+    edges
 }
 
 /// Turns the tapped samples into `BINS` normalized band levels.
@@ -277,6 +342,9 @@ pub struct Analyzer {
     window: Vec<f32>,
     scratch: Vec<Complex<f32>>,
     levels: [f32; BINS],
+    /// The band edges for `edges_rate`, worked out again when the rate changes.
+    edges: [usize; BINS + 1],
+    edges_rate: u32,
 }
 
 impl Analyzer {
@@ -295,6 +363,8 @@ impl Analyzer {
             window,
             scratch: vec![Complex::new(0.0, 0.0); WINDOW],
             levels: [0.0; BINS],
+            edges: band_edges(REFERENCE_RATE),
+            edges_rate: REFERENCE_RATE,
         }
     }
 
@@ -313,9 +383,15 @@ impl Analyzer {
         }
         self.fft.process(&mut self.scratch);
 
+        let rate = self.spectrum.rate();
+        if rate != self.edges_rate {
+            self.edges = band_edges(rate);
+            self.edges_rate = rate;
+        }
+
         let half = WINDOW / 2;
         for band in 0..BINS {
-            let (start, end) = band_bins(band);
+            let (start, end) = (self.edges[band], self.edges[band + 1]);
             let width = end - start;
             let magnitude = self.scratch[start..end]
                 .iter()
@@ -523,15 +599,21 @@ mod tests {
         step: f32,
         channels: u16,
         remaining: usize,
+        rate: u32,
     }
 
     impl Tone {
         fn new(frequency: f32, channels: u16, frames: usize) -> Self {
+            Self::at_rate(frequency, channels, frames, TEST_RATE)
+        }
+
+        fn at_rate(frequency: f32, channels: u16, frames: usize, rate: u32) -> Self {
             Self {
                 phase: 0.0,
-                step: std::f32::consts::TAU * frequency / TEST_RATE as f32,
+                step: std::f32::consts::TAU * frequency / rate as f32,
                 channels,
                 remaining: frames * channels as usize,
+                rate,
             }
         }
     }
@@ -563,7 +645,7 @@ mod tests {
         }
 
         fn sample_rate(&self) -> rodio::SampleRate {
-            NonZero::new(TEST_RATE).unwrap()
+            NonZero::new(self.rate).unwrap()
         }
 
         fn total_duration(&self) -> Option<Duration> {
@@ -586,6 +668,52 @@ mod tests {
     }
 
     #[test]
+    fn cd_rate_edges_are_the_ones_the_bands_were_tuned_with() {
+        // What the edges were before the rate was read from the stream, when
+        // 44.1 kHz was assumed for everything.
+        let half = (WINDOW / 2) as f64;
+        let ratio = (22_050.0 / LOW_HZ).powf(1.0 / BINS as f64);
+        let mut expected = [0usize; BINS + 1];
+        for (band, edge) in expected.iter_mut().enumerate() {
+            *edge = ((LOW_HZ * ratio.powi(band as i32) / 22_050.0) * half).round() as usize;
+        }
+        for band in 1..=BINS {
+            expected[band] = expected[band].max(expected[band - 1] + 1);
+        }
+        assert_eq!(band_edges(44_100), expected);
+    }
+
+    #[test]
+    fn high_rates_are_analysed_at_cd_or_dat_rate() {
+        assert_eq!(decimation(44_100), 1);
+        assert_eq!(decimation(48_000), 1);
+        assert_eq!(decimation(88_200), 2);
+        assert_eq!(decimation(96_000), 2);
+        assert_eq!(decimation(192_000), 4);
+        assert_eq!(decimation(22_050), 1);
+    }
+
+    #[test]
+    fn edges_rise_and_stay_inside_the_spectrum_at_every_rate() {
+        for rate in [8_000, 22_050, 44_100, 48_000, 88_200, 96_000, 192_000] {
+            let edges = band_edges(rate);
+            assert!(edges.windows(2).all(|pair| pair[0] < pair[1]), "{rate}: {edges:?}");
+            assert!(edges[BINS] <= WINDOW / 2, "{rate}: {edges:?}");
+        }
+    }
+
+    #[test]
+    fn a_tone_lands_in_the_same_band_whatever_the_rate() {
+        // One tone per octave or so across the range, away from band edges.
+        for hz in [50.0, 200.0, 1_000.0, 4_000.0, 12_000.0] {
+            let at_cd = loudest_band_at(hz, 44_100);
+            for rate in [48_000, 88_200, 96_000, 192_000] {
+                assert_eq!(loudest_band_at(hz, rate), at_cd, "{hz} Hz at {rate}");
+            }
+        }
+    }
+
+    #[test]
     fn silence_leaves_every_band_at_zero() {
         let spectrum = Arc::new(Spectrum::new());
         let mut analyzer = Analyzer::new(spectrum);
@@ -595,7 +723,11 @@ mod tests {
 
     /// The loudest band, for the placement tests below.
     fn loudest_band(hz: f32) -> usize {
-        let levels = levels_of(Tone::new(hz, 1, WINDOW * 4));
+        loudest_band_at(hz, TEST_RATE)
+    }
+
+    fn loudest_band_at(hz: f32, rate: u32) -> usize {
+        let levels = levels_of(Tone::at_rate(hz, 1, WINDOW * 4, rate));
         levels
             .iter()
             .enumerate()

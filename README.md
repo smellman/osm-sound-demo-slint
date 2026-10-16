@@ -656,6 +656,16 @@ bands are one bin wide each, so a pure bass tone spreads over its neighbours; th
 resolution talking, and `a_low_tone_stays_in_the_low_bands` pins down what it does. The
 FFT costs 8.6 µs a frame, against a 16.7 ms budget at 60 fps.
 
+The edges are in hertz, so they are worked out for the rate of what is playing: a bin is
+`rate / 2048` Hz. They used to assume 44.1 kHz for everything, which is what Otherman's
+MP3s are, but Local Music's FLACs are as often 48 kHz — every band about 9% high — and
+occasionally 96 kHz, an octave high. The range stays 30 Hz to 22.05 kHz at any rate. A file
+at 88.2 kHz or above is also averaged down by a whole factor before the analyser sees it,
+2 for 96 kHz and 4 for 192, because at 96 kHz a 2048-point window would be 47 Hz a bin and
+the bottom bands would run together; only the analyser's copy is averaged, not what plays.
+`a_tone_lands_in_the_same_band_whatever_the_rate` checks a tone from 50 Hz to 12 kHz lands
+in the same band at 44.1, 48, 88.2, 96 and 192 kHz.
+
 
 ### The band animation
 
