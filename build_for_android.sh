@@ -10,11 +10,13 @@
 # library and wraps it in an APK.
 #
 # The native MapLibre library is built from source rather than downloaded. The
-# published `android-arm64` artifact does not match the Rust binding this app
-# pins: its header renamed `MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND`
-# while the binding still asks for the old name, so the download does not
-# compile at all. Building the library ourselves from the same commit the
-# binding comes from keeps the two in step. That is what takes the minutes.
+# published `android-arm64` artifact is a floating snapshot of upstream's latest
+# commit, while the Rust binding comes from the commit Cargo.lock pins, so the
+# two drift apart whenever upstream moves. They already have once: the snapshot
+# renamed `MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND` while the
+# pinned binding still asked for the old name, and the download did not compile
+# at all. Building the library ourselves from the same commit the binding comes
+# from keeps the two in step. That is what takes the minutes.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

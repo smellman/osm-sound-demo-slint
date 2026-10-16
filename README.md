@@ -147,10 +147,12 @@ holding `platform-tools` and `ndk`, one below the `~/Library/Android` Android St
 Three things the script settles that are easy to trip over:
 
 **The native library is built from source**, which is what takes the minutes. The published
-`android-arm64` artifact does not match the Rust binding this app pins — its header renamed
-`MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND` while the binding still asks for
-the old name, so the download does not compile. `FFI_DIR` points at the checkout, which has
-to sit at the commit `Cargo.lock` resolves `maplibre-native-ffi` to.
+`android-arm64` artifact is a floating snapshot of upstream's latest commit, while the Rust
+binding comes from the commit `Cargo.lock` pins, so the two drift apart whenever upstream
+moves. They already have once — the snapshot renamed `MLN_LOG_EVENT_OPENGL` to
+`MLN_LOG_EVENT_GRAPHICS_BACKEND` while the pinned binding still asked for the old name, and the
+download did not compile. `FFI_DIR` points at the checkout, which has to sit at the commit
+`Cargo.lock` resolves `maplibre-native-ffi` to.
 
 **Two Rust toolchains are in play.** The FFI checkout carries no `rust-toolchain.toml`, so
 cargo run from there picks the default one, which has no Android target and fails with
