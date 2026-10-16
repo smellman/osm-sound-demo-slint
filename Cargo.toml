@@ -38,11 +38,11 @@ linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
 # support at all, so there `Gilrs::new` returns `NotImplemented` and no pad is
 # ever seen. See gilrs-core/src/platform/ios in the branch below.
 gilrs = { git = "https://gitlab.com/smellman/gilrs.git", branch = "ios-game-controller-backend" }
-rodio = { version = "0.22", default-features = false, features = ["playback", "recording", "symphonia-mp3"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "symphonia-mp3"] }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slint = "1.16"
+slint = "1.18"
 ureq = { version = "3", features = ["json"] }
 
 # The FFI hands the graphics plumbing to the caller: the map draws through a
@@ -52,7 +52,7 @@ ash = { version = "0.38", optional = true }
 # EGL, for the OpenGL backend. `glutin_egl_sys` is bindings only, so the
 # library itself is opened by hand.
 glutin_egl_sys = { version = "0.7", optional = true }
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 # Metal is every Apple platform, not just macOS: the same `metal` feature builds
 # for iOS and the simulator (see "iOS" in the README), so gating these on
@@ -76,7 +76,7 @@ objc2-v06 = { package = "objc2", version = "0.6" }
 # Android's windowing and lifecycle come from android-activity, which Slint
 # drives for us; the feature is only meaningful on that target.
 [target.'cfg(target_os = "android")'.dependencies]
-slint = { version = "1.16", features = ["backend-android-activity-06"] }
+slint = { version = "1.18", features = ["backend-android-activity-06"] }
 # MapLibre Native does its own HTTP on Android and will not touch HTTPS until
 # `mln_android_init` has handed it a JVM and a Context — without that the style
 # never loads and the map stays black while the rest of the app works. The
@@ -128,4 +128,4 @@ name = "android.permission.INTERNET"
 name = "android.permission.RECORD_AUDIO"
 
 [build-dependencies]
-slint-build = "1.16"
+slint-build = "1.18"
