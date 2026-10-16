@@ -508,7 +508,9 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    TouchComboBox {
+                    // Local Music only: an Otherman release plays through as
+                    // the album it is, so its bar stays as it always was.
+                    if root.local: TouchComboBox {
                         horizontal-stretch: 2;
                         model: root.tracks;
                         current-index <=> root.track-index;
