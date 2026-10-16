@@ -203,6 +203,7 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_HOME` | `lon,lat` for Locate Me, answering without the network. Longitude first, as MapLibre and GeoJSON order a position |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
+| `OSM_SOUND_DEMO_MUSIC` | The directory Local Music reads, instead of `~/Music`. On macOS Local Music is off unless this is set |
 | `OSM_SOUND_DEMO_PREFETCH` | Override MapLibre Native's `prefetch_zoom_delta`; `0` turns prefetching off. Unset by default, and measuring says leave it that way — see [Tile prefetching](#tile-prefetching) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
@@ -509,6 +510,32 @@ On macOS the input is behind the microphone permission, and a binary started fro
 terminal inherits that terminal's grant. Without it the device opens and delivers silence
 rather than failing, so a flat skyline with a device named in the status line means the
 permission, not the routing.
+
+### Local Music
+
+The **Local Music** button switches from Otherman's catalogue to the albums under
+`~/Music` (or `OSM_SOUND_DEMO_MUSIC`): the release dropdown lists albums, the dropdown
+beside it the album's tracks, and Go To Release becomes Open Folder. Picking a track plays
+it; the transport, auto-advance and the D-pad work as they do for releases. Switching back
+stops what is playing, and each side keeps the release or album it had.
+
+The directory is scanned in the background at startup, and the button only appears once it
+has found something to play. `src/library.rs` reads FLAC and MP3 tags with
+[lofty](https://github.com/Serial-ATA/lofty-rs) — headers only, which put 1215 FLAC files
+into 98 albums in about 30 ms here — and groups tracks by album artist (or artist) and
+album, falling back to the directory for untagged files. Tracks sort by disc, track number
+and file name.
+
+Playback is the same rodio player and tap as a streamed track, reading the file directly,
+so the skyline follows a local track exactly as it follows a stream. That is also why this
+does not go through mpd, which was the other option: mpd plays to its own output, past the
+analyser, and getting its samples back means configuring a FIFO output (or running VJ mode
+off a monitor input) on top of setting up mpd and its database.
+
+It is for Linux. The phones have no music directory to list, and macOS's `~/Music` is
+Music.app's library — its own database and layout, mostly AAC and ALAC, which rodio is not
+built to decode here — so there it stays off unless `OSM_SOUND_DEMO_MUSIC` names a plain
+directory of FLAC or MP3 files.
 
 ### The effects
 

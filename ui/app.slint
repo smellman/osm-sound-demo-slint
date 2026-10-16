@@ -162,15 +162,23 @@ export component AppWindow inherits Window {
     in property <bool> busy: false;
     in property <bool> has-release: false;
     in property <bool> vj: false;
+    // Local Music: offered once the music directory has been scanned and held
+    // something; `local` is whether it is the source now.
+    in property <bool> local-available: false;
+    in property <bool> local: false;
+    in property <[string]> tracks;
     // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
     in-out property <int> place-index: 0;
     // Two-way so the gamepad's D-pad moves the release dropdown too.
     in-out property <int> release-index: 0;
+    in-out property <int> track-index: 0;
     // Two-way so L2/R2 move the slider as well as the output level.
     in-out property <float> volume: 100;
 
     // --- callbacks: UI -> Rust ---
     callback release-selected(/* index */ int);
+    callback track-selected(/* index */ int);
+    callback toggle-local();
     callback place-selected(/* index */ int);
     callback toggle-play();
     callback next-track();
@@ -291,6 +299,26 @@ export component AppWindow inherits Window {
                     text: root.vj ? "VJ: on" : "VJ Mode";
                     clicked => {
                         root.toggle-vj();
+                    }
+                }
+            }
+
+            // --- overlay: top-right "Local Music" ---
+            Rectangle {
+                x: parent.width - self.width - 482px - root.inset-right;
+                y: 12px + root.inset-top;
+                width: 120px;
+                height: 32px;
+                visible: root.local-available;
+                background: root.local ? #1f6feb : #0d0f13cc;
+                border-radius: 6px;
+
+                Button {
+                    width: 100%;
+                    height: 100%;
+                    text: root.local ? "Local: on" : "Local Music";
+                    clicked => {
+                        root.toggle-local();
                     }
                 }
             }
@@ -480,8 +508,18 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    TouchComboBox {
+                        horizontal-stretch: 2;
+                        model: root.tracks;
+                        current-index <=> root.track-index;
+                        drop-up: true;
+                        selected(index) => {
+                            root.track-selected(index);
+                        }
+                    }
+
                     Button {
-                        text: "Go To Release";
+                        text: root.local ? "Open Folder" : "Go To Release";
                         enabled: root.has-release;
                         clicked => {
                             root.open-release();

@@ -5,6 +5,9 @@
 //! sample stream on its way to the device and running an FFT over the most
 //! recent window on the UI thread.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -375,10 +378,31 @@ impl AudioPlayer {
         }
         // `with_byte_len` turns seeking on, so this has to come after it.
         let decoder = builder.with_seekable(false).build()?;
-        self.player
-            .append(Tap::new(decoder, Arc::clone(&self.spectrum)));
-        self.player.play();
+        self.start(decoder);
         Ok(())
+    }
+
+    /// Replaces whatever is queued with a file on disk and starts it. Local
+    /// Music's tracks, which are all there from the start, so unlike a stream
+    /// the decoder may seek.
+    pub fn play_file(&self, path: &Path) -> Result<(), Error> {
+        self.stop();
+        let file = File::open(path)?;
+        let byte_len = file.metadata()?.len();
+        let mut builder = DecoderBuilder::new()
+            .with_data(BufReader::new(file))
+            .with_byte_len(byte_len);
+        if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+            builder = builder.with_hint(&extension.to_ascii_lowercase());
+        }
+        self.start(builder.build()?);
+        Ok(())
+    }
+
+    fn start(&self, source: impl Source + Send + 'static) {
+        self.player
+            .append(Tap::new(source, Arc::clone(&self.spectrum)));
+        self.player.play();
     }
 
     pub fn stop(&self) {

@@ -24,6 +24,7 @@ compile_error!("only one rendering backend can be enabled at a time");
 mod app;
 mod audio;
 mod gamepad;
+mod library;
 mod locate;
 mod map;
 mod otherman;
