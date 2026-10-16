@@ -157,8 +157,11 @@ struct State {
     /// Local Music's albums, empty until the scan is in or when there is no
     /// music directory.
     albums: Vec<LocalAlbum>,
-    /// Which album the D-pad steps through in Local Music.
+    /// Which album the D-pad steps through in Local Music, as an index into
+    /// `albums` rather than into the filtered dropdown.
     album_index: usize,
+    /// The artist the album dropdown is narrowed to; `None` lists them all.
+    artist: Option<String>,
     volume: f32,
     /// Accumulated hue rotation, so the drop can speed it up without the phase
     /// jumping when it decays.
@@ -207,6 +210,11 @@ impl State {
         self.albums.get(self.album_index)
     }
 
+    /// Indices into `albums` of those the artist dropdown lets through.
+    fn shown_albums(&self) -> Vec<usize> {
+        library::by_artist(&self.albums, self.artist.as_deref())
+    }
+
     fn current_local_track(&self) -> Option<&library::LocalTrack> {
         self.current_album()
             .and_then(|album| album.tracks.get(self.track_index))
@@ -216,7 +224,11 @@ impl State {
     fn collection_labels(&self) -> Vec<SharedString> {
         match self.source {
             Source::Otherman => self.releases.iter().map(|r| r.label().into()).collect(),
-            Source::Local => self.albums.iter().map(|a| a.label().into()).collect(),
+            Source::Local => self
+                .shown_albums()
+                .into_iter()
+                .map(|index| self.albums[index].label().into())
+                .collect(),
         }
     }
 
@@ -224,7 +236,11 @@ impl State {
     fn collection_index(&self) -> usize {
         match self.source {
             Source::Otherman => self.release_index,
-            Source::Local => self.album_index,
+            Source::Local => self
+                .shown_albums()
+                .iter()
+                .position(|&index| index == self.album_index)
+                .unwrap_or(0),
         }
     }
 
@@ -288,6 +304,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         release_index: 0,
         albums: Vec::new(),
         album_index: 0,
+        artist: None,
         volume: 1.0,
         hue: 0.0,
         releases: Vec::new(),
@@ -665,7 +682,19 @@ fn load_library(ui: &AppWindow) {
         );
         let _ = ui_handle.upgrade_in_event_loop(move |ui| {
             let available = !albums.is_empty();
-            let _ = with_state(|state| state.albums = albums);
+            let artists = with_state(|state| {
+                state.albums = albums;
+                let mut labels: Vec<SharedString> = vec!["All Artists".into()];
+                labels.extend(
+                    library::artists(&state.albums)
+                        .into_iter()
+                        .map(SharedString::from),
+                );
+                labels
+            });
+            if let Some(artists) = artists {
+                ui.set_artists(ModelRc::new(VecModel::from(artists)));
+            }
             ui.set_local_available(available);
         });
     });
@@ -776,6 +805,15 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         move |index| {
             if let Some(ui) = ui_handle.upgrade() {
                 select_track(&ui, &state, index.max(0) as usize);
+            }
+        }
+    });
+
+    ui.on_artist_selected({
+        let ui_handle = ui.as_weak();
+        move |index| {
+            if let Some(ui) = ui_handle.upgrade() {
+                select_artist(&ui, index.max(0) as usize);
             }
         }
     });
@@ -1014,12 +1052,13 @@ fn select_release(ui: &AppWindow, index: usize) {
     });
 }
 
-/// Selects one of Local Music's albums, stopping whatever was playing.
-fn select_album(ui: &AppWindow, index: usize) {
+/// Selects one of Local Music's albums by its place in the album dropdown,
+/// stopping whatever was playing.
+fn select_album(ui: &AppWindow, position: usize) {
     let selected = with_state(|state| {
-        if index >= state.albums.len() {
+        let Some(index) = state.shown_albums().get(position).copied() else {
             return false;
-        }
+        };
         state.audio.stop();
         state.playing = false;
         state.busy = false;
@@ -1032,12 +1071,33 @@ fn select_album(ui: &AppWindow, index: usize) {
     if selected != Some(true) {
         return;
     }
-    ui.set_release_index(index as i32);
+    ui.set_release_index(position as i32);
     ui.set_playing(false);
     ui.set_busy(false);
     ui.set_has_release(true);
     refresh_title(ui);
     refresh_tracks(ui);
+}
+
+/// Narrows the album dropdown to one artist, or with 0 lists every album. The
+/// album that was selected stays selected, and playing, if the artist still
+/// lists it; otherwise the artist's first album takes its place.
+fn select_artist(ui: &AppWindow, position: usize) {
+    let kept = with_state(|state| {
+        state.artist = match position {
+            0 => None,
+            _ => library::artists(&state.albums)
+                .get(position - 1)
+                .map(|artist| artist.to_string()),
+        };
+        state.shown_albums().contains(&state.album_index)
+    });
+    let Some(kept) = kept else { return };
+    ui.set_artist_index(position as i32);
+    refresh_collection(ui);
+    if !kept {
+        select_album(ui, 0);
+    }
 }
 
 /// Picks a track from the track dropdown and plays it: choosing one is asking

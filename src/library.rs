@@ -145,6 +145,33 @@ pub fn scan(dir: &Path) -> Vec<LocalAlbum> {
     albums
 }
 
+/// Every album artist in `albums`, once each, in the order `scan` sorts them.
+pub fn artists(albums: &[LocalAlbum]) -> Vec<&str> {
+    let mut artists: Vec<&str> = Vec::new();
+    for album in albums {
+        if artists
+            .last()
+            .is_none_or(|last| !same_artist(last, &album.artist))
+        {
+            artists.push(&album.artist);
+        }
+    }
+    artists
+}
+
+/// Indices into `albums` of `artist`'s albums, or of all of them for `None`.
+pub fn by_artist(albums: &[LocalAlbum], artist: Option<&str>) -> Vec<usize> {
+    (0..albums.len())
+        .filter(|&index| artist.is_none_or(|artist| same_artist(artist, &albums[index].artist)))
+        .collect()
+}
+
+/// Whether two album artists are one, the way `scan` groups them: ignoring
+/// case.
+fn same_artist(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
 /// Playable files under `dir`, at any depth. Hidden entries are skipped, which
 /// keeps a `.Trash` or a sync tool's state directory out of the library.
 fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -242,6 +269,39 @@ mod tests {
     fn a_track_label_carries_its_number_when_it_has_one() {
         assert_eq!(track("Intro", 1, 3).label(), "03. Intro");
         assert_eq!(track("Intro", 0, 0).label(), "Intro");
+    }
+
+    fn album(artist: &str, title: &str) -> LocalAlbum {
+        LocalAlbum {
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+            dir: PathBuf::new(),
+            tracks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_artist_is_listed_once_in_album_order() {
+        let albums = [
+            album("Aphex Twin", "Drukqs"),
+            album("aphex twin", "Syro"),
+            album("Boards of Canada", "Geogaddi"),
+        ];
+        assert_eq!(artists(&albums), ["Aphex Twin", "Boards of Canada"]);
+        assert!(artists(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_artist_narrows_the_albums_to_theirs() {
+        let albums = [
+            album("Aphex Twin", "Drukqs"),
+            album("aphex twin", "Syro"),
+            album("Boards of Canada", "Geogaddi"),
+        ];
+        assert_eq!(by_artist(&albums, None), [0, 1, 2]);
+        assert_eq!(by_artist(&albums, Some("Aphex Twin")), [0, 1]);
+        assert_eq!(by_artist(&albums, Some("Boards of Canada")), [2]);
+        assert!(by_artist(&albums, Some("Autechre")).is_empty());
     }
 
     #[test]

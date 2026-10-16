@@ -167,17 +167,21 @@ export component AppWindow inherits Window {
     in property <bool> local-available: false;
     in property <bool> local: false;
     in property <[string]> tracks;
+    // Local Music's album artists, after an "All Artists" entry.
+    in property <[string]> artists;
     // Two-way so a gamepad's L1/R1 moves the dropdown as well as the map.
     in-out property <int> place-index: 0;
     // Two-way so the gamepad's D-pad moves the release dropdown too.
     in-out property <int> release-index: 0;
     in-out property <int> track-index: 0;
+    in-out property <int> artist-index: 0;
     // Two-way so L2/R2 move the slider as well as the output level.
     in-out property <float> volume: 100;
 
     // --- callbacks: UI -> Rust ---
     callback release-selected(/* index */ int);
     callback track-selected(/* index */ int);
+    callback artist-selected(/* index */ int);
     callback toggle-local();
     callback place-selected(/* index */ int);
     callback toggle-play();
@@ -495,6 +499,18 @@ export component AppWindow inherits Window {
                             text: parent.line;
                             color: #e8ecf3;
                             vertical-alignment: center;
+                        }
+                    }
+
+                    // Local Music only, like the track dropdown: narrows the
+                    // albums to one artist's, as iTunes' artist column does.
+                    if root.local: TouchComboBox {
+                        horizontal-stretch: 2;
+                        model: root.artists;
+                        current-index <=> root.artist-index;
+                        drop-up: true;
+                        selected(index) => {
+                            root.artist-selected(index);
                         }
                     }
 
