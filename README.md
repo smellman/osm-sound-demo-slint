@@ -186,7 +186,7 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 
 | Variable | Effect |
 | --- | --- |
-| `MAPLIBRE_STYLE_URL` | Override the initial style URL |
+| `MAPLIBRE_STYLE_URL` | Load this style URL instead of the bundled `style/style.json` |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_HOME` | `lon,lat` for Locate Me, answering without the network. Longitude first, as MapLibre and GeoJSON order a position |
@@ -442,8 +442,22 @@ Some of these are deliberate, some are limits of the current Rust bindings.
 - **Pitch opens at 70°**, as the web demo did, and goes to 85°. MapLibre Native clamps at
   60° unless `BoundOptions::max_pitch` is raised first — asking for more without that
   silently gives 60 back.
-- **Vector tiles come from the style's own source**, not from `planet.pmtiles` — there is no
-  `pmtiles://` protocol to register on the native side.
+- **Vector tiles come from `planet.pmtiles`**, as in the web demo. The style is
+  tile.openstreetmap.jp's toner-ja, bundled as `style/style.json` with its `openmaptiles`
+  source pointed at `pmtiles://https://tile.openstreetmap.jp/static/planet.pmtiles`.
+  MapLibre Native reads PMTiles itself, so there is no protocol to register as the web
+  demo had to.
+- **Glyphs and the sprite are compiled in.** `style/fonts` (`migu1c-regular` and
+  `migu2m-regular`) and `style/sprites` are copied from
+  [osmfj/tileserver-gl-site](https://github.com/osmfj/tileserver-gl-site), which is what
+  tile.openstreetmap.jp serves them from. The style still names that server, and
+  `src/map/bundled.rs` answers those URLs from the copies before they reach the network, so
+  anything not bundled — or a style from `MAPLIBRE_STYLE_URL` — is fetched as before. The
+  city and primary-road labels asked for Nunito and Noto Sans; the repository has no Nunito
+  (the server substitutes another font) and Noto Sans is about 35 MB a weight, so both use
+  `migu1c-regular` here. Migu is under the IPA Font License Agreement v1.0; the license
+  texts are in `style/fonts/licenses`, described in `style/fonts/LICENSE.md`, and have to go
+  with any build that is handed out.
 - **Locate Me asks a service, not the OS.** The web demo asked the browser, which asks the
   OS; CoreLocation on macOS would mean shipping an app bundle with a usage description. So
   the button looks the machine up by its public address instead — **pressing it sends that

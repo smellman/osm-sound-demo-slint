@@ -42,16 +42,27 @@ use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor}
 use crate::Size;
 use crate::audio::BINS;
 
-pub const DEFAULT_STYLE_URL: &str =
-    "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
+/// The style the map opens with: tile.openstreetmap.jp's toner-ja, with its
+/// `openmaptiles` source read from `planet.pmtiles` rather than through the
+/// TileJSON. Compiled in, so the style itself needs no network; the tiles,
+/// glyphs and sprite still come over it.
+const BUNDLED_STYLE: &str = include_str!("../../style/style.json");
 
-/// The style the map opens with, `MAPLIBRE_STYLE_URL` overriding it.
-fn default_style_url() -> String {
+/// The style URL `MAPLIBRE_STYLE_URL` asks for, or `None` for the bundled one.
+fn default_style_url() -> Option<String> {
     std::env::var("MAPLIBRE_STYLE_URL")
         .ok()
         .map(|url| url.trim().to_owned())
         .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| DEFAULT_STYLE_URL.to_owned())
+}
+
+/// Starts loading a style: the one at `url`, or the bundled one when there is
+/// none.
+fn set_style(map: &MapHandle, url: Option<&str>) -> maplibre_native_ffi::Result<()> {
+    match url {
+        Some(url) => map.set_style_url(url),
+        None => map.set_style_json(BUNDLED_STYLE.as_bytes()),
+    }
 }
 
 /// How many frames to keep looking for an attribution before accepting that
@@ -679,7 +690,8 @@ struct Engine {
     map: Option<Attached>,
     cache: PathBuf,
     size: (u32, u32),
-    style_url: String,
+    /// `None` is the bundled style.
+    style_url: Option<String>,
     camera: MapCamera,
     bands: [Band; SLICES],
     applied: [Option<Band>; SLICES],
@@ -781,10 +793,10 @@ impl Engine {
                 }
             }
             Command::Style(url) => {
-                if self.style_url != url {
-                    self.style_url = url;
+                if self.style_url.as_deref() != Some(url.as_str()) {
+                    self.style_url = Some(url);
                     if let Some(attached) = &mut self.map {
-                        if let Err(error) = attached.map.set_style_url(&self.style_url) {
+                        if let Err(error) = set_style(&attached.map, self.style_url.as_deref()) {
                             eprintln!("style load failed: {error}");
                         }
                         attached.layers = false;
@@ -1045,6 +1057,10 @@ impl Engine {
             match RuntimeHandle::with_options(&options) {
                 Ok(runtime) => {
                     // Before any request goes out, which the style load starts.
+                    #[cfg(not(target_os = "android"))]
+                    if let Err(error) = crate::map::bundled::install(&runtime) {
+                        eprintln!("serving the bundled glyphs and sprite failed: {error}");
+                    }
                     #[cfg(target_os = "android")]
                     if let Err(error) = crate::map::fetch::install(&runtime) {
                         eprintln!("serving the map's own requests failed: {error}");
@@ -1098,7 +1114,7 @@ impl Engine {
                 eprintln!("setting the tile options failed: {error}");
             }
         }
-        if let Err(error) = map.set_style_url(&self.style_url) {
+        if let Err(error) = set_style(&map, self.style_url.as_deref()) {
             eprintln!("style load failed: {error}");
         }
 
@@ -1131,7 +1147,7 @@ impl Engine {
     fn sync_bands(&mut self) {
         let Some(attached) = &self.map else { return };
         // A layer naming a source the style has not loaded yet is rejected, and
-        // `set_style_url` only starts the load.
+        // `set_style` only starts the load.
         if !attached.style_loaded {
             return;
         }

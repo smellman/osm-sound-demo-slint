@@ -56,6 +56,10 @@ pub fn install(runtime: &RuntimeHandle) -> Result<()> {
     // lock. It is only held for the length of a `send`, which does not block.
     let sender = Mutex::new(sender);
     runtime.set_resource_provider(move |request, handle| {
+        // The bundled glyphs and sprite need no worker: they are already here.
+        if super::bundled::answer(&request.resolved_url, &handle) {
+            return ResourceProviderDecision::Handle;
+        }
         let job = Job {
             url: request.resolved_url,
             range: request.range,

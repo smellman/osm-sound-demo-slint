@@ -8,6 +8,8 @@ use slint::ComponentHandle;
 use crate::AppWindow;
 use crate::MapAdapter;
 
+// The style's glyphs and sprite, compiled in.
+mod bundled;
 // Android answers MapLibre Native's own requests itself; see the module.
 #[cfg(target_os = "android")]
 mod fetch;
