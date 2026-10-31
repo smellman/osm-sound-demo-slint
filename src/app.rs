@@ -284,7 +284,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("OSM_SOUND_DEMO_WINDOWED").is_some() {
         ui.set_windowed(true);
     }
-    let map = map::create_map(ui.get_map_size());
+    // A finished frame runs the tick at once rather than waiting for the timer,
+    // so the frame rate is set by how fast frames are drawn and the display
+    // shows them, not by the timer's 16 ms.
+    let map = map::create_map(ui.get_map_size(), {
+        let ui = ui.as_weak();
+        move || {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MapAdapter>().invoke_tick());
+        }
+    });
     let (audio, analyzer) = AudioPlayer::new().map_err(|e| format!("audio device: {e}"))?;
 
     let now = Instant::now();

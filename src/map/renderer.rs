@@ -475,7 +475,7 @@ pub struct MapLibre {
 }
 
 impl MapLibre {
-    fn new(size: (u32, u32)) -> Self {
+    fn new(size: (u32, u32), on_frame: impl Fn() + Send + 'static) -> Self {
         let (commands, command_rx) = std::sync::mpsc::channel();
         // A single slot: if the UI falls behind there is no point queueing stale
         // frames, the newest one is always the one worth showing.
@@ -485,7 +485,7 @@ impl MapLibre {
             .name("maplibre-render".to_owned())
             .spawn({
                 let rendered = Arc::clone(&rendered);
-                move || render_thread(size, command_rx, frame_tx, &rendered)
+                move || render_thread(size, command_rx, frame_tx, &rendered, &on_frame)
             })
             .expect("spawning the map render thread");
 
@@ -766,8 +766,10 @@ impl Drop for MapLibre {
     }
 }
 
-pub fn create_map(size: Size) -> Rc<RefCell<MapLibre>> {
-    Rc::new(RefCell::new(MapLibre::new(safe_size(size))))
+/// `on_frame` is called on the render thread each time a frame is ready to be
+/// taken, so the UI can pick it up straight away instead of on its next timer.
+pub fn create_map(size: Size, on_frame: impl Fn() + Send + 'static) -> Rc<RefCell<MapLibre>> {
+    Rc::new(RefCell::new(MapLibre::new(safe_size(size), on_frame)))
 }
 
 /// How long a wait on MapLibre Native is allowed before it is given up on: a
@@ -1781,6 +1783,7 @@ fn render_thread(
     commands: Receiver<Command>,
     frames: SyncSender<Frame>,
     rendered: &AtomicU64,
+    on_frame: &dyn Fn(),
 ) {
     let mut engine = Engine::new(size);
     loop {
@@ -1819,11 +1822,13 @@ fn render_thread(
             // Drop the frame rather than stall if the UI has not consumed the
             // previous one yet.
             let carried_camera = frame.camera.is_some();
-            if frames.try_send(frame).is_err() && carried_camera {
+            match frames.try_send(frame) {
+                Ok(()) => on_frame(),
                 // A dropped frame is no loss on its own, but the camera it was
                 // carrying is: nothing else will tell the UI where the map
                 // stopped.
-                engine.request_camera_report();
+                Err(_) if carried_camera => engine.request_camera_report(),
+                Err(_) => {}
             }
         }
     }

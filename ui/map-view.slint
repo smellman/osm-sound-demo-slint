@@ -71,6 +71,10 @@ export component MapView {
     }
 
     // --- internal: render loop ---
+    //
+    // While the map is animating, the tick is run by each finished frame (see
+    // `create_map` in `src/app.rs`). This timer keeps it going when no frames
+    // come: input, the status line and tiles still loading on a still map.
     Timer {
         interval: 16ms;
         running: true;
