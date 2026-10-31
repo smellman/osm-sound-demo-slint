@@ -278,7 +278,7 @@ impl State {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    select_window_renderer()?;
+    let share = select_window_renderer()?;
     let ui = AppWindow::new()?;
     // Full screen by default; `OSM_SOUND_DEMO_WINDOWED` is for running it
     // alongside other work.
@@ -288,12 +288,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // A finished frame runs the tick at once rather than waiting for the timer,
     // so the frame rate is set by how fast frames are drawn and the display
     // shows them, not by the timer's 16 ms.
-    let map = map::create_map(ui.get_map_size(), {
+    let map = map::create_map(ui.get_map_size(), share, {
         let ui = ui.as_weak();
         move || {
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MapAdapter>().invoke_tick());
         }
     });
+    map.borrow().attach_window(ui.window());
     let (audio, analyzer) = AudioPlayer::new().map_err(|e| format!("audio device: {e}"))?;
 
     let now = Instant::now();
@@ -1263,19 +1264,46 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
 
 /// Draws the window with Skia on macOS, where FemtoVG's OpenGL keeps a 120 Hz
 /// display at 60. `SLINT_BACKEND` still wins, so the two can be compared.
+///
+/// Returns whether the map should share its frames with the window rather than
+/// have them read back, which only Linux does.
 #[cfg(target_os = "macos")]
-fn select_window_renderer() -> Result<(), slint::PlatformError> {
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
     if std::env::var_os("SLINT_BACKEND").is_some() {
-        return Ok(());
+        return Ok(false);
     }
     slint::BackendSelector::new()
         .renderer_name("skia".to_owned())
         .select()
+        .map(|()| false)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn select_window_renderer() -> Result<(), slint::PlatformError> {
-    Ok(())
+/// Draws the window with Skia on Linux too. With the `vulkan` feature it draws
+/// through wgpu's Vulkan backend, so the map's frames can be imported as
+/// textures instead of read back — see "Shared frames" in the README.
+/// `OSM_SOUND_DEMO_READBACK` keeps Skia but reads frames back, to compare;
+/// `SLINT_BACKEND` overrides the lot.
+#[cfg(target_os = "linux")]
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return Ok(false);
+    }
+    let selector = slint::BackendSelector::new().renderer_name("skia".to_owned());
+    #[cfg(feature = "vulkan")]
+    if std::env::var_os("OSM_SOUND_DEMO_READBACK").is_none() {
+        let mut settings = slint::wgpu_30::WGPUSettings::default();
+        settings.backends = slint::wgpu_30::wgpu::Backends::VULKAN;
+        return selector
+            .require_wgpu_30(slint::wgpu_30::WGPUConfiguration::Automatic(settings))
+            .select()
+            .map(|()| true);
+    }
+    selector.select().map(|()| false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
+    Ok(false)
 }
 
 fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {

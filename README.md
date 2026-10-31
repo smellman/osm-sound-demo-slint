@@ -179,6 +179,7 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
+| `OSM_SOUND_DEMO_READBACK` | Linux with `vulkan`: read frames back instead of sharing them with the window, to compare — see [Shared frames](#shared-frames) |
 | `OSM_SOUND_DEMO_RENDER_SCALE` | Render the map at this fraction of its on-screen size and let Slint scale it up (default 1.0, floor 0.25). The single biggest thing you can trade for frame rate — see [Frame rate](#frame-rate) |
 
 ## Controls
@@ -295,8 +296,55 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
 On macOS the window is drawn with Slint's Skia renderer rather than its default, FemtoVG.
 FemtoVG draws through OpenGL there, which holds a 120 Hz display to 60: on an M2 Pro's
 built-in display, full screen and playing, FemtoVG showed 61–65 fps while the render
-thread finished 74–75, and Skia showed 72–76 of 72–77. Other platforms keep Slint's
-default. `SLINT_BACKEND=winit-femtovg` puts FemtoVG back to compare.
+thread finished 74–75, and Skia showed 72–76 of 72–77. Linux uses Skia too, for the
+reason in [Shared frames](#shared-frames); other platforms keep Slint's default.
+`SLINT_BACKEND=winit-femtovg` puts FemtoVG back to compare.
+
+### Shared frames
+
+On Linux with the `vulkan` feature the map's frames are not read back at all. Skia draws
+the window through wgpu's Vulkan backend, and the map renders into a ring of five images
+on its own Vulkan device whose memory is exported as file descriptors. The window's
+device imports that memory once per ring, wraps each image as a `wgpu::Texture`, and
+hands it to Slint as a `slint::Image`. Each frame used to cost a 9 MB readback, a copy
+into a pixel buffer and an upload for the window renderer to make again; now it costs
+none of them. The code is in `src/map/shared.rs`.
+
+At 1920x1200 on the AMD RENOIR integrated GPU, on AC power with the performance profile,
+playing from Local Music, one build run three ways:
+
+| Window | Frames | fps |
+| --- | --- | --- |
+| Skia over wgpu (default) | shared | 74–80 |
+| Skia over wgpu (`OSM_SOUND_DEMO_READBACK=1`) | read back | 46–48 |
+| FemtoVG (`SLINT_BACKEND=winit-femtovg`) | read back | 46–48 |
+
+Skia on its own changes nothing here: the display is 60 Hz, so the macOS reason does not
+apply, and what held the frame rate down was the readback. These are frames handed to
+Slint; the display still shows at most 60 of them a second, but there is now headroom
+for the heavy moments.
+
+The two are separate devices because they cannot share one: this GPU has a single
+graphics queue, MapLibre Native submits to it from its own thread, and wgpu offers no
+lock to take around its own submissions. Some details that cost time to find:
+
+- **A shown frame stays acquired.** The session never draws into an image whose frame is
+  acquired, so the UI holds each frame until the GPU has finished every draw that
+  sampled it, through `Queue::on_submitted_work_done` registered after each draw. A
+  frame dropped without `release` is discarded, which quarantines its slot for good.
+- **A resize gets a new session.** A ring's images have a fixed size, and both replacing
+  them and detaching are refused while a frame is acquired, which the one on screen
+  always is. The old session is disposed of instead, its ring is marked so the UI hands
+  its frames back at once (nothing draws into them any more, and the image stays on
+  screen because the window's device holds its own reference to the memory), and the
+  map takes the new session once the old one has retired.
+- **Shutting down hands every frame back first,** or the session would never retire and
+  closing the map would wait out its timeout.
+- The images are passed between the devices without a queue family ownership transfer.
+  RADV shows them correctly, but strictly the Vulkan spec asks for one.
+
+If the window turns out not to be drawn with Vulkan, the map switches back to reading
+frames back.
 
 ### Rendering backend
 

@@ -71,6 +71,13 @@ objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 slint = { version = "1.18", features = ["renderer-skia"] }
 
+# Skia draws the window on Linux as well, and `unstable-wgpu-30` lets it take
+# the map's frames as wgpu textures: with the `vulkan` feature the map renders
+# into images the window's device imports, so nothing is read back. See
+# "Shared frames" in the README.
+[target.'cfg(target_os = "linux")'.dependencies]
+slint = { version = "1.18", features = ["renderer-skia", "unstable-wgpu-30"] }
+
 # The audio session iOS needs before it will make a sound. cpal pulls this crate
 # in already but never sets a category or activates the session, so the app does
 # it; see the `session` module in src/audio.rs.
