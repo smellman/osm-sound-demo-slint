@@ -1272,7 +1272,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         let delta = now.duration_since(state.last_tick);
         state.last_tick = now;
         let seconds = delta.as_secs_f64();
-        let levels = state.analyzer.poll();
+        let levels = state.analyzer.poll(delta);
         let map = Rc::clone(&state.map);
 
         // Sticks and D-pad, held rather than pressed.

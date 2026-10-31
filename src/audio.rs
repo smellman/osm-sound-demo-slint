@@ -118,8 +118,20 @@ const REFERENCE_RATE: u32 = 44_100;
 const MIN_DB: f32 = -90.0;
 const MAX_DB: f32 = -10.0;
 
-/// Exponential smoothing applied to each band, weighting the previous value.
+/// Exponential smoothing applied to each band, weighting the previous value
+/// over one [`SMOOTHING_TICK`].
 const SMOOTHING: f32 = 0.35;
+
+/// The poll interval [`SMOOTHING`] was tuned at. The UI polls once per map
+/// frame now, so the interval varies with the frame rate; the weight is
+/// scaled to the time that actually passed, so the bands settle at the same
+/// speed at 120 fps as at 60.
+pub const SMOOTHING_TICK: Duration = Duration::from_millis(16);
+
+/// The weight [`SMOOTHING`] comes to over `elapsed`.
+fn smoothing_over(elapsed: Duration) -> f32 {
+    SMOOTHING.powf(elapsed.as_secs_f32() / SMOOTHING_TICK.as_secs_f32())
+}
 
 /// Ring buffer of the most recent mono frames, written by the audio thread.
 #[derive(Debug)]
@@ -369,8 +381,8 @@ impl Analyzer {
     }
 
     /// Recomputes the band levels from the newest window and returns them,
-    /// each in `0.0..=1.0`.
-    pub fn poll(&mut self) -> [f32; BINS] {
+    /// each in `0.0..=1.0`. `elapsed` is the time since the previous poll.
+    pub fn poll(&mut self, elapsed: Duration) -> [f32; BINS] {
         let mut samples = [0.0f32; WINDOW];
         self.spectrum.snapshot(&mut samples);
 
@@ -390,6 +402,7 @@ impl Analyzer {
         }
 
         let half = WINDOW / 2;
+        let smoothing = smoothing_over(elapsed);
         for band in 0..BINS {
             let (start, end) = (self.edges[band], self.edges[band + 1]);
             let width = end - start;
@@ -401,7 +414,7 @@ impl Analyzer {
                 / half as f32;
             let db = 20.0 * magnitude.max(1e-10).log10();
             let level = ((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
-            self.levels[band] = SMOOTHING * self.levels[band] + (1.0 - SMOOTHING) * level;
+            self.levels[band] = smoothing * self.levels[band] + (1.0 - smoothing) * level;
         }
         self.levels
     }
@@ -662,7 +675,7 @@ mod tests {
         let mut analyzer = Analyzer::new(spectrum);
         let mut levels = [0.0; BINS];
         for _ in 0..64 {
-            levels = analyzer.poll();
+            levels = analyzer.poll(SMOOTHING_TICK);
         }
         levels
     }
@@ -717,10 +730,17 @@ mod tests {
     }
 
     #[test]
+    fn smoothing_does_not_depend_on_the_poll_rate() {
+        let half = SMOOTHING_TICK / 2;
+        assert!((smoothing_over(half).powi(2) - SMOOTHING).abs() < 1e-6);
+        assert!((smoothing_over(SMOOTHING_TICK) - SMOOTHING).abs() < 1e-6);
+    }
+
+    #[test]
     fn silence_leaves_every_band_at_zero() {
         let spectrum = Arc::new(Spectrum::new());
         let mut analyzer = Analyzer::new(spectrum);
-        let levels = analyzer.poll();
+        let levels = analyzer.poll(SMOOTHING_TICK);
         assert!(levels.iter().all(|level| *level == 0.0), "{levels:?}");
     }
 
@@ -842,7 +862,7 @@ mod tests {
             for _ in 0..WINDOW {
                 assert!(tap.next().is_some(), "the track ended after {chunk} chunks");
             }
-            let levels = analyzer.poll();
+            let levels = analyzer.poll(SMOOTHING_TICK);
             for (peak, level) in loudest.iter_mut().zip(levels.iter()) {
                 *peak = peak.max(*level);
             }
@@ -882,7 +902,7 @@ mod tests {
         let mut loudest = [0.0f32; BINS];
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            let levels = analyzer.poll();
+            let levels = analyzer.poll(SMOOTHING_TICK);
             for (peak, level) in loudest.iter_mut().zip(levels.iter()) {
                 *peak = peak.max(*level);
             }
