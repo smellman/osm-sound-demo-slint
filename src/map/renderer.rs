@@ -216,6 +216,26 @@ const IDLE_TICK: Duration = Duration::from_millis(16);
 /// thread has a frame to draw afterwards.
 const PUMP_BUDGET: Duration = Duration::from_millis(2);
 
+/// Where `Engine::render` spends a frame, summed in nanoseconds for
+/// `report_frame_phases`: waiting for the session to draw, reading the
+/// texture back, and copying it into the buffer handed to Slint.
+#[cfg(test)]
+static PHASE_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const PHASE_WAIT: usize = 0;
+const PHASE_READ: usize = 1;
+const PHASE_COPY: usize = 2;
+
+/// Adds the time since `started` to a phase and restarts the clock. Outside
+/// tests it only restarts the clock, which costs a clock read per phase.
+fn phase(index: usize, started: &mut Instant) {
+    let now = Instant::now();
+    #[cfg(test)]
+    PHASE_NANOS[index].fetch_add((now - *started).as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = index;
+    *started = now;
+}
+
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
 const MIN_PITCH: f64 = 0.0;
@@ -1237,6 +1257,7 @@ impl Engine {
         // would be lost for good.
         let attribution = self.attribution.clone();
 
+        let mut clock = Instant::now();
         let result = match self.ready.take() {
             Some(result) => result,
             None => {
@@ -1248,6 +1269,7 @@ impl Engine {
             }
         };
 
+        phase(PHASE_WAIT, &mut clock);
         let attached = self.map.as_ref()?;
         let readback = match attached
             .session
@@ -1264,6 +1286,7 @@ impl Engine {
         };
 
         self.dirty = false;
+        phase(PHASE_READ, &mut clock);
 
         // Slint builds the pixel buffer from the reported dimensions, so a
         // mismatch would panic the UI thread rather than show a bad frame.
@@ -1289,6 +1312,7 @@ impl Engine {
         {
             target.copy_from_slice(&source[..row]);
         }
+        phase(PHASE_COPY, &mut clock);
 
         // While the map owns the camera, hand it back with the frame so the UI
         // can follow. `flying` also tells the UI when it has landed.
@@ -3266,6 +3290,65 @@ mod tests {
             "{}x{} — still: {still:.1} fps, camera only: {camera:.1} fps, camera + {} bands: {playing:.1} fps",
             size.0, size.1, BINS,
         );
+    }
+
+    /// Splits a frame into the phases `Engine::render` times, plus the pump
+    /// the render thread runs between frames, for a still map and a turning
+    /// camera. What is left of the frame interval is the test loop itself.
+    #[test]
+    fn report_frame_phases() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        let size = probe_size();
+        let mut engine = Engine::new(size);
+        let warm_up = Instant::now();
+        while warm_up.elapsed() < SETTLE_DEADLINE {
+            engine.pump(Some(SETTLE_PUMP));
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
+
+        const BUDGET: Duration = Duration::from_secs(5);
+        let mut measure = |label: &str, turn: bool| {
+            for counter in &PHASE_NANOS {
+                counter.store(0, Ordering::Relaxed);
+            }
+            let mut pump = Duration::ZERO;
+            let mut frames = 0u32;
+            let started = Instant::now();
+            while started.elapsed() < BUDGET {
+                if turn {
+                    engine.apply(Command::Camera(MapCamera {
+                        bearing: f64::from(frames) * 2.0,
+                        ..MapCamera::default()
+                    }));
+                }
+                let pumped = Instant::now();
+                engine.pump(Some(PUMP_BUDGET));
+                pump += pumped.elapsed();
+                engine.mark_dirty();
+                if engine.render().is_some() {
+                    frames += 1;
+                }
+            }
+            let frames_f = f64::from(frames.max(1));
+            let ms = |nanos: u64| nanos as f64 / 1e6 / frames_f;
+            let [wait, read, copy] = PHASE_NANOS
+                .each_ref()
+                .map(|counter| ms(counter.load(Ordering::Relaxed)));
+            let frame = started.elapsed().as_secs_f64() * 1e3 / frames_f;
+            eprintln!(
+                "{}x{} {label:<7} {:5.1} fps | frame {frame:6.2} ms = wait {wait:6.2} + read {read:6.2} + copy {copy:5.2} + pump {:5.2} + rest {:5.2}",
+                size.0,
+                size.1,
+                1e3 / frame,
+                pump.as_secs_f64() * 1e3 / frames_f,
+                frame - wait - read - copy - pump.as_secs_f64() * 1e3 / frames_f,
+            );
+        };
+        measure("still", false);
+        measure("camera", true);
     }
 
     #[test]
