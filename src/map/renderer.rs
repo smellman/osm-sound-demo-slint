@@ -875,6 +875,23 @@ fn service(session: Option<&RenderSessionHandle>) {
 
 /// Waits for `future`, servicing the session's driver work meanwhile: on
 /// OpenGL a readback or an attachment only finishes when this thread runs it.
+/// Keeps one demand waiting for the map's next update; see `Engine::arm`.
+fn arm_demand(session: &RenderSessionHandle, armed: &mut Option<u64>, next_token: &mut u64) {
+    if armed.is_some() {
+        return;
+    }
+    let token = *next_token;
+    *next_token += 1;
+    let demand = FrameDemand {
+        flags: FrameDemandFlag::WAIT_FOR_UPDATE,
+        token,
+    };
+    match session.request_frame(&demand) {
+        Ok(()) => *armed = Some(token),
+        Err(error) => eprintln!("asking for a frame failed: {error}"),
+    }
+}
+
 fn drive<T>(
     inbox: &Arc<Inbox>,
     session: Option<&RenderSessionHandle>,
@@ -1192,26 +1209,20 @@ impl Engine {
             }
             self.ready = Some(result);
         }
-        self.arm();
+        // A frame waiting to be read back holds the next demand back: driver
+        // work runs in order, so a demand armed now could draw a whole frame
+        // ahead of the readback that render() is about to ask for. render()
+        // arms it once the readback is queued.
+        if self.ready.is_none() {
+            self.arm();
+        }
     }
 
     /// Keeps one demand waiting for the map's next update, so every update the
     /// map publishes gets drawn without this thread having to ask each time.
     fn arm(&mut self) {
-        if self.armed.is_some() {
-            return;
-        }
         let Some(attached) = &self.map else { return };
-        let token = self.next_token;
-        self.next_token += 1;
-        let demand = FrameDemand {
-            flags: FrameDemandFlag::WAIT_FOR_UPDATE,
-            token,
-        };
-        match attached.session.request_frame(&demand) {
-            Ok(()) => self.armed = Some(token),
-            Err(error) => eprintln!("asking for a frame failed: {error}"),
-        }
+        arm_demand(&attached.session, &mut self.armed, &mut self.next_token);
     }
 
     /// Waits for the session to draw a frame.
@@ -1271,9 +1282,11 @@ impl Engine {
 
         phase(PHASE_WAIT, &mut clock);
         let attached = self.map.as_ref()?;
-        let readback = match attached
-            .session
-            .read_texture()
+        let read = attached.session.read_texture();
+        // Queued behind the readback, so the next frame draws while this one is
+        // copied out and handed to Slint rather than ahead of the readback.
+        arm_demand(&attached.session, &mut self.armed, &mut self.next_token);
+        let readback = match read
             .map_err(|error| error.to_string())
             .and_then(|read| drive(&self.inbox, Some(&attached.session), read))
         {
