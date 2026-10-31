@@ -4,13 +4,15 @@
 # `_ios-arm64` preset) and calls `___chkstk_darwin`, which libSystem only
 # exports from iOS 12 on. Linking with the default left it undefined.
 #
-# 14.3 rather than 12.0 so the app and the library it links agree. Inert on
-# every other platform, and Cargo leaves it alone if the environment already
-# sets it.
+# 15.0 rather than 14.3, the library's own, because Xcode 27 refuses anything
+# below 15.0 for the app bundle, and this has to match `deploymentTarget` in
+# project.yml. A library built for an older iOS links into a newer app as it
+# is. Inert on every other platform, and Cargo leaves it alone if the
+# environment already sets it.
 #
 # `MAPLIBRE_NATIVE_C_INSTALL_DIR` deliberately does not live here: the FFI
 # build script reads it for whatever target is being built, so a value set once
 # would point a macOS or simulator build at the iOS device archive. It belongs
 # on the one command that needs it — see "iOS" in the README.
 [env]
-IPHONEOS_DEPLOYMENT_TARGET = "14.3"
+IPHONEOS_DEPLOYMENT_TARGET = "15.0"

@@ -10,7 +10,7 @@ targets:
   OSMSoundDemo:
     type: application
     platform: iOS
-    deploymentTarget: "14.3"
+    deploymentTarget: "15.0"
     info:
         path: Info.plist
         properties:

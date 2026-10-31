@@ -79,9 +79,11 @@ tag matching the version in `Cargo.toml` (`v0.202610.3` at the time of writing),
 target and backend being built. A prefix from a different tag is how the C API and the
 Rust crate drift apart.
 
-The deployment target comes from `.cargo/config.toml`. Rust's default for the triple
-predates `___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so
-without it the link fails on an undefined symbol.
+The deployment target, iOS 15.0, comes from `.cargo/config.toml` and has to match
+`deploymentTarget` in `project.yml`. Rust's default for the triple predates
+`___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so without it
+the link fails on an undefined symbol. The archive itself is built for 14.3, but Xcode 27
+refuses anything below 15.0 for the app.
 
 `project.yml` and `build_for_ios_with_cargo.bash` drive the app bundle, following the same
 guide. `xcodegen generate` writes the Xcode project and the `Info.plist`; the script picks
