@@ -8,9 +8,9 @@
 //! module has no file for — a font range, or a style loaded from
 //! `MAPLIBRE_STYLE_URL` — goes out to the network as it always did.
 
-use maplibre_native_ffi::ResourceResponse;
 #[cfg(not(target_os = "android"))]
-use maplibre_native_ffi::{ResourceProviderDecision, RuntimeHandle};
+use maplibre_native_ffi::{ResourceProvider, RuntimeHandle};
+use maplibre_native_ffi::{ResourceRequestHandle, ResourceResponse, ResourceResponseStatus};
 
 /// Every bundled file, keyed by its path under `style/` and sorted by it.
 /// Written by `build.rs`.
@@ -42,30 +42,44 @@ pub fn lookup(url: &str) -> Option<&'static [u8]> {
 
 /// Installs a provider that answers bundled files and passes everything else
 /// to MapLibre's own networking. Android installs its own provider instead,
-/// which asks [`lookup`] first; see `fetch`.
+/// which asks [`answer`] first; see `fetch`.
+///
+/// Waits for the runtime to take it, so it is in place before the style load
+/// sends the first request.
 #[cfg(not(target_os = "android"))]
 pub fn install(runtime: &RuntimeHandle) -> maplibre_native_ffi::Result<()> {
-    runtime.set_resource_provider(|request, handle| match lookup(&request.resolved_url) {
-        Some(bytes) => {
-            if let Err(error) = handle.complete(ResourceResponse::ok(bytes)) {
-                eprintln!("completing a bundled map request failed: {error}");
-            }
-            ResourceProviderDecision::Handle
+    let provider = ResourceProvider::new(|request, handle| {
+        if let Err(handle) = answer(&request.resolved_url, handle)
+            && let Err((_, error)) = handle.pass_through()
+        {
+            eprintln!("handing a map request to the network failed: {error}");
         }
-        None => ResourceProviderDecision::PassThrough,
-    })
+    });
+    let installed = runtime.set_resource_provider(provider)?;
+    match installed.wait(std::time::Duration::from_secs(5)) {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => {
+            eprintln!("the runtime did not take the bundled-file provider in time");
+            Ok(())
+        }
+    }
 }
 
-/// Answers `url` from the bundle if it can, completing `handle` inline.
-#[cfg(target_os = "android")]
-pub fn answer(url: &str, handle: &maplibre_native_ffi::ResourceRequestHandle) -> bool {
+/// Answers `url` from the bundle if it can, completing `handle` inline. A URL
+/// the bundle has no file for hands the handle back unanswered.
+pub fn answer(url: &str, handle: ResourceRequestHandle) -> Result<(), ResourceRequestHandle> {
     let Some(bytes) = lookup(url) else {
-        return false;
+        return Err(handle);
     };
-    if let Err(error) = handle.complete(ResourceResponse::ok(bytes)) {
+    let response = ResourceResponse {
+        status: ResourceResponseStatus::Ok,
+        bytes,
+        ..Default::default()
+    };
+    if let Err((_, error)) = handle.complete(&response) {
         eprintln!("completing a bundled map request failed: {error}");
     }
-    true
+    Ok(())
 }
 
 /// Decodes `%XX` escapes. A font stack with a space in its name arrives as

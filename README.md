@@ -20,8 +20,8 @@ A rendering backend has to be named — `opengl`, `vulkan` or `metal`. See
 
 Debug builds work but render the map at a few frames per second, so use `--release` for
 anything you actually want to look at. The toolchain is pinned by `rust-toolchain.toml`
-and rustup will fetch it on first build; the pin is not a preference, and the file says
-what breaks without it.
+and rustup will fetch it on first build; the file says why it once had to match the FFI's
+own toolchain and no longer does.
 
 To read the map's tiles from disk rather than from tile.openstreetmap.jp, fetch the
 archives first:
@@ -39,11 +39,11 @@ newer planet. Without the archives the map reads them from the server, as before
 
 `maplibre-native-ffi` downloads a prebuilt native artifact rather than building MapLibre
 Native from source, so there is no C++ toolchain to set up and a clean build takes about a
-minute. What is still needed is the system libraries the Rust crates link against and the
-one that generates the FFI bindings. On Debian and Raspberry Pi OS:
+minute. What is still needed is the system libraries the Rust crates link against. On
+Debian and Raspberry Pi OS:
 
 ```bash
-sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang libclang-dev
+sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev
 ```
 
 | Package | Wanted by |
@@ -52,9 +52,10 @@ sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang l
 | `libasound2-dev` | ALSA, which `rodio` plays through |
 | `libudev-dev` | `gilrs`, to enumerate gamepads |
 | `libssl-dev` | OpenSSL, pulled in through `ureq`'s `native-tls` |
-| `clang`, `libclang-dev` | `bindgen`, which generates the FFI bindings from the native library's C header at build time |
 
-That is the list a Raspberry Pi OS image needed in practice.
+That is the list a Raspberry Pi OS image needed in practice. It used to include `clang` and
+`libclang-dev` for `bindgen`, which the FFI crate ran at build time; the crates.io release
+ships its bindings pre-generated, so nothing on a Linux build runs `bindgen` any more.
 
 ### iOS
 
@@ -66,40 +67,17 @@ simulator needs nothing beyond the target:
 cargo build --release --features metal --target=aarch64-apple-ios-sim
 ```
 
-The device triple needs the native library built from source, because
-`maplibre-native-ffi` publishes a prebuilt artifact for `ios-simulator-arm64` and none for
-`aarch64-apple-ios`.
+The device builds the same way, with `--target=aarch64-apple-ios`: `maplibre-native-ffi`
+publishes a prebuilt artifact for both triples, and the crate pins it by version and
+checksum.
 
-What gets built is **maplibre-native-ffi**, not MapLibre Native. MapLibre Native arrives as
-that repository's `third_party/maplibre-native` submodule, with five patches from
-`patches/maplibre-native/` applied on top, and `MAPLIBRE_NATIVE_C_INSTALL_DIR` points at
-the prefix holding the FFI project's own C API — `include/maplibre_native_c.h` and
-`lib/libmaplibre-native-c.a`. A standalone MapLibre Native checkout has neither.
-
-Clone it beside this one and check out the commit `Cargo.lock` resolves
-`maplibre-native-ffi` to. The build script feeds the prefix's headers straight to bindgen
-when the variable is set, with no version check of its own, so a prefix built from a
-different commit is how the C API and the Rust crate drift apart:
-
-```bash
-git -C ../maplibre-native-ffi checkout --detach <the rev from Cargo.lock>
-# Checks out the pinned submodule and applies the patches. The submodule is marked
-# `update = none` so that Cargo skips it, so plain `git submodule update` will not do.
-bash ../maplibre-native-ffi/.mise/bin/sync-submodules
-cmake --workflow --preset ios-arm64-metal   # run from ../maplibre-native-ffi
-```
-
-That needs CMake and Ninja, takes a few minutes, and installs into
-`build/ios-arm64-metal/install`. Then:
-
-```bash
-MAPLIBRE_NATIVE_C_INSTALL_DIR=$PWD/../maplibre-native-ffi/build/ios-arm64-metal/install \
-  cargo build --release --features metal --target=aarch64-apple-ios
-```
-
-Set that variable on the command itself and nowhere else. The build script reads it for
-whatever target is being built, so exporting it in a shell profile silently points a macOS
-or simulator build at the iOS device archive.
+To link a native library built from source instead — to try a patch to MapLibre Native,
+say — check out the [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)
+tag matching the version in `Cargo.toml` (`v0.202610.3` at the time of writing), build its
+`ios-arm64-metal` preset, and name the install prefix in `MAPLIBRE_NATIVE_FFI_LOCAL_BUILD`
+(an absolute path). The crate's build script checks that the prefix was built for the
+target and backend being built. A prefix from a different tag is how the C API and the
+Rust crate drift apart.
 
 The deployment target comes from `.cargo/config.toml`. Rust's default for the triple
 predates `___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so
@@ -107,8 +85,7 @@ without it the link fails on an undefined symbol.
 
 `project.yml` and `build_for_ios_with_cargo.bash` drive the app bundle, following the same
 guide. `xcodegen generate` writes the Xcode project and the `Info.plist`; the script picks
-the triple from what Xcode is building and supplies the device prefix above, defaulting to
-the sibling checkout and taking `MAPLIBRE_NATIVE_C_INSTALL_DIR` as an override.
+the triple from what Xcode is building.
 
 To put it on a device, with the device connected and `DEVELOPMENT_TEAM` in `project.yml`
 set to yours:
@@ -151,25 +128,18 @@ ABI=x86_64 ./build_for_android.sh      # what an emulator on an Intel host wants
 adb install -r target/release/apk/OSMSoundDemo.apk
 ```
 
-It needs the Android SDK and NDK, plus `cargo-apk`, `cargo-about`, CMake and Ninja; it
-checks for each and says what is missing rather than failing deep inside a build. Set
+It needs the Android SDK and NDK, plus `cargo-apk`; it checks for each and says what is missing rather than failing deep inside a build. Set
 `ANDROID_HOME` if the SDK is not at `~/Library/Android/sdk` — note that is the directory
 holding `platform-tools` and `ndk`, one below the `~/Library/Android` Android Studio shows.
 
-Three things the script settles that are easy to trip over:
+Two things the script settles that are easy to trip over:
 
-**The native library is built from source**, which is what takes the minutes. The published
-`android-arm64` artifact is a floating snapshot of upstream's latest commit, while the Rust
-binding comes from the commit `Cargo.lock` pins, so the two drift apart whenever upstream
-moves. They already have once — the snapshot renamed `MLN_LOG_EVENT_OPENGL` to
-`MLN_LOG_EVENT_GRAPHICS_BACKEND` while the pinned binding still asked for the old name, and the
-download did not compile. `FFI_DIR` points at the checkout, which has to sit at the commit
-`Cargo.lock` resolves `maplibre-native-ffi` to.
-
-**Two Rust toolchains are in play.** The FFI checkout carries no `rust-toolchain.toml`, so
-cargo run from there picks the default one, which has no Android target and fails with
-"can't find crate for `std`". The script pins both halves to the channel in this project's
-`rust-toolchain.toml`, which is also the version the FFI repo pins for itself.
+**The native library is downloaded**, as everywhere else. It used to be built from source,
+because the published `android-arm64` artifact was a floating snapshot of upstream's latest
+commit while the binding came from the commit `Cargo.lock` pinned, and the two drifted
+apart — the snapshot once renamed `MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND`
+under a binding that still asked for the old name. The binding now comes from crates.io and
+pins its artifact by version and checksum, so that cannot happen.
 
 **bindgen has to be told the triple separately.** `cargo-apk` sets a bare `clang` as the C
 compiler and passes the API version in `CFLAGS`, which bindgen does not read; the NDK's
@@ -356,20 +326,23 @@ general into them.
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
 creates the device, attaches an *owned texture* render target at the map's size, and reads
-the frame back with
-`read_premultiplied_rgba8_into` for Slint. The binding downloads a prebuilt native
-artifact, so a clean build takes well under a minute rather than compiling MapLibre Native
-from source.
+the frame back as premultiplied RGBA8 with `RenderSessionHandle::read_texture` for Slint.
+The binding downloads a prebuilt native artifact, so a clean build takes well under a
+minute rather than compiling MapLibre Native from source.
 
 The device is created once and leaked on purpose: a render target borrows those handles,
-and a map outlives any one session. On the Vulkan side the handles are held as plain
-addresses rather than `NativePointer`, which is deliberately `!Send` and so cannot live in
-a static.
+and a map outlives any one session. The handles are held as plain addresses, since raw
+pointers are not `Send` and the Vulkan ones live in a static.
 
-The map runs in `MapMode::Continuous`, and the render thread drives it with
-`RuntimeHandle::pump` plus `drain_events`. Those events are what tell it whether to draw
-again — `MapRenderUpdateAvailable`, and `needs_repaint` on `MapRenderFrameFinished` — and
-when the style has loaded, which is when the band layers can be added.
+The map runs in `MapMode::Continuous` on the runtime's own worker threads. Commands go in
+without waiting, and what comes back arrives on callbacks: the runtime's event handler
+says when the style has loaded, which is when the band layers can be added, and a camera
+transition's end handler says when a flight has landed. The render thread keeps one frame
+demand armed with `FrameDemandFlag::WAIT_FOR_UPDATE`, so every update the map publishes —
+tiles arriving, a flight stepping — is drawn without being asked for; `needs_repaint` on a
+frame result, set during a paint transition, is answered with a repaint. On OpenGL the
+session shares the render thread's EGL context and its driver work is serviced there; on
+Vulkan and Metal it drives itself.
 
 
 ### Frame rate
@@ -441,12 +414,13 @@ this ever needs more frame rate.
 
 Some of these are deliberate, some are limits of the current Rust bindings.
 
-- **Rendering runs on its own thread.** MapLibre Native drives its work through its own
-  run loop, which on macOS is the process CoreFoundation run loop; pumping that from
-  inside a Slint callback re-enters winit's event handling and aborts. The UI thread only
-  posts camera and band updates and picks up finished frames.
+- **Rendering runs on its own thread.** Reading a frame back blocks until it lands, and on
+  OpenGL the render session's driver work has to run on the thread whose EGL context it
+  shares; neither belongs in a Slint callback. The UI thread only posts camera and band
+  updates and picks up finished frames.
 - **Fly-to is MapLibre Native's own.** `Fly To` hands the camera over with
-  `MapHandle::fly_to` and follows along until the transition-finished event; MapLibre picks
+  a `CameraUpdateMode::Fly` camera update and follows along until the transition's end
+  handler fires; MapLibre picks
   the duration from the distance, as the web demo's `flyTo` did, unless `MAPLIBRE_FLY_MS`
   says otherwise. Anything that moves the camera — a drag, the sticks, an effect — cancels
   the flight. As in the web demo, the building animation pauses during a fly.

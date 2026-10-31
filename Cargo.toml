@@ -50,7 +50,7 @@ ureq = { version = "3", features = ["json"] }
 
 # The FFI hands the graphics plumbing to the caller: the map draws through a
 # device this app creates, so each backend brings the crate that creates one.
-maplibre-native-ffi = { git = "https://github.com/maplibre/maplibre-native-ffi" }
+maplibre-native-ffi = "0.202610.3"
 ash = { version = "0.38", optional = true }
 # EGL, for the OpenGL backend. `glutin_egl_sys` is bindings only, so the
 # library itself is opened by hand.
@@ -83,9 +83,8 @@ slint = { version = "1.18", features = ["backend-android-activity-06"] }
 # MapLibre Native does its own HTTP on Android and will not touch HTTPS until
 # `mln_android_init` has handed it a JVM and a Context — without that the style
 # never loads and the map stays black while the rest of the app works. The
-# binding keeps its `sys` crate private and wraps no such call, so the raw one
-# is used directly; `jni` and `ndk-context` are what produce the two arguments.
-maplibre-native-ffi-sys = { git = "https://github.com/maplibre/maplibre-native-ffi" }
+# binding wraps that call as `init_android`; `jni` and `ndk-context` are what
+# produce the two arguments.
 jni = "0.21"
 ndk-context = "0.1"
 
@@ -132,3 +131,9 @@ name = "android.permission.RECORD_AUDIO"
 
 [build-dependencies]
 slint-build = "1.18"
+
+# A Metal-only probe of the FFI on its own; the attach call it makes exists only
+# in a `metal` build.
+[[example]]
+name = "ffi_smoke"
+required-features = ["metal"]

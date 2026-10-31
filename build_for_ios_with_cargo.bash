@@ -54,24 +54,10 @@ for arch in $ARCHS; do
             ;;
     esac
 
-    # `maplibre-native-ffi` publishes a prebuilt native artifact for the
-    # simulator and none for the device, so a device build links one built from
-    # source. The variable is set per invocation rather than exported once
-    # because the FFI build script reads it for whatever target is building: a
-    # value left standing would point the simulator at the device archive.
-    # See "iOS" in the README for how the prefix is produced.
-    if [ $IS_SIMULATOR -eq 0 ]; then
-        MLN_PREFIX="${MAPLIBRE_NATIVE_C_INSTALL_DIR:-$PWD/../maplibre-native-ffi/build/ios-arm64-metal/install}"
-        if [ ! -f "$MLN_PREFIX/lib/libmaplibre-native-c.a" ]; then
-            echo "error: no native library at $MLN_PREFIX" >&2
-            echo "Build it, or set MAPLIBRE_NATIVE_C_INSTALL_DIR — see \"iOS\" in the README." >&2
-            exit 1
-        fi
-        MAPLIBRE_NATIVE_C_INSTALL_DIR="$MLN_PREFIX" \
-            cargo build $MAYBE_RELEASE --target $CARGO_TARGET --bin "$1" "${@:2}"
-    else
-        cargo build $MAYBE_RELEASE --target $CARGO_TARGET --bin "$1" "${@:2}"
-    fi
+    # `maplibre-native-ffi` publishes a prebuilt native artifact for the device
+    # and the simulator alike, pinned by version and checksum, so both download
+    # it. See "iOS" in the README for building one from source instead.
+    cargo build $MAYBE_RELEASE --target $CARGO_TARGET --bin "$1" "${@:2}"
 
     executables+=("$DERIVED_FILE_DIR/cargo/$CARGO_TARGET/$CARGO_PROFILE/$1")
 done
