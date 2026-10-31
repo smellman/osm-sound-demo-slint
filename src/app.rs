@@ -10,6 +10,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::audio::{Analyzer, AudioPlayer, VjMode};
 use crate::gamepad::{Action, Gamepads};
+use crate::library::{self, LocalAlbum};
 use crate::locate;
 use crate::map::{self, CameraBoost, Light, MapLibre};
 use crate::otherman::{self, ListItem, Release};
@@ -121,6 +122,15 @@ const ORBIT_ZOOM_IN: f64 = 0.8;
 /// Hue speed multiplier at the midpoint of an orbit.
 const ORBIT_HUE_GAIN: f64 = 2.5;
 
+/// Where the tracks come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Otherman Records' catalogue, streamed.
+    Otherman,
+    /// Albums under the music directory; see [`library`].
+    Local,
+}
+
 struct State {
     map: Rc<RefCell<MapLibre>>,
     audio: AudioPlayer,
@@ -141,8 +151,17 @@ struct State {
     /// Whether the skyline is lit by the music, or painted a colour per height
     /// band. See [`toggle_light`].
     lit: bool,
+    source: Source,
     /// Which release the D-pad steps through.
     release_index: usize,
+    /// Local Music's albums, empty until the scan is in or when there is no
+    /// music directory.
+    albums: Vec<LocalAlbum>,
+    /// Which album the D-pad steps through in Local Music, as an index into
+    /// `albums` rather than into the filtered dropdown.
+    album_index: usize,
+    /// The artist the album dropdown is narrowed to; `None` lists them all.
+    artist: Option<String>,
     volume: f32,
     /// Accumulated hue rotation, so the drop can speed it up without the phase
     /// jumping when it decays.
@@ -167,11 +186,17 @@ struct State {
 
 impl State {
     fn current_track_title(&self) -> String {
-        match (&self.release, self.current_track()) {
-            (Some(release), Some(track)) => {
-                format!("{} / {}", track.title, release.artists())
-            }
-            _ => "No track selected, please select a release.".to_string(),
+        match self.source {
+            Source::Otherman => match (&self.release, self.current_track()) {
+                (Some(release), Some(track)) => {
+                    format!("{} / {}", track.title, release.artists())
+                }
+                _ => "No track selected, please select a release.".to_string(),
+            },
+            Source::Local => match self.current_local_track() {
+                Some(track) => format!("{} / {}", track.title, track.artist),
+                None => "No track selected, please select an album.".to_string(),
+            },
         }
     }
 
@@ -180,16 +205,96 @@ impl State {
             .as_ref()
             .and_then(|release| release.tracklist.get(self.track_index))
     }
+
+    fn current_album(&self) -> Option<&LocalAlbum> {
+        self.albums.get(self.album_index)
+    }
+
+    /// Indices into `albums` of those the artist dropdown lets through.
+    fn shown_albums(&self) -> Vec<usize> {
+        library::by_artist(&self.albums, self.artist.as_deref())
+    }
+
+    fn current_local_track(&self) -> Option<&library::LocalTrack> {
+        self.current_album()
+            .and_then(|album| album.tracks.get(self.track_index))
+    }
+
+    /// The labels of what the release dropdown lists for the current source.
+    fn collection_labels(&self) -> Vec<SharedString> {
+        match self.source {
+            Source::Otherman => self.releases.iter().map(|r| r.label().into()).collect(),
+            Source::Local => self
+                .shown_albums()
+                .into_iter()
+                .map(|index| self.albums[index].label().into())
+                .collect(),
+        }
+    }
+
+    /// The release dropdown's position for the current source.
+    fn collection_index(&self) -> usize {
+        match self.source {
+            Source::Otherman => self.release_index,
+            Source::Local => self
+                .shown_albums()
+                .iter()
+                .position(|&index| index == self.album_index)
+                .unwrap_or(0),
+        }
+    }
+
+    /// The labels of the selected release's or album's tracks.
+    fn track_labels(&self) -> Vec<SharedString> {
+        match self.source {
+            Source::Otherman => self
+                .release
+                .iter()
+                .flat_map(|release| &release.tracklist)
+                .map(|track| track.title.as_str().into())
+                .collect(),
+            Source::Local => self
+                .current_album()
+                .iter()
+                .flat_map(|album| &album.tracks)
+                .map(|track| track.label().into())
+                .collect(),
+        }
+    }
+
+    fn track_count(&self) -> usize {
+        match self.source {
+            Source::Otherman => self.release.as_ref().map_or(0, |r| r.tracklist.len()),
+            Source::Local => self.current_album().map_or(0, |a| a.tracks.len()),
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        match self.source {
+            Source::Otherman => self.release.is_some(),
+            Source::Local => self.current_album().is_some(),
+        }
+    }
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let share = select_window_renderer()?;
     let ui = AppWindow::new()?;
     // Full screen by default; `OSM_SOUND_DEMO_WINDOWED` is for running it
     // alongside other work.
     if std::env::var_os("OSM_SOUND_DEMO_WINDOWED").is_some() {
         ui.set_windowed(true);
     }
-    let map = map::create_map(ui.get_map_size());
+    // A finished frame runs the tick at once rather than waiting for the timer,
+    // so the frame rate is set by how fast frames are drawn and the display
+    // shows them, not by the timer's 16 ms.
+    let map = map::create_map(ui.get_map_size(), share, {
+        let ui = ui.as_weak();
+        move || {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MapAdapter>().invoke_tick());
+        }
+    });
+    map.borrow().attach_window(ui.window());
     let (audio, analyzer) = AudioPlayer::new().map_err(|e| format!("audio device: {e}"))?;
 
     let now = Instant::now();
@@ -205,7 +310,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         drop_started: None,
         orbit_started: None,
         lit: true,
+        source: Source::Otherman,
         release_index: 0,
+        albums: Vec::new(),
+        album_index: 0,
+        artist: None,
         volume: 1.0,
         hue: 0.0,
         releases: Vec::new(),
@@ -228,6 +337,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     connect_transport(&ui, &state);
     connect_tick(&ui, &state);
     load_release_list(&ui);
+    load_library(&ui);
 
     ui.run()?;
 
@@ -291,9 +401,11 @@ fn step_place(ui: &AppWindow, delta: isize) {
     fly_to_place(ui, next);
 }
 
-/// Steps through the release catalogue for the gamepad's D-pad.
+/// Steps through the release catalogue, or the albums in Local Music, for the
+/// gamepad's D-pad.
 fn step_release(ui: &AppWindow, delta: isize) {
-    let Some((current, count)) = with_state(|state| (state.release_index, state.releases.len()))
+    let Some((current, count)) =
+        with_state(|state| (state.collection_index(), state.collection_labels().len()))
     else {
         return;
     };
@@ -539,15 +651,20 @@ fn load_release_list(ui: &AppWindow) {
         let result = otherman::fetch_all_releases();
         let _ = ui_handle.upgrade_in_event_loop(move |ui| match result {
             Ok(releases) => {
-                let labels: Vec<SharedString> = releases
-                    .iter()
-                    .map(|release| SharedString::from(release.label()))
-                    .collect();
-                ui.set_releases(ModelRc::new(VecModel::from(labels)));
-                with_state(|state| state.releases = releases);
-                // The dropdown already shows the first entry, so load it to
-                // match rather than leaving the transport disabled.
-                select_release(&ui, 0);
+                let Some(source) = with_state(|state| {
+                    state.releases = releases;
+                    state.source
+                }) else {
+                    return;
+                };
+                // Local Music owns the dropdown for now; switching back fills
+                // it from the list just stored.
+                if source == Source::Otherman {
+                    refresh_collection(&ui);
+                    // The dropdown already shows the first entry, so load it
+                    // to match rather than leaving the transport disabled.
+                    select_release(&ui, 0);
+                }
             }
             Err(error) => {
                 eprintln!("fetching the release list failed: {error}");
@@ -555,6 +672,97 @@ fn load_release_list(ui: &AppWindow) {
             }
         });
     });
+}
+
+/// Scans the music directory in the background, and offers Local Music once
+/// it has found something to play.
+fn load_library(ui: &AppWindow) {
+    let Some(dir) = library::music_dir() else {
+        return;
+    };
+    let ui_handle = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let albums = library::scan(&dir);
+        eprintln!(
+            "Local Music: {} albums in {} in {:.2?}",
+            albums.len(),
+            dir.display(),
+            started.elapsed()
+        );
+        let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+            let available = !albums.is_empty();
+            let artists = with_state(|state| {
+                state.albums = albums;
+                let mut labels: Vec<SharedString> = vec!["All Artists".into()];
+                labels.extend(
+                    library::artists(&state.albums)
+                        .into_iter()
+                        .map(SharedString::from),
+                );
+                labels
+            });
+            if let Some(artists) = artists {
+                ui.set_artists(ModelRc::new(VecModel::from(artists)));
+            }
+            ui.set_local_available(available);
+        });
+    });
+}
+
+/// Switches between Otherman's catalogue and Local Music. Whatever was playing
+/// stops; each side keeps the release or album it had selected.
+fn toggle_local(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let source = {
+        let state = state.borrow();
+        match state.source {
+            Source::Otherman if !state.albums.is_empty() => Source::Local,
+            Source::Otherman => return,
+            Source::Local => Source::Otherman,
+        }
+    };
+    if state.borrow().playing || state.borrow().busy {
+        stop(ui, state);
+    }
+    {
+        let mut state = state.borrow_mut();
+        state.source = source;
+        state.track_index = 0;
+    }
+    ui.set_local(source == Source::Local);
+    refresh_collection(ui);
+    let has_selection = state.borrow().has_selection();
+    ui.set_has_release(has_selection);
+    refresh_title(ui);
+    refresh_tracks(ui);
+    notify(
+        ui,
+        match source {
+            Source::Local => "Local Music",
+            Source::Otherman => "Otherman Records",
+        },
+    );
+}
+
+/// Fills the release dropdown from the current source.
+fn refresh_collection(ui: &AppWindow) {
+    let Some((labels, index)) =
+        with_state(|state| (state.collection_labels(), state.collection_index()))
+    else {
+        return;
+    };
+    ui.set_releases(ModelRc::new(VecModel::from(labels)));
+    ui.set_release_index(index as i32);
+}
+
+/// Fills the track dropdown from the selected release or album.
+fn refresh_tracks(ui: &AppWindow) {
+    let Some((labels, index)) = with_state(|state| (state.track_labels(), state.track_index))
+    else {
+        return;
+    };
+    ui.set_tracks(ModelRc::new(VecModel::from(labels)));
+    ui.set_track_index(index as i32);
 }
 
 // The application state is reachable from any callback on the UI thread, so
@@ -597,6 +805,35 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 stop(&ui, &state);
             } else {
                 start(&ui, &state);
+            }
+        }
+    });
+
+    ui.on_track_selected({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move |index| {
+            if let Some(ui) = ui_handle.upgrade() {
+                select_track(&ui, &state, index.max(0) as usize);
+            }
+        }
+    });
+
+    ui.on_artist_selected({
+        let ui_handle = ui.as_weak();
+        move |index| {
+            if let Some(ui) = ui_handle.upgrade() {
+                select_artist(&ui, index.max(0) as usize);
+            }
+        }
+    });
+
+    ui.on_toggle_local({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                toggle_local(&ui, &state);
             }
         }
     });
@@ -743,14 +980,29 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         let state = Rc::clone(state);
         move || {
             let state = state.borrow();
-            if let Some(release) = state.release.as_ref() {
-                open_in_browser(&format!("{}{}", otherman::RELEASE_LINK_BASE, release.id));
+            match state.source {
+                Source::Otherman => {
+                    if let Some(release) = state.release.as_ref() {
+                        open_in_browser(&format!("{}{}", otherman::RELEASE_LINK_BASE, release.id));
+                    }
+                }
+                // The file manager, by way of the same opener.
+                Source::Local => {
+                    if let Some(album) = state.current_album() {
+                        open_in_browser(&album.dir.to_string_lossy());
+                    }
+                }
             }
         }
     });
 }
 
+/// Selects a release, or in Local Music an album.
 fn select_release(ui: &AppWindow, index: usize) {
+    if with_state(|state| state.source) == Some(Source::Local) {
+        select_album(ui, index);
+        return;
+    }
     let id = {
         let borrowed = STATE.with(|slot| slot.borrow().clone());
         let Some(state) = borrowed else { return };
@@ -767,6 +1019,18 @@ fn select_release(ui: &AppWindow, index: usize) {
     std::thread::spawn(move || {
         let result = otherman::fetch_release(&id);
         let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+            // Switched to Local Music while this was loading: keep the
+            // release for when Otherman comes back, and leave the player and
+            // the UI to Local Music.
+            if with_state(|state| state.source) != Some(Source::Otherman) {
+                if let Ok(release) = result {
+                    let _ = with_state(|state| {
+                        state.release = Some(release);
+                        state.release_index = index;
+                    });
+                }
+                return;
+            }
             ui.set_busy(false);
             match result {
                 Ok(release) => {
@@ -783,6 +1047,7 @@ fn select_release(ui: &AppWindow, index: usize) {
                     ui.set_playing(false);
                     ui.set_has_release(true);
                     refresh_title(&ui);
+                    refresh_tracks(&ui);
                 }
                 Err(error) => {
                     eprintln!("fetching release {id} failed: {error}");
@@ -791,6 +1056,70 @@ fn select_release(ui: &AppWindow, index: usize) {
             }
         });
     });
+}
+
+/// Selects one of Local Music's albums by its place in the album dropdown,
+/// stopping whatever was playing.
+fn select_album(ui: &AppWindow, position: usize) {
+    let selected = with_state(|state| {
+        let Some(index) = state.shown_albums().get(position).copied() else {
+            return false;
+        };
+        state.audio.stop();
+        state.playing = false;
+        state.busy = false;
+        state.generation += 1;
+        state.album_index = index;
+        state.track_index = 0;
+        state.map.borrow_mut().reset_levels();
+        true
+    });
+    if selected != Some(true) {
+        return;
+    }
+    ui.set_release_index(position as i32);
+    ui.set_playing(false);
+    ui.set_busy(false);
+    ui.set_has_release(true);
+    refresh_title(ui);
+    refresh_tracks(ui);
+}
+
+/// Narrows the album dropdown to one artist, or with 0 lists every album. The
+/// album that was selected stays selected, and playing, if the artist still
+/// lists it; otherwise the artist's first album takes its place.
+fn select_artist(ui: &AppWindow, position: usize) {
+    let kept = with_state(|state| {
+        state.artist = match position {
+            0 => None,
+            _ => library::artists(&state.albums)
+                .get(position - 1)
+                .map(|artist| artist.to_string()),
+        };
+        state.shown_albums().contains(&state.album_index)
+    });
+    let Some(kept) = kept else { return };
+    ui.set_artist_index(position as i32);
+    refresh_collection(ui);
+    if !kept {
+        select_album(ui, 0);
+    }
+}
+
+/// Picks a track from the track dropdown and plays it: choosing one is asking
+/// to hear it.
+fn select_track(ui: &AppWindow, state: &Rc<RefCell<State>>, index: usize) {
+    {
+        let mut state = state.borrow_mut();
+        if index >= state.track_count() {
+            return;
+        }
+        state.track_index = index;
+    }
+    refresh_title(ui);
+    ui.set_track_index(index as i32);
+    stop(ui, state);
+    start(ui, state);
 }
 
 /// Puts a message on the status line and keeps it there for a moment.
@@ -814,6 +1143,10 @@ fn refresh_title(ui: &AppWindow) {
 /// kilobytes, then hands the reader to the UI thread, which owns the player.
 /// The rest of the track keeps arriving while it plays.
 fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    if state.borrow().source == Source::Local {
+        start_local(ui, state);
+        return;
+    }
     let (url, generation) = {
         let mut state = state.borrow_mut();
         let Some(track) = state.current_track() else {
@@ -865,6 +1198,36 @@ fn start(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     });
 }
 
+/// Starts the current Local Music track. The file is on disk, so it is opened
+/// right here: the decoder reads only the headers before playback begins.
+fn start_local(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let failure = {
+        let mut state = state.borrow_mut();
+        let Some(path) = state.current_local_track().map(|track| track.path.clone()) else {
+            return;
+        };
+        state.generation += 1;
+        state.busy = false;
+        match state.audio.play_file(&path) {
+            Ok(()) => {
+                state.playing = true;
+                state.track_started = Instant::now();
+                None
+            }
+            Err(error) => {
+                state.playing = false;
+                Some(format!("Could not play {}: {error}", path.display()))
+            }
+        }
+    };
+    ui.set_busy(false);
+    ui.set_playing(failure.is_none());
+    if let Some(failure) = failure {
+        eprintln!("{failure}");
+        ui.set_track_title(failure.into());
+    }
+}
+
 fn stop(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     {
         let mut state = state.borrow_mut();
@@ -882,10 +1245,7 @@ fn stop(ui: &AppWindow, state: &Rc<RefCell<State>>) {
 fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
     let was_playing = {
         let mut state = state.borrow_mut();
-        let Some(release) = state.release.as_ref() else {
-            return;
-        };
-        let len = release.tracklist.len();
+        let len = state.track_count();
         if len == 0 {
             return;
         }
@@ -894,10 +1254,66 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
     };
 
     refresh_title(ui);
+    let index = state.borrow().track_index;
+    ui.set_track_index(index as i32);
     if was_playing {
         stop(ui, state);
         start(ui, state);
     }
+}
+
+/// Draws the window with Skia on macOS, where FemtoVG's OpenGL keeps a 120 Hz
+/// display at 60. It draws through wgpu's Metal backend, so the map's frames
+/// can be shown as textures instead of read back — see "Shared frames" in the
+/// README. `OSM_SOUND_DEMO_READBACK` keeps Skia but reads frames back, to
+/// compare; `SLINT_BACKEND` overrides the lot.
+///
+/// Returns whether the map should share its frames with the window rather than
+/// have them read back.
+#[cfg(target_os = "macos")]
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return Ok(false);
+    }
+    let selector = slint::BackendSelector::new().renderer_name("skia".to_owned());
+    #[cfg(feature = "metal")]
+    if std::env::var_os("OSM_SOUND_DEMO_READBACK").is_none() {
+        let mut settings = slint::wgpu_30::WGPUSettings::default();
+        settings.backends = slint::wgpu_30::wgpu::Backends::METAL;
+        return selector
+            .require_wgpu_30(slint::wgpu_30::WGPUConfiguration::Automatic(settings))
+            .select()
+            .map(|()| true);
+    }
+    selector.select().map(|()| false)
+}
+
+/// Draws the window with Skia on Linux too. With the `vulkan` feature it draws
+/// through wgpu's Vulkan backend, so the map's frames can be imported as
+/// textures instead of read back — see "Shared frames" in the README.
+/// `OSM_SOUND_DEMO_READBACK` keeps Skia but reads frames back, to compare;
+/// `SLINT_BACKEND` overrides the lot.
+#[cfg(target_os = "linux")]
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return Ok(false);
+    }
+    let selector = slint::BackendSelector::new().renderer_name("skia".to_owned());
+    #[cfg(feature = "vulkan")]
+    if std::env::var_os("OSM_SOUND_DEMO_READBACK").is_none() {
+        let mut settings = slint::wgpu_30::WGPUSettings::default();
+        settings.backends = slint::wgpu_30::wgpu::Backends::VULKAN;
+        return selector
+            .require_wgpu_30(slint::wgpu_30::WGPUConfiguration::Automatic(settings))
+            .select()
+            .map(|()| true);
+    }
+    selector.select().map(|()| false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn select_window_renderer() -> Result<bool, slint::PlatformError> {
+    Ok(false)
 }
 
 fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
@@ -920,7 +1336,7 @@ fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         let delta = now.duration_since(state.last_tick);
         state.last_tick = now;
         let seconds = delta.as_secs_f64();
-        let levels = state.analyzer.poll();
+        let levels = state.analyzer.poll(delta);
         let map = Rc::clone(&state.map);
 
         // Sticks and D-pad, held rather than pressed.

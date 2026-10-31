@@ -10,48 +10,103 @@
 //! costs about 40 ms a frame here; continuous mode does the same work in under
 //! 8 ms (see `report_static_vs_continuous`).
 //!
-//! MapLibre Native drives its work through its own run loop, which on macOS is
-//! the process CoreFoundation run loop. Pumping that from inside a Slint
-//! callback re-enters winit's event handling and aborts the process, so the
-//! renderer lives on its own thread: the UI thread only posts commands and
-//! picks up finished frames.
+//! MapLibre Native runs on worker threads of its own and hands back events,
+//! frame results and completions from them. Reading frames back and — on
+//! OpenGL — servicing the render session's driver work still has to happen on
+//! the thread whose graphics context the session shares, so the renderer lives
+//! on its own thread: the UI thread only posts commands and picks up finished
+//! frames.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maplibre_native_ffi::{
-    AnimationOptions, BoundOptions, CameraOptions, LatLng, MapHandle, MapMode, MapOptions,
-    MapTileOptions, NativePointer, RenderSessionHandle, RenderTargetExtent, RuntimeEventMask,
-    RuntimeEventPayload, RuntimeEventSource, RuntimeEventType, RuntimeHandle, RuntimeOptions,
+    AnimationOptions, BoundOptions, Camera, CameraOptions, CameraTransitionHandler, CameraUpdate,
+    CameraUpdateMode, FrameDemand, FrameDemandFlag, LatLng, LogicalExtent, MapHandle, MapMode,
+    MapOptions, MapTileOptions, NativeFuture, RenderDriverKind, RenderFrameResult, RenderResult,
+    RenderSessionAttachOptions, RenderSessionHandle, RuntimeEvent, RuntimeEventFlag,
+    RuntimeEventHandler, RuntimeEventType, RuntimeHandle, RuntimeOptions, TileLodMode, Wake,
 };
 #[cfg(feature = "opengl")]
 use maplibre_native_ffi::{
-    EglContextDescriptor, OpenGLContextDescriptor, OpenGLOwnedTextureDescriptor,
+    EglContextDescriptor, OpenGlContextDescriptor, OpenGlContextDescriptorData,
+    OpenGlContextOwnership, OpenGlOwnedTextureDescriptor,
 };
-#[cfg(feature = "metal")]
-use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
-#[cfg(feature = "vulkan")]
-use maplibre_native_ffi::{VulkanContextDescriptor, VulkanOwnedTextureDescriptor};
 
 use crate::Size;
 use crate::audio::BINS;
 
-pub const DEFAULT_STYLE_URL: &str =
-    "https://tile.openstreetmap.jp/styles/maptiler-toner-ja/style.json";
+/// The style the map opens with: tile.openstreetmap.jp's toner-ja, its three
+/// sources read from PMTiles archives under `pmtiles/` rather than through
+/// their TileJSON. Compiled in, so the style itself needs no network.
+const BUNDLED_STYLE: &str = include_str!("../../style/style.json");
 
-/// The style the map opens with, `MAPLIBRE_STYLE_URL` overriding it.
-fn default_style_url() -> String {
+/// How the bundled style names a local archive: `asset://` resolves against
+/// the runtime's asset path, which [`asset_root`] sets to this project.
+const LOCAL_PMTILES: &str = "pmtiles://asset://";
+
+/// Where an archive is read from when there is no local copy.
+const REMOTE_PMTILES: &str = "pmtiles://https://tile.openstreetmap.jp/static/";
+
+/// The directory `asset://` URLs resolve against, or `None` where the archives
+/// are never local. On the desktop that is this project, so `pmtiles/` is the
+/// directory `download-pmtiles.sh` fills. Android's asset path is the APK, and
+/// an 85 GB planet does not go in one; on iOS the build machine's path does
+/// not exist on the device, so the check below falls back there too.
+fn asset_root() -> Option<&'static str> {
+    if cfg!(target_os = "android") {
+        None
+    } else {
+        Some(env!("CARGO_MANIFEST_DIR"))
+    }
+}
+
+/// The bundled style, each local archive that has not been downloaded pointed
+/// back at the server. Checked on every load, so archives that arrive while
+/// the app runs are used from the next style load on.
+fn bundled_style() -> String {
+    let mut style: serde_json::Value =
+        serde_json::from_str(BUNDLED_STYLE).expect("the bundled style is valid JSON");
+    if let Some(sources) = style["sources"].as_object_mut() {
+        for source in sources.values_mut() {
+            let Some(path) = source["url"]
+                .as_str()
+                .and_then(|url| url.strip_prefix(LOCAL_PMTILES))
+            else {
+                continue;
+            };
+            let local = asset_root().is_some_and(|root| Path::new(root).join(path).is_file());
+            if !local {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                source["url"] = format!("{REMOTE_PMTILES}{name}").into();
+            }
+        }
+    }
+    style.to_string()
+}
+
+/// The style URL `MAPLIBRE_STYLE_URL` asks for, or `None` for the bundled one.
+fn default_style_url() -> Option<String> {
     std::env::var("MAPLIBRE_STYLE_URL")
         .ok()
         .map(|url| url.trim().to_owned())
         .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| DEFAULT_STYLE_URL.to_owned())
+}
+
+/// Starts loading a style: the one at `url`, or the bundled one when there is
+/// none.
+fn set_style(map: &MapHandle, url: Option<&str>) -> maplibre_native_ffi::Result<()> {
+    match url {
+        Some(url) => map.discarding().set_style_url(url),
+        None => map.discarding().set_style_json(&bundled_style()),
+    }
 }
 
 /// How many frames to keep looking for an attribution before accepting that
@@ -78,6 +133,31 @@ fn prefetch_zoom_delta() -> Option<u32> {
         std::env::var("OSM_SOUND_DEMO_PREFETCH")
             .ok()
             .and_then(|value| value.trim().parse().ok())
+    })
+}
+
+/// How MapLibre Native picks the zoom of the tiles it draws.
+///
+/// `Distance` draws coarser tiles the further they are from the camera. The
+/// default draws every visible tile at the camera's zoom, which at the pitch this
+/// app sits at fills the ground up to the horizon with z16 tiles: about a third
+/// of the frame rate goes on detail too far away to read, and it shows as noise
+/// along the horizon. At 70° and 960x640 a frame takes 11 ms with `Distance`
+/// against 32 ms without, on OpenGL; the foreground is identical.
+///
+/// `OSM_SOUND_DEMO_TILE_LOD=default` puts MapLibre Native's own mode back, which
+/// is how to A/B it.
+fn tile_lod_mode() -> TileLodMode {
+    static MODE: OnceLock<TileLodMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("OSM_SOUND_DEMO_TILE_LOD")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("default") => TileLodMode::Default,
+            _ => TileLodMode::Distance,
+        }
     })
 }
 
@@ -135,6 +215,26 @@ const IDLE_TICK: Duration = Duration::from_millis(16);
 /// How long each runtime pump may block waiting for work. Short, because the
 /// thread has a frame to draw afterwards.
 const PUMP_BUDGET: Duration = Duration::from_millis(2);
+
+/// Where `Engine::render` spends a frame, summed in nanoseconds for
+/// `report_frame_phases`: waiting for the session to draw, reading the
+/// texture back, and copying it into the buffer handed to Slint.
+#[cfg(test)]
+static PHASE_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const PHASE_WAIT: usize = 0;
+const PHASE_READ: usize = 1;
+const PHASE_COPY: usize = 2;
+
+/// Adds the time since `started` to a phase and restarts the clock. Outside
+/// tests it only restarts the clock, which costs a clock read per phase.
+fn phase(index: usize, started: &mut Instant) {
+    let now = Instant::now();
+    #[cfg(test)]
+    PHASE_NANOS[index].fetch_add((now - *started).as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = index;
+    *started = now;
+}
 
 const MIN_ZOOM: f64 = 0.0;
 const MAX_ZOOM: f64 = 22.0;
@@ -196,6 +296,10 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// The frame as a texture the window's device can sample, in place of
+    /// `rgba`, when frames are shared rather than read back.
+    #[cfg(shared_frames)]
+    pub shared: Option<super::shared::SharedFrame>,
     /// The style's attribution, once its sources have reported one. Sent on
     /// the frame it changes and `None` on every other.
     pub attribution: Option<String>,
@@ -227,6 +331,10 @@ enum Command {
     Palette(Option<Box<[f64; SLICES]>>),
     /// How many of the slices to show; one of [`SLICE_MODES`].
     Slices(usize),
+    /// Stop sharing frames and read them back instead: the window turned out
+    /// not to be drawn on a device that can take them.
+    #[cfg(shared_frames)]
+    ReadBack,
 }
 
 /// The style's light, which the web demo animated with `map.setLight`.
@@ -372,10 +480,15 @@ pub struct MapLibre {
     slices: usize,
     /// The zoom a pinch started from, while one is in progress.
     pinch_from: Option<f64>,
+    /// Puts shared frames on screen and hands them back once drawn.
+    #[cfg(shared_frames)]
+    bridge: Rc<RefCell<super::shared::Bridge>>,
+    #[cfg(shared_frames)]
+    read_back_requested: bool,
 }
 
 impl MapLibre {
-    fn new(size: (u32, u32)) -> Self {
+    fn new(size: (u32, u32), share: bool, on_frame: impl Fn() + Send + 'static) -> Self {
         let (commands, command_rx) = std::sync::mpsc::channel();
         // A single slot: if the UI falls behind there is no point queueing stale
         // frames, the newest one is always the one worth showing.
@@ -385,7 +498,7 @@ impl MapLibre {
             .name("maplibre-render".to_owned())
             .spawn({
                 let rendered = Arc::clone(&rendered);
-                move || render_thread(size, command_rx, frame_tx, &rendered)
+                move || render_thread(size, share, command_rx, frame_tx, &rendered, &on_frame)
             })
             .expect("spawning the map render thread");
 
@@ -400,7 +513,45 @@ impl MapLibre {
             flight_id: 0,
             slices: SLICE_MODES[0],
             pinch_from: None,
+            #[cfg(shared_frames)]
+            bridge: Rc::default(),
+            #[cfg(shared_frames)]
+            read_back_requested: false,
         }
+    }
+
+    /// Lets shared frames reach `window`, which has to be told when each draw
+    /// is submitted before the frames it showed can be handed back.
+    pub fn attach_window(&self, window: &slint::Window) {
+        #[cfg(shared_frames)]
+        super::shared::Bridge::attach(&self.bridge, window);
+        #[cfg(not(shared_frames))]
+        let _ = window;
+    }
+
+    /// Hands back frames whose session has been replaced; see
+    /// `Bridge::let_go_of_disposed`. Called on every tick, since the new
+    /// session cannot start until they are.
+    pub fn tidy_shared(&mut self) {
+        #[cfg(shared_frames)]
+        self.bridge.borrow_mut().let_go_of_disposed();
+    }
+
+    /// The image to show for a shared frame, or `None` if it cannot be shown,
+    /// in which case the frame is handed straight back.
+    #[cfg(shared_frames)]
+    pub fn show_shared(&mut self, frame: super::shared::SharedFrame) -> Option<slint::Image> {
+        let mut bridge = self.bridge.borrow_mut();
+        if bridge.refused() {
+            // Only once: the render thread stops sending them.
+            if !std::mem::replace(&mut self.read_back_requested, true) {
+                eprintln!("the window cannot sample shared frames; reading them back instead");
+                drop(bridge);
+                self.send(Command::ReadBack);
+            }
+            return None;
+        }
+        bridge.show(frame)
     }
 
     fn send(&self, command: Command) {
@@ -660,26 +811,193 @@ impl Drop for MapLibre {
         // tile cache properly instead of being cut off mid-write. It parks on a
         // 16 ms timeout, so this returns promptly.
         self.commands = None;
+        // Shared frames are handed back first, both the ones on screen and any
+        // still in the channel, or their session would never retire and the
+        // map's teardown would wait out its timeout for them.
+        #[cfg(shared_frames)]
+        self.bridge.borrow_mut().let_go_of_all();
         if let Some(handle) = self.render_thread.take() {
+            while !handle.is_finished() {
+                while self.frames.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let _ = handle.join();
         }
     }
 }
 
-pub fn create_map(size: Size) -> Rc<RefCell<MapLibre>> {
-    Rc::new(RefCell::new(MapLibre::new(safe_size(size))))
+/// `on_frame` is called on the render thread each time a frame is ready to be
+/// taken, so the UI can pick it up straight away instead of on its next timer.
+///
+/// `share` hands frames over as textures for the window's device instead of
+/// reading them back; see `shared`. It is ignored where that is not built.
+pub fn create_map(
+    size: Size,
+    share: bool,
+    on_frame: impl Fn() + Send + 'static,
+) -> Rc<RefCell<MapLibre>> {
+    Rc::new(RefCell::new(MapLibre::new(
+        safe_size(size),
+        share,
+        on_frame,
+    )))
 }
 
-/// Owns the MapLibre Native renderer for the lifetime of the render thread.
+/// How long a wait on MapLibre Native is allowed before it is given up on: a
+/// completion, a map coming up, or a frame the engine has asked for.
+const NATIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The token that marks the first frame demand. Any value but `u64::MAX` will
+/// do; native hands it back with the demand's result.
+const FIRST_TOKEN: u64 = 1;
+
+/// What MapLibre Native's threads hand the render thread, and the wake that
+/// tells it something has arrived.
+///
+/// Every callback the engine registers — the runtime's events, the end of a
+/// camera transition, the render session's frame and driver-work wakes, and the
+/// completion of a future the engine is waiting on — raises this, so the render
+/// thread can block on one thing.
+#[derive(Default)]
+struct Inbox {
+    state: Mutex<InboxState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct InboxState {
+    wakes: u64,
+    events: Vec<RuntimeEvent>,
+    /// The camera transitions that have ended, by transition id.
+    landed: Vec<u64>,
+}
+
+impl Inbox {
+    fn lock(&self) -> MutexGuard<'_, InboxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records whatever `deliver` adds and wakes the render thread.
+    fn raise(&self, deliver: impl FnOnce(&mut InboxState)) {
+        let mut state = self.lock();
+        deliver(&mut state);
+        state.wakes += 1;
+        self.changed.notify_all();
+    }
+
+    /// The wake count, read before looking at what a wake announces.
+    fn seen(&self) -> u64 {
+        self.lock().wakes
+    }
+
+    /// Blocks until a wake arrives after `seen`, or `timeout` passes.
+    fn wait_past(&self, seen: u64, timeout: Duration) {
+        let state = self.lock();
+        let _ = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.wakes == seen);
+    }
+
+    /// Whether events or landings are waiting to be picked up.
+    fn has_news(&self) -> bool {
+        let state = self.lock();
+        !state.events.is_empty() || !state.landed.is_empty()
+    }
+
+    fn take(&self) -> (Vec<RuntimeEvent>, Vec<u64>) {
+        let mut state = self.lock();
+        (
+            std::mem::take(&mut state.events),
+            std::mem::take(&mut state.landed),
+        )
+    }
+}
+
+impl std::task::Wake for Inbox {
+    fn wake(self: Arc<Self>) {
+        self.raise(|_| {});
+    }
+}
+
+/// A native wake that raises `inbox`.
+fn inbox_wake(inbox: &Arc<Inbox>) -> Wake {
+    let inbox = Arc::clone(inbox);
+    Wake::new(move || inbox.raise(|_| {}))
+}
+
+/// Who services the render session's driver work. OpenGL shares this thread's
+/// EGL context, so the work has to run here; Vulkan and Metal hand their device
+/// to the session, which drives itself on a library worker.
+#[cfg(feature = "opengl")]
+const DRIVER: RenderDriverKind = RenderDriverKind::CallerGraphicsThread;
+#[cfg(not(feature = "opengl"))]
+const DRIVER: RenderDriverKind = RenderDriverKind::CoreWorker;
+
+/// Runs whatever driver work the session has queued for this thread. A no-op
+/// for a session that drives itself.
+fn service(session: Option<&RenderSessionHandle>) {
+    if DRIVER == RenderDriverKind::CallerGraphicsThread
+        && let Some(session) = session
+        && let Err(error) = session.service_driver_work()
+    {
+        eprintln!("servicing the render session failed: {error}");
+    }
+}
+
+/// Waits for `future`, servicing the session's driver work meanwhile: on
+/// OpenGL a readback or an attachment only finishes when this thread runs it.
+/// Keeps one demand waiting for the map's next update; see `Engine::arm`.
+fn arm_demand(session: &RenderSessionHandle, armed: &mut Option<u64>, next_token: &mut u64) {
+    if armed.is_some() {
+        return;
+    }
+    let token = *next_token;
+    *next_token += 1;
+    let demand = FrameDemand {
+        flags: FrameDemandFlag::WAIT_FOR_UPDATE,
+        token,
+    };
+    match session.request_frame(&demand) {
+        Ok(()) => *armed = Some(token),
+        Err(error) => eprintln!("asking for a frame failed: {error}"),
+    }
+}
+
+fn drive<T>(
+    inbox: &Arc<Inbox>,
+    session: Option<&RenderSessionHandle>,
+    future: NativeFuture<T>,
+) -> Result<T, String> {
+    let waker = Waker::from(Arc::clone(inbox));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    let deadline = Instant::now() + NATIVE_TIMEOUT;
+    loop {
+        let seen = inbox.seen();
+        if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+            return result.map_err(|error| error.to_string());
+        }
+        service(session);
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("timed out".to_owned());
+        }
+        inbox.wait_past(seen, deadline - now);
+    }
+}
+
 /// Owns the MapLibre Native runtime, map and render session for the lifetime of
-/// the render thread. All three handles are thread-affine, so they never leave
-/// it.
+/// the render thread. The handles themselves may be used from any thread, but
+/// the session's driver work and readback belong to this one.
 struct Engine {
     runtime: Option<RuntimeHandle>,
     map: Option<Attached>,
     cache: PathBuf,
     size: (u32, u32),
-    style_url: String,
+    /// `None` is the bundled style.
+    style_url: Option<String>,
     camera: MapCamera,
     bands: [Band; SLICES],
     applied: [Option<Band>; SLICES],
@@ -708,12 +1026,37 @@ struct Engine {
     attribution_attempts: u32,
     /// Something the UI asked for has not been drawn yet.
     dirty: bool,
-    /// MapLibre Native says it has more to draw — tiles still arriving, or a
-    /// transition in flight. Unlike the old bindings, this is a real signal
-    /// rather than a settle timer.
-    wants_repaint: bool,
+    /// Where MapLibre Native's threads leave what they have for this one.
+    inbox: Arc<Inbox>,
+    /// A frame the session has drawn and this thread has not read back yet.
+    ///
+    /// The map publishes an update whenever it has something new to show —
+    /// tiles arriving, a transition stepping — and the demand kept armed in
+    /// [`Engine::arm`] draws it, so this is how the map says it wants a frame.
+    ready: Option<RenderFrameResult>,
+    /// The token of the frame demand waiting for the map's next update.
+    armed: Option<u64>,
+    next_token: u64,
     /// Reused between frames; the read-back is the same size every time.
     pixels: Vec<u8>,
+    /// Render into a ring of images the window's device shares, rather than
+    /// reading frames back.
+    #[cfg_attr(not(shared_frames), allow(dead_code))]
+    share: bool,
+    /// Rings of disposed sessions, kept until those sessions have retired.
+    #[cfg(shared_frames)]
+    retired: Vec<(Arc<super::shared::Ring>, Instant)>,
+    /// A map waiting for its old session to retire before it takes a new one.
+    #[cfg(shared_frames)]
+    unattached: Option<Unattached>,
+}
+
+#[cfg(shared_frames)]
+struct Unattached {
+    map: MapHandle,
+    layers: bool,
+    style_loaded: bool,
+    since: Instant,
 }
 
 /// A map with a render target attached. Kept together because the session is
@@ -726,7 +1069,19 @@ struct Attached {
     /// The style has finished loading, so its sources exist and layers
     /// referring to them can be added.
     style_loaded: bool,
+    /// The images the session renders into, when frames are shared.
+    #[cfg_attr(not(shared_frames), allow(dead_code))]
+    ring: SharedRing,
 }
+
+#[cfg(shared_frames)]
+type SharedRing = Option<Arc<super::shared::Ring>>;
+#[cfg(not(shared_frames))]
+type SharedRing = ();
+#[cfg(shared_frames)]
+type SharedSlot = Option<super::shared::SharedFrame>;
+#[cfg(not(shared_frames))]
+type SharedSlot = ();
 
 impl Engine {
     fn new(size: (u32, u32)) -> Self {
@@ -752,13 +1107,34 @@ impl Engine {
             attribution: None,
             attribution_attempts: 0,
             dirty: true,
-            wants_repaint: false,
+            inbox: Arc::new(Inbox::default()),
+            ready: None,
+            armed: None,
+            next_token: FIRST_TOKEN,
             pixels: Vec::new(),
+            share: false,
+            #[cfg(shared_frames)]
+            retired: Vec::new(),
+            #[cfg(shared_frames)]
+            unattached: None,
         }
     }
 
     fn apply(&mut self, command: Command) {
         match command {
+            #[cfg(shared_frames)]
+            Command::ReadBack => {
+                if self.share {
+                    self.share = false;
+                    if let Err(error) = self.reattach() {
+                        eprintln!("switching to reading frames back failed: {error}");
+                        self.map = None;
+                        self.applied = [None; SLICES];
+                        self.applied_light = None;
+                    }
+                    self.mark_dirty();
+                }
+            }
             Command::Resize(width, height) => {
                 if self.size != (width, height) {
                     self.size = (width, height);
@@ -767,8 +1143,34 @@ impl Engine {
                     // this matters — the loaded style. Rebuilding re-fetched
                     // the style from its URL, so resizing the window with no
                     // network left the map blank.
-                    if let Some(attached) = &self.map
-                        && let Err(error) = attached.session.resize(width, height, 1.0)
+                    // The session sizes the map to its target, so this is all
+                    // a resize takes.
+                    #[cfg(shared_frames)]
+                    let shared = self
+                        .map
+                        .as_ref()
+                        .is_some_and(|attached| attached.ring.is_some());
+                    #[cfg(not(shared_frames))]
+                    let shared = false;
+                    #[cfg(shared_frames)]
+                    if shared && let Err(error) = self.reattach() {
+                        eprintln!("replacing the shared render target failed: {error}");
+                        self.map = None;
+                        self.applied = [None; SLICES];
+                        self.applied_light = None;
+                    }
+                    // Waited for, so the session's generation has moved on before
+                    // anything else is read from it: `collect_results` then
+                    // tells the frames drawn before the resize by theirs.
+                    if !shared
+                        && let Some(attached) = &self.map
+                        && let Err(error) = attached
+                            .session
+                            .resize(LogicalExtent::new(width, height, 1.0))
+                            .map_err(|error| error.to_string())
+                            .and_then(|resized| {
+                                drive(&self.inbox, Some(&attached.session), resized)
+                            })
                     {
                         eprintln!("resizing the render target failed: {error}");
                         // Fall back to a rebuild, which at least recovers when
@@ -777,14 +1179,15 @@ impl Engine {
                         self.applied = [None; SLICES];
                         self.applied_light = None;
                     }
+                    self.ready = None;
                     self.mark_dirty();
                 }
             }
             Command::Style(url) => {
-                if self.style_url != url {
-                    self.style_url = url;
+                if self.style_url.as_deref() != Some(url.as_str()) {
+                    self.style_url = Some(url);
                     if let Some(attached) = &mut self.map {
-                        if let Err(error) = attached.map.set_style_url(&self.style_url) {
+                        if let Err(error) = set_style(&attached.map, self.style_url.as_deref()) {
                             eprintln!("style load failed: {error}");
                         }
                         attached.layers = false;
@@ -804,7 +1207,7 @@ impl Engine {
                 // flight in the air gives way rather than fighting it.
                 if self.flight_id.take().is_some()
                     && let Some(attached) = &self.map
-                    && let Err(error) = attached.map.cancel_transitions()
+                    && let Err(error) = attached.map.discarding().cancel_transitions()
                 {
                     eprintln!("cancelling the fly-to failed: {error}");
                 }
@@ -860,65 +1263,54 @@ impl Engine {
 
     /// Whether another frame is worth rendering.
     fn wants_frame(&self) -> bool {
-        self.dirty || self.wants_repaint
+        self.dirty || self.ready.is_some()
     }
 
-    /// Turns the runtime, letting tile loads and transitions make progress, and
-    /// picks up whether the map wants another frame.
+    /// Picks up what MapLibre Native's threads have delivered — events, a
+    /// finished flight, a drawn frame — waiting up to `timeout` for a frame or
+    /// an event if none is there yet.
     fn pump(&mut self, timeout: Option<Duration>) {
-        let Some(runtime) = self.runtime.as_mut() else {
+        if self.map.is_none() {
             return;
-        };
-        if let Err(error) = runtime.pump(timeout, None) {
-            eprintln!("pumping the map runtime failed: {error}");
-            return;
+        }
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            let seen = self.inbox.seen();
+            self.collect_results();
+            if self.ready.is_some() || self.inbox.has_news() {
+                break;
+            }
+            let Some(deadline) = deadline else { break };
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            self.inbox.wait_past(seen, deadline - now);
         }
 
+        let (events, landed) = self.inbox.take();
         let Some(attached) = &self.map else { return };
-        let source = RuntimeEventSource::Map(attached.map.id());
-        let batch = match runtime.drain_events(0) {
-            Ok(batch) => batch,
-            Err(error) => {
-                eprintln!("draining map events failed: {error}");
-                return;
-            }
-        };
-        let mut wants_repaint = false;
-        let mut style_loaded = false;
-        let mut landed = false;
-        for event in batch.iter() {
-            if event.source() != source {
-                continue;
-            }
-            match event.event_type() {
-                RuntimeEventType::MapRenderUpdateAvailable => wants_repaint = true,
-                RuntimeEventType::MapStyleLoaded => style_loaded = true,
-                RuntimeEventType::MapCameraTransitionFinished => {
-                    if let RuntimeEventPayload::CameraTransitionFinished(finished) = event.payload()
-                        && self.flight_id == Some(finished.transition_id)
-                    {
-                        landed = true;
-                    }
-                }
-                RuntimeEventType::MapRenderFrameFinished => {
-                    if let RuntimeEventPayload::RenderFrame(frame) = event.payload() {
-                        wants_repaint |= frame.needs_repaint;
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.wants_repaint = wants_repaint;
+        let source = attached.map.id();
+        let style_loaded = events.iter().any(|event| {
+            event.source == source && event.r#type == RuntimeEventType::MapStyleLoaded
+        });
+        let landed = self.flight_id.is_some_and(|id| landed.contains(&id));
         self.collect_attribution();
         if landed {
             self.flight_id = None;
-            // Take the camera the flight ended on before `jump_to` resumes:
-            // otherwise the next frame pins the map back to the last position
-            // sampled mid-flight.
-            if let Some(attached) = &self.map
-                && let Ok(camera) = attached.map.camera()
-            {
-                self.camera = self.camera.with(&camera);
+            // Take the camera the flight ended on before the next jump: otherwise
+            // the next frame pins the map back to the last position sampled
+            // mid-flight.
+            if let Some(attached) = &self.map {
+                match attached
+                    .map
+                    .get_camera()
+                    .map_err(|error| error.to_string())
+                    .and_then(|query| drive(&self.inbox, None, query))
+                {
+                    Ok(reported) => self.camera = MapCamera::reported(&reported.camera),
+                    Err(error) => eprintln!("reading the camera after the fly-to failed: {error}"),
+                }
             }
             self.report_camera = true;
             // One more frame, so the UI sees `flying: false` and stops waiting.
@@ -931,53 +1323,137 @@ impl Engine {
         }
     }
 
+    /// Runs the session's driver work and takes the frames it has finished,
+    /// keeping the newest one drawn, then re-arms the demand.
+    fn collect_results(&mut self) {
+        let Some(attached) = &self.map else { return };
+        service(Some(&attached.session));
+        let results = match attached.session.drain_frame_results() {
+            Ok(results) => results,
+            Err(error) => {
+                eprintln!("draining frame results failed: {error}");
+                return;
+            }
+        };
+        // A frame drawn before the session's target last changed — a demand
+        // armed before a resize can finish after it — has nothing left to
+        // read back: the session answers with INVALID_STATE.
+        let generation = if results.is_empty() {
+            0
+        } else {
+            match attached.session.get_snapshot() {
+                Ok(snapshot) => snapshot.generation,
+                Err(error) => {
+                    eprintln!("reading the render session's state failed: {error}");
+                    0
+                }
+            }
+        };
+        for result in results {
+            if self.armed == Some(result.token) {
+                self.armed = None;
+            }
+            if result.disposition != RenderResult::Rendered || result.generation < generation {
+                continue;
+            }
+            // A paint transition still running. A camera transition does not set
+            // this: the map publishes an update for each of its frames instead.
+            if result.needs_repaint
+                && let Err(error) = attached.map.discarding().request_repaint()
+            {
+                eprintln!("asking for a repaint failed: {error}");
+            }
+            self.ready = Some(result);
+        }
+        // A frame waiting to be read back holds the next demand back: driver
+        // work runs in order, so a demand armed now could draw a whole frame
+        // ahead of the readback that render() is about to ask for. render()
+        // arms it once the readback is queued.
+        if self.ready.is_none() {
+            self.arm();
+        }
+    }
+
+    /// Keeps one demand waiting for the map's next update, so every update the
+    /// map publishes gets drawn without this thread having to ask each time.
+    fn arm(&mut self) {
+        let Some(attached) = &self.map else { return };
+        arm_demand(&attached.session, &mut self.armed, &mut self.next_token);
+    }
+
+    /// Waits for the session to draw a frame.
+    fn wait_for_frame(&mut self) -> Option<RenderFrameResult> {
+        let deadline = Instant::now() + NATIVE_TIMEOUT;
+        loop {
+            let seen = self.inbox.seen();
+            self.collect_results();
+            if let Some(result) = self.ready.take() {
+                return Some(result);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                eprintln!("the map drew no frame in {NATIVE_TIMEOUT:?}");
+                return None;
+            }
+            self.inbox.wait_past(seen, deadline - now);
+        }
+    }
+
     /// Renders one frame, first bringing the band layers up to date.
     fn render(&mut self) -> Option<Frame> {
         self.ensure_map()?;
-        self.sync_bands();
-        self.sync_light();
+        // Only on a change: every command publishes a map update, which the
+        // armed demand then draws, so sending them unconditionally would keep
+        // the map drawing forever.
+        if self.dirty {
+            self.sync_bands();
+            self.sync_light();
+            self.sync_camera();
+            // A frame was asked for, so make sure there is an update to draw
+            // even when nothing above changed what the map shows.
+            if let Some(attached) = &self.map
+                && let Err(error) = attached.map.discarding().request_repaint()
+            {
+                eprintln!("asking for a repaint failed: {error}");
+            }
+            // Anything already drawn predates the change.
+            self.ready = None;
+        }
         // Carried on every frame rather than announced once: a frame is allowed
         // to be dropped or superseded, and a one-shot riding on one that was
         // would be lost for good.
         let attribution = self.attribution.clone();
 
-        if let Some((camera, duration_ms, id)) = self.pending_fly.take() {
-            let mut animation = AnimationOptions::default();
-            animation.duration_ms = duration_ms;
-            animation.transition_id = Some(id);
-            let attached = self.map.as_ref()?;
-            if let Err(error) = attached
-                .map
-                .fly_to(&camera_options(camera), Some(&animation))
-            {
-                eprintln!("starting the fly-to failed: {error}");
-                self.flight_id = None;
+        let mut clock = Instant::now();
+        let result = match self.ready.take() {
+            Some(result) => result,
+            None => {
+                let Some(result) = self.wait_for_frame() else {
+                    self.dirty = false;
+                    return None;
+                };
+                result
             }
-        } else if self.flight_id.is_none() {
-            // The map drives its own camera while a flight is in the air.
-            let camera = camera_options(self.camera);
-            let attached = self.map.as_ref()?;
-            if let Err(error) = attached.map.jump_to(&camera) {
-                eprintln!("moving the camera failed: {error}");
-            }
+        };
+
+        phase(PHASE_WAIT, &mut clock);
+        #[cfg(shared_frames)]
+        if let Some(ring) = self.map.as_ref()?.ring.clone() {
+            let shared = self.acquire_shared(ring);
+            self.dirty = false;
+            let shared = shared?;
+            return Some(self.finish_frame(&result, attribution, Vec::new(), Some(shared)));
         }
         let attached = self.map.as_ref()?;
-        if let Err(error) = attached.session.render_update() {
-            eprintln!("rendering failed: {error}");
-            self.dirty = false;
-            return None;
-        }
-
-        let (width, height) = self.size;
-        let expected = width as usize * height as usize * 4;
-        if self.pixels.len() != expected {
-            self.pixels = vec![0; expected];
-        }
-        let info = match attached
-            .session
-            .read_premultiplied_rgba8_into(&mut self.pixels)
+        let read = attached.session.read_texture();
+        // Queued behind the readback, so the next frame draws while this one is
+        // copied out and handed to Slint rather than ahead of the readback.
+        arm_demand(&attached.session, &mut self.armed, &mut self.next_token);
+        let readback = match read
+            .map_err(|error| error.to_string())
+            .and_then(|read| drive(&self.inbox, Some(&attached.session), read))
         {
-            Ok(info) => info,
+            Ok(readback) => readback,
             Err(error) => {
                 eprintln!("reading the frame back failed: {error}");
                 self.dirty = false;
@@ -986,65 +1462,195 @@ impl Engine {
         };
 
         self.dirty = false;
+        phase(PHASE_READ, &mut clock);
 
         // Slint builds the pixel buffer from the reported dimensions, so a
         // mismatch would panic the UI thread rather than show a bad frame.
-        if (info.width, info.height) != (width, height) {
+        let (width, height) = self.size;
+        let info = readback.info;
+        let row = width as usize * 4;
+        let stride = info.stride as usize;
+        if (info.width, info.height) != (width, height)
+            || stride < row
+            || readback.data.len() < stride * height as usize
+        {
             eprintln!(
-                "skipping a frame: read back {}x{}, expected {width}x{height}",
+                "skipping a frame: read back {}x{} (stride {stride}), expected {width}x{height}",
                 info.width, info.height
             );
             return None;
         }
+        self.pixels.resize(row * height as usize, 0);
+        for (target, source) in self
+            .pixels
+            .chunks_exact_mut(row)
+            .zip(readback.data.chunks(stride))
+        {
+            target.copy_from_slice(&source[..row]);
+        }
+        phase(PHASE_COPY, &mut clock);
 
+        Some(self.finish_frame(
+            &result,
+            attribution,
+            self.pixels.clone(),
+            SharedSlot::default(),
+        ))
+    }
+
+    /// Wraps a drawn frame for the UI, with the camera and flight state it
+    /// was drawn with.
+    fn finish_frame(
+        &mut self,
+        result: &RenderFrameResult,
+        attribution: Option<String>,
+        rgba: Vec<u8>,
+        shared: SharedSlot,
+    ) -> Frame {
         // While the map owns the camera, hand it back with the frame so the UI
         // can follow. `flying` also tells the UI when it has landed.
         //
         // The landing frame needs `report_camera` to carry it: `flight_id` is
-        // cleared when the transition-finished event arrives, which is in the
-        // pump before this render, so `flying` is already false here. Without
-        // it the UI's last sample stays the mid-flight one — short of the
-        // destination, and visibly so in the zoom, which is what the map is
+        // cleared when the transition's end handler fires, which is picked up
+        // in the pump before this render, so `flying` is already false here.
+        // Without it the UI's last sample stays the mid-flight one — short of
+        // the destination, and visibly so in the zoom, which is what the map is
         // still easing when the last airborne frame is drawn.
+        //
+        // The camera is the one this frame drew, so it matches the picture.
         let flying = self.flight_id.is_some();
         let report = flying || std::mem::take(&mut self.report_camera);
-        let camera = report
-            .then(|| self.map.as_ref().and_then(|a| a.map.camera().ok()))
-            .flatten()
-            .map(|camera| MapCamera {
-                lat: camera
-                    .center
-                    .map_or(self.camera.lat, |center| center.latitude),
-                lon: camera
-                    .center
-                    .map_or(self.camera.lon, |center| center.longitude),
-                zoom: camera.zoom.unwrap_or(self.camera.zoom),
-                bearing: camera.bearing.unwrap_or(self.camera.bearing),
-                pitch: camera.pitch.unwrap_or(self.camera.pitch),
-            });
+        let camera = report.then(|| MapCamera::reported(&result.view.camera));
         if let Some(camera) = camera {
             self.camera = camera;
         }
 
-        Some(Frame {
+        let (width, height) = self.size;
+        #[cfg(not(shared_frames))]
+        let () = shared;
+        Frame {
             width,
             height,
-            rgba: self.pixels.clone(),
+            rgba,
+            #[cfg(shared_frames)]
+            shared,
             attribution,
             camera,
             flying,
             flight: self.last_flight,
-        })
+        }
+    }
+
+    /// Takes the newest frame the session drew into the shared ring, handing
+    /// back any older ones nobody will show, and arms the next demand.
+    #[cfg(shared_frames)]
+    fn acquire_shared(
+        &mut self,
+        ring: Arc<super::shared::Ring>,
+    ) -> Option<super::shared::SharedFrame> {
+        use super::shared::SharedFrame;
+        let attached = self.map.as_ref()?;
+        let mut newest: Option<SharedFrame> = None;
+        loop {
+            match attached.session.acquire_frame() {
+                Ok(Some(handle)) => {
+                    let slot = handle.view().and_then(|view| super::shared::slot(&view));
+                    let slot = match slot {
+                        Ok(slot) => slot as usize,
+                        Err(error) => {
+                            eprintln!("reading a frame's slot failed: {error}");
+                            if let Err((_, error)) = handle.release(None) {
+                                eprintln!("releasing a map frame failed: {error}");
+                            }
+                            continue;
+                        }
+                    };
+                    // An older one is replaced, and dropping it releases it.
+                    newest = Some(SharedFrame::new(Arc::clone(&ring), slot, handle));
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("acquiring a frame failed: {error}");
+                    break;
+                }
+            }
+        }
+        // Queued once the frame is acquired, so it draws into another slot.
+        arm_demand(&attached.session, &mut self.armed, &mut self.next_token);
+        newest
+    }
+
+    /// Starts a fly-to that is waiting, or otherwise puts the camera where the
+    /// UI has it. The map drives its own camera while a flight is in the air.
+    fn sync_camera(&mut self) {
+        let Some(attached) = &self.map else { return };
+        if let Some((camera, duration_ms, id)) = self.pending_fly.take() {
+            let inbox = Arc::clone(&self.inbox);
+            let update = CameraUpdate {
+                mode: CameraUpdateMode::Fly,
+                camera: camera_options(camera),
+                animation: AnimationOptions {
+                    duration_ms,
+                    transition_id: Some(id),
+                    // Runs on the runtime's worker however the flight ends:
+                    // landed, cancelled, or the map closing under it.
+                    end_handler: CameraTransitionHandler::new(move |_| {
+                        inbox.raise(|state| state.landed.push(id));
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if let Err(error) = attached.map.discarding().update_camera(&update) {
+                eprintln!("starting the fly-to failed: {error}");
+                self.flight_id = None;
+            }
+        } else if self.flight_id.is_none() {
+            let update = CameraUpdate {
+                mode: CameraUpdateMode::Jump,
+                camera: camera_options(self.camera),
+                ..Default::default()
+            };
+            if let Err(error) = attached.map.discarding().update_camera(&update) {
+                eprintln!("moving the camera failed: {error}");
+            }
+        }
     }
 
     /// Brings up the runtime, map and render session, and loads the style.
     fn ensure_map(&mut self) -> Option<()> {
+        #[cfg(shared_frames)]
+        if self.unattached.is_some() {
+            self.attach_unattached();
+            if self.map.is_none() && self.unattached.is_some() {
+                return None;
+            }
+        }
         if self.runtime.is_none() {
-            let mut options = RuntimeOptions::default();
-            options.cache_path = Some(self.cache.to_string_lossy().into_owned());
-            match RuntimeHandle::with_options(&options) {
+            let cache = self.cache.to_string_lossy().into_owned();
+            let options = RuntimeOptions {
+                // Empty is the platform's default: the APK's assets on Android.
+                asset_path: asset_root().unwrap_or_default(),
+                cache_path: &cache,
+            };
+            match RuntimeHandle::create(&options) {
                 Ok(runtime) => {
+                    // Before the map exists, so its first events are not missed.
+                    let inbox = Arc::clone(&self.inbox);
+                    if let Err(error) =
+                        runtime
+                            .discarding()
+                            .set_event_handler(RuntimeEventHandler::new(move |events| {
+                                inbox.raise(|state| state.events.extend(events));
+                            }))
+                    {
+                        eprintln!("listening for map events failed: {error}");
+                    }
                     // Before any request goes out, which the style load starts.
+                    #[cfg(not(target_os = "android"))]
+                    if let Err(error) = crate::map::bundled::install(&runtime) {
+                        eprintln!("serving the bundled glyphs and sprite failed: {error}");
+                    }
                     #[cfg(target_os = "android")]
                     if let Err(error) = crate::map::fetch::install(&runtime) {
                         eprintln!("serving the map's own requests failed: {error}");
@@ -1063,9 +1669,17 @@ impl Engine {
 
         let runtime = self.runtime.as_ref()?;
         let (width, height) = self.size;
-        let mut options = MapOptions::new(width, height, 1.0);
-        options.mode = MapMode::Continuous;
-        let map = match MapHandle::with_options(runtime, &options) {
+        let mut options = MapOptions::new(LogicalExtent::new(width, height, 1.0));
+        options.map_mode = MapMode::Continuous;
+        // A map queues no event of an unselected type, and this is the only one
+        // the engine reads: frames, and the end of a flight, arrive on their
+        // own.
+        options.event_mask = Some(RuntimeEventFlag::MAP_STYLE_LOADED);
+        let map = match runtime
+            .create_map(&options)
+            .map_err(|error| error.to_string())
+            .and_then(|(map, ready)| drive(&self.inbox, None, ready).map(|()| map))
+        {
             Ok(map) => map,
             Err(error) => {
                 eprintln!("creating the map failed: {error}");
@@ -1073,37 +1687,29 @@ impl Engine {
             }
         };
 
-        // A map queues no event of an unselected type, so this comes before the
-        // style load.
-        if let Err(error) = map.set_event_mask(
-            RuntimeEventMask::MAP_RENDER_UPDATE_AVAILABLE
-                | RuntimeEventMask::MAP_RENDER_FRAME_FINISHED
-                | RuntimeEventMask::MAP_STYLE_LOADED
-                | RuntimeEventMask::MAP_CAMERA_TRANSITION_FINISHED,
-        ) {
-            eprintln!("selecting map events failed: {error}");
-        }
         // Raise the pitch bound before any camera goes in: MapLibre Native
         // clamps at 60 by default and would silently hold anything steeper.
-        let mut bounds = BoundOptions::default();
-        bounds.max_pitch = Some(MAX_PITCH);
-        if let Err(error) = map.set_bounds(&bounds) {
+        let bounds = BoundOptions {
+            max_pitch: Some(MAX_PITCH),
+            ..Default::default()
+        };
+        if let Err(error) = map.discarding().set_bounds(&bounds) {
             eprintln!("raising the pitch bound failed: {error}");
         }
-        if let Some(prefetch_zoom_delta) = prefetch_zoom_delta() {
-            // Non-exhaustive, so the fields are filled in rather than named.
-            let mut options = MapTileOptions::default();
-            options.prefetch_zoom_delta = Some(prefetch_zoom_delta);
-            if let Err(error) = map.set_tile_options(&options) {
-                eprintln!("setting the tile options failed: {error}");
-            }
+        let options = MapTileOptions {
+            lod_mode: Some(tile_lod_mode()),
+            prefetch_zoom_delta: prefetch_zoom_delta(),
+            ..Default::default()
+        };
+        if let Err(error) = map.discarding().set_tile_options(&options) {
+            eprintln!("setting the tile options failed: {error}");
         }
-        if let Err(error) = map.set_style_url(&self.style_url) {
+        if let Err(error) = set_style(&map, self.style_url.as_deref()) {
             eprintln!("style load failed: {error}");
         }
 
-        let session = match attach_render_target(&map, self.size) {
-            Ok(session) => session,
+        let (session, ring) = match self.attach_target(&map) {
+            Ok(target) => target,
             Err(error) => {
                 eprintln!("attaching the render target failed: {error}");
                 return None;
@@ -1114,8 +1720,102 @@ impl Engine {
             session,
             layers: false,
             style_loaded: false,
+            ring,
         });
+        self.armed = None;
+        self.ready = None;
+        self.arm();
         Some(())
+    }
+
+    /// Attaches the session the map renders through: a shared ring when
+    /// frames are shared, otherwise a texture this thread reads back.
+    fn attach_target(&self, map: &MapHandle) -> Result<(RenderSessionHandle, SharedRing), String> {
+        #[cfg(shared_frames)]
+        if self.share {
+            return attach_shared(map, self.size, &self.inbox)
+                .map(|(session, ring)| (session, Some(ring)));
+        }
+        #[cfg(shared_frames)]
+        return attach_render_target(map, self.size, &self.inbox).map(|session| (session, None));
+        #[cfg(not(shared_frames))]
+        attach_render_target(map, self.size, &self.inbox).map(|session| (session, ()))
+    }
+
+    /// Replaces a shared ring's session with one at the current size, keeping
+    /// the map. A ring's images have a fixed size, and both swapping them in
+    /// place and detaching are refused while a frame is acquired, which the
+    /// one on screen always is. Disposing is not: the old session retires once
+    /// the UI hands its last frame back, and its ring is kept until then.
+    #[cfg(shared_frames)]
+    fn reattach(&mut self) -> Result<(), String> {
+        let Some(attached) = self.map.take() else {
+            return Ok(());
+        };
+        let Attached {
+            map,
+            session,
+            layers,
+            style_loaded,
+            ring,
+        } = attached;
+        if let Err((_, error)) = session.dispose() {
+            eprintln!("disposing of the old render target failed: {error}");
+        }
+        if let Some(ring) = ring {
+            ring.dispose();
+            self.retired.push((ring, Instant::now()));
+        }
+        self.armed = None;
+        self.ready = None;
+        self.unattached = Some(Unattached {
+            map,
+            layers,
+            style_loaded,
+            since: Instant::now(),
+        });
+        self.attach_unattached();
+        Ok(())
+    }
+
+    /// Attaches a new session to a map whose old one was disposed of, once the
+    /// old one has retired. Until then the map refuses it, and this is tried
+    /// again on the next pass; past [`NATIVE_TIMEOUT`] the map is rebuilt.
+    #[cfg(shared_frames)]
+    fn attach_unattached(&mut self) {
+        let Some(unattached) = self.unattached.take() else {
+            return;
+        };
+        match self.attach_target(&unattached.map) {
+            Ok((session, ring)) => {
+                self.map = Some(Attached {
+                    map: unattached.map,
+                    session,
+                    layers: unattached.layers,
+                    style_loaded: unattached.style_loaded,
+                    ring,
+                });
+                self.arm();
+                self.mark_dirty();
+            }
+            Err(_) if unattached.since.elapsed() < NATIVE_TIMEOUT => {
+                self.unattached = Some(unattached);
+            }
+            Err(error) => {
+                eprintln!("attaching a new render target failed: {error}; rebuilding the map");
+                self.applied = [None; SLICES];
+                self.applied_light = None;
+            }
+        }
+    }
+
+    /// Lets go of rings whose session has been disposed of, once no frame of
+    /// them is left on screen and the session has had time to retire.
+    #[cfg(shared_frames)]
+    fn prune_retired(&mut self) {
+        self.retired.retain(|(ring, since)| {
+            Arc::strong_count(ring) > 1 || since.elapsed() < NATIVE_TIMEOUT
+        });
     }
 
     /// Brings the band layers up to date.
@@ -1131,16 +1831,18 @@ impl Engine {
     fn sync_bands(&mut self) {
         let Some(attached) = &self.map else { return };
         // A layer naming a source the style has not loaded yet is rejected, and
-        // `set_style_url` only starts the load.
+        // `set_style` only starts the load.
         if !attached.style_loaded {
             return;
         }
         if !attached.layers {
             for slice in 0..SLICES {
                 let json = building_layer_json(slice, 1, &building_layer_id(slice));
+                // An empty `before` appends the layer.
                 if let Err(error) = attached
                     .map
-                    .add_style_layer_json(json.to_string().as_bytes(), None)
+                    .discarding()
+                    .add_style_layer_json(&json.to_string(), "")
                 {
                     eprintln!("adding building layer {slice} failed: {error}");
                     return;
@@ -1164,10 +1866,11 @@ impl Engine {
             }
             let id = building_layer_id(slice);
             let height = serde_json::json!(target.height).to_string();
-            match attached
-                .map
-                .set_layer_property(&id, "fill-extrusion-height", height.as_bytes())
-            {
+            match attached.map.discarding().set_style_layer_property(
+                &id,
+                "fill-extrusion-height",
+                &height,
+            ) {
                 Ok(()) => self.applied[slice] = Some(target),
                 Err(error) => eprintln!("updating building layer {slice} failed: {error}"),
             }
@@ -1182,8 +1885,6 @@ impl Engine {
     /// and how much height each covers. A shown layer is widened to span the
     /// slices hidden behind it, so the skyline stays whole either way.
     fn sync_slices(&mut self) {
-        use maplibre_native_ffi::StyleLayerVisibility;
-
         if self.applied_slices == Some(self.slices) {
             return;
         }
@@ -1193,12 +1894,14 @@ impl Engine {
         for slice in 0..SLICES {
             let id = building_layer_id(slice);
             let shown = slice.is_multiple_of(step);
-            let visibility = if shown {
-                StyleLayerVisibility::Visible
-            } else {
-                StyleLayerVisibility::None
-            };
-            if let Err(error) = attached.map.set_layer_visibility(&id, visibility) {
+            // Style-spec JSON, so the strings keep their quotes.
+            let visibility = if shown { r#""visible""# } else { r#""none""# };
+            if let Err(error) =
+                attached
+                    .map
+                    .discarding()
+                    .set_style_layer_property(&id, "visibility", visibility)
+            {
                 eprintln!("showing building layer {slice} failed: {error}");
                 return;
             }
@@ -1206,10 +1909,11 @@ impl Engine {
                 continue;
             }
             let filter = building_layer_filter(slice, step);
-            if let Err(error) = attached
-                .map
-                .set_layer_filter(&id, Some(filter.to_string().as_bytes()))
-            {
+            if let Err(error) = attached.map.discarding().set_style_layer_property(
+                &id,
+                "filter",
+                &filter.to_string(),
+            ) {
                 eprintln!("refiltering building layer {slice} failed: {error}");
                 return;
             }
@@ -1242,10 +1946,10 @@ impl Engine {
                 None => BUILDING_COLOR.to_owned(),
             };
             let color = serde_json::json!(color).to_string();
-            if let Err(error) = attached.map.set_layer_property(
+            if let Err(error) = attached.map.discarding().set_style_layer_property(
                 &building_layer_id(slice),
                 "fill-extrusion-color",
-                color.as_bytes(),
+                &color,
             ) {
                 eprintln!("recolouring building layer {slice} failed: {error}");
                 return;
@@ -1278,14 +1982,10 @@ impl Engine {
         ))
         .to_string();
         let intensity = serde_json::json!(self.light.intensity).to_string();
-        let set = attached
-            .map
-            .set_style_light_property("color", color.as_bytes())
-            .and_then(|()| {
-                attached
-                    .map
-                    .set_style_light_property("intensity", intensity.as_bytes())
-            });
+        let map = attached.map.discarding();
+        let set = map
+            .set_style_light_property("color", &color)
+            .and_then(|()| map.set_style_light_property("intensity", &intensity));
         match set {
             Ok(()) => self.applied_light = Some(self.light),
             Err(error) => {
@@ -1315,16 +2015,21 @@ impl Engine {
         }
         self.attribution_attempts += 1;
 
-        let ids = attached.map.style_source_ids().unwrap_or_default();
+        let sources = match attached
+            .map
+            .list_style_sources()
+            .map_err(|error| error.to_string())
+            .and_then(|query| drive(&self.inbox, None, query))
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                eprintln!("listing the style's sources failed: {error}");
+                return;
+            }
+        };
         let mut credits: Vec<String> = Vec::new();
-        for id in ids {
-            let Ok(Some(info)) = attached.map.style_source_info(&id) else {
-                continue;
-            };
-            let Some(attribution) = info.attribution else {
-                continue;
-            };
-            let text = attribution_text(&attribution);
+        for source in sources {
+            let text = attribution_text(&source.attribution);
             if !text.is_empty() && !credits.contains(&text) {
                 credits.push(text);
             }
@@ -1337,26 +2042,83 @@ impl Engine {
         self.mark_dirty();
     }
 
-    /// Closes the map and runtime in order, so the tile cache is flushed rather
-    /// than cut off.
+    /// Closes the session, map and runtime in order, so the tile cache is
+    /// flushed rather than cut off.
     fn close(&mut self) {
-        if let Some(attached) = self.map.take() {
-            drop(attached.session);
-            if let Err(error) = attached.map.close() {
-                eprintln!("closing the map failed: {error}");
+        let report = |what: &str, result: Result<(), String>| {
+            if let Err(error) = result {
+                eprintln!("{what} failed: {error}");
             }
-        }
-        if let Some(runtime) = self.runtime.take()
-            && let Err(error) = runtime.close()
+        };
+        if let Some(Attached {
+            map, session, ring, ..
+        }) = self.map.take()
         {
-            eprintln!("closing the map runtime failed: {error}");
+            // A shared ring may still have a frame out, which detaching
+            // refuses; disposing waits for it instead, and closing the map
+            // below waits for that. The ring outlives both.
+            #[cfg(shared_frames)]
+            let session = match ring {
+                Some(_) => {
+                    if let Err((_, error)) = session.dispose() {
+                        eprintln!("disposing of the render target failed: {error}");
+                    }
+                    None
+                }
+                None => Some(session),
+            };
+            #[cfg(not(shared_frames))]
+            let (session, _) = (Some(session), ring);
+            if let Some(session) = session {
+                // Detaching is driver work like any other, so it is serviced here;
+                // a released session takes no more service calls.
+                report(
+                    "detaching the render target",
+                    session
+                        .detach()
+                        .map_err(|error| error.to_string())
+                        .and_then(|detached| drive(&self.inbox, Some(&session), detached)),
+                );
+                report(
+                    "releasing the render target",
+                    session
+                        .release()
+                        .map_err(|(_, error)| error.to_string())
+                        .and_then(|released| drive(&self.inbox, None, released)),
+                );
+            }
+            report(
+                "closing the map",
+                map.release()
+                    .map_err(|(_, error)| error.to_string())
+                    .and_then(|released| drive(&self.inbox, None, released)),
+            );
         }
+        #[cfg(shared_frames)]
+        if let Some(Unattached { map, .. }) = self.unattached.take() {
+            report(
+                "closing the map",
+                map.release()
+                    .map_err(|(_, error)| error.to_string())
+                    .and_then(|released| drive(&self.inbox, None, released)),
+            );
+        }
+        if let Some(runtime) = self.runtime.take() {
+            report(
+                "closing the map runtime",
+                runtime
+                    .release()
+                    .map_err(|(_, error)| error.to_string())
+                    .and_then(|released| drive(&self.inbox, None, released)),
+            );
+        }
+        self.armed = None;
+        self.ready = None;
     }
 }
 
-/// MapLibre Native allows one runtime per owning thread, so an engine that goes
-/// out of scope without giving its own up leaves that thread unable to build
-/// another. The app only ever has one, but the tests share a thread.
+/// Closing waits for the tile cache to be written out, which a thread that is
+/// simply cut off would not do.
 impl Drop for Engine {
     fn drop(&mut self) {
         self.close();
@@ -1367,11 +2129,23 @@ impl Drop for Engine {
 /// runtime, then render at most one frame per pass.
 fn render_thread(
     size: (u32, u32),
+    share: bool,
     commands: Receiver<Command>,
     frames: SyncSender<Frame>,
     rendered: &AtomicU64,
+    on_frame: &dyn Fn(),
 ) {
     let mut engine = Engine::new(size);
+    #[cfg(all(shared_frames, feature = "vulkan"))]
+    {
+        engine.share = share && vulkan_context().exports_memory;
+    }
+    #[cfg(all(shared_frames, feature = "metal"))]
+    {
+        engine.share = share;
+    }
+    #[cfg(not(shared_frames))]
+    let _ = share;
     loop {
         // Only park when there is nothing to draw.
         if !engine.wants_frame() {
@@ -1400,6 +2174,8 @@ fn render_thread(
         // The runtime has to turn whether or not a frame is wanted: that is how
         // tile loads finish and how the map says it wants another one.
         engine.pump(Some(PUMP_BUDGET));
+        #[cfg(shared_frames)]
+        engine.prune_retired();
         if !engine.wants_frame() {
             continue;
         }
@@ -1408,31 +2184,61 @@ fn render_thread(
             // Drop the frame rather than stall if the UI has not consumed the
             // previous one yet.
             let carried_camera = frame.camera.is_some();
-            if frames.try_send(frame).is_err() && carried_camera {
+            match frames.try_send(frame) {
+                Ok(()) => on_frame(),
                 // A dropped frame is no loss on its own, but the camera it was
                 // carrying is: nothing else will tell the UI where the map
                 // stopped.
-                engine.request_camera_report();
+                Err(_) if carried_camera => engine.request_camera_report(),
+                Err(_) => {}
             }
         }
     }
     // `Drop` closes it; naming it here as well would only be a second way in.
 }
 
-/// Attaches a render target the map draws into and this thread reads back.
+/// Attaches a render target the map draws into and this thread reads back,
+/// and waits for it to be ready.
 ///
 /// The backend is chosen at compile time to match the `maplibre-native-ffi`
 /// feature in `Cargo.toml`; the FFI hands the graphics plumbing to the caller,
 /// so the device comes from here.
-#[cfg(feature = "metal")]
 fn attach_render_target(
     map: &MapHandle,
     size: (u32, u32),
-) -> maplibre_native_ffi::Result<RenderSessionHandle> {
-    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
-    let context = MetalContextDescriptor::new(metal_device());
-    map.attach_ref()?
-        .attach_metal_owned_texture(&MetalOwnedTextureDescriptor::new(extent, context))
+    inbox: &Arc<Inbox>,
+) -> Result<RenderSessionHandle, String> {
+    let options = RenderSessionAttachOptions {
+        frame_wake: inbox_wake(inbox),
+        driver_work_wake: inbox_wake(inbox),
+        ..RenderSessionAttachOptions::new(DRIVER)
+    };
+    let extent = LogicalExtent::new(size.0, size.1, 1.0);
+    let (session, attached) =
+        attach_owned_texture(map, extent, &options).map_err(|error| error.to_string())?;
+    drive(inbox, Some(&session), attached)?;
+    Ok(session)
+}
+
+/// Attaches a Metal owned-texture render target.
+#[cfg(feature = "metal")]
+fn attach_owned_texture(
+    map: &MapHandle,
+    extent: LogicalExtent,
+    options: &RenderSessionAttachOptions,
+) -> maplibre_native_ffi::Result<(RenderSessionHandle, NativeFuture<()>)> {
+    use maplibre_native_ffi::{MetalContextDescriptor, MetalOwnedTextureDescriptor};
+
+    let descriptor = MetalOwnedTextureDescriptor {
+        extent,
+        context: MetalContextDescriptor {
+            device: metal_device(),
+        },
+        // MTLPixelFormatBGRA8Unorm. The readback converts to RGBA either way.
+        pixel_format: 80,
+    };
+    // SAFETY: the device is leaked in `metal_device`, so it outlives the session.
+    unsafe { map.attach_metal_owned_texture(&descriptor, options) }
 }
 
 /// Attaches a Vulkan owned-texture render target.
@@ -1441,57 +2247,168 @@ fn attach_render_target(
 /// surface extensions. MapLibre Native draws into a texture the session owns
 /// and this thread reads it back.
 #[cfg(feature = "vulkan")]
-fn attach_render_target(
+fn attach_owned_texture(
+    map: &MapHandle,
+    extent: LogicalExtent,
+    options: &RenderSessionAttachOptions,
+) -> maplibre_native_ffi::Result<(RenderSessionHandle, NativeFuture<()>)> {
+    use maplibre_native_ffi::VulkanOwnedTextureDescriptor;
+
+    let context = vulkan_context_descriptor(vulkan_context());
+    // SAFETY: every address names an object leaked in `create_vulkan_context`,
+    // so all of them outlive this session.
+    unsafe {
+        map.attach_vulkan_owned_texture(
+            &VulkanOwnedTextureDescriptor::new(extent, context),
+            options,
+        )
+    }
+}
+
+/// The context MapLibre Native borrows: the process-wide device.
+#[cfg(feature = "vulkan")]
+fn vulkan_context_descriptor(
+    vulkan: &VulkanContext,
+) -> maplibre_native_ffi::VulkanContextDescriptor {
+    let pointer = |address: usize| address as *mut std::ffi::c_void;
+    maplibre_native_ffi::VulkanContextDescriptor {
+        instance: pointer(vulkan.instance),
+        physical_device: pointer(vulkan.physical_device),
+        device: pointer(vulkan.device),
+        graphics_queue: pointer(vulkan.graphics_queue),
+        graphics_queue_family_index: vulkan.graphics_queue_family_index,
+        // Let MapLibre Native resolve its entry points through the same loader
+        // rather than assuming a system one.
+        get_instance_proc_addr: pointer(vulkan.get_instance_proc_addr),
+        get_device_proc_addr: pointer(vulkan.get_device_proc_addr),
+    }
+}
+
+/// Attaches a ring of images the window's device imports, so frames reach
+/// the screen without a readback; see `shared`.
+#[cfg(all(shared_frames, feature = "vulkan"))]
+fn attach_shared(
     map: &MapHandle,
     size: (u32, u32),
-) -> maplibre_native_ffi::Result<RenderSessionHandle> {
+    inbox: &Arc<Inbox>,
+) -> Result<(RenderSessionHandle, Arc<super::shared::Ring>), String> {
+    use super::shared::{FORMAT, Producer, Ring};
+    use ash::vk::{self, Handle};
+    use maplibre_native_ffi::{VulkanBorrowedTexture, VulkanBorrowedTextureDescriptor};
+
     let vulkan = vulkan_context();
-    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
-    // SAFETY: every address below names an object leaked in
-    // `create_vulkan_context`, so all of them outlive this session.
-    let pointer = |address: usize| unsafe { NativePointer::from_address(address) };
-    let mut context = VulkanContextDescriptor::new(
-        pointer(vulkan.instance),
-        pointer(vulkan.physical_device),
-        pointer(vulkan.device),
-        pointer(vulkan.graphics_queue),
-        vulkan.graphics_queue_family_index,
+    let ring = Ring::new(
+        &Producer {
+            instance: &vulkan.ash_instance,
+            physical_device: vk::PhysicalDevice::from_raw(vulkan.physical_device as u64),
+            device: &vulkan.ash_device,
+        },
+        size.0,
+        size.1,
+    )?;
+    let textures = ring
+        .textures()
+        .into_iter()
+        .map(|(image, view)| VulkanBorrowedTexture::new(image, view))
+        .collect();
+    // Left ready to sample. The initial layout stays undefined: every frame
+    // is drawn from scratch, so what a slot held before does not matter, and
+    // a frame can be released without changing its layout back.
+    let descriptor = VulkanBorrowedTextureDescriptor::new(
+        LogicalExtent::new(size.0, size.1, 1.0),
+        ring.width(),
+        ring.height(),
+        vulkan_context_descriptor(vulkan),
+        textures,
+        FORMAT.as_raw() as u32,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw() as u32,
     );
-    // Let MapLibre Native resolve its entry points through the same loader
-    // rather than assuming a system one.
-    context.get_instance_proc_addr = pointer(vulkan.get_instance_proc_addr);
-    context.get_device_proc_addr = pointer(vulkan.get_device_proc_addr);
-    map.attach_ref()?
-        .attach_vulkan_owned_texture(&VulkanOwnedTextureDescriptor::new(extent, context))
+    let options = RenderSessionAttachOptions {
+        frame_wake: inbox_wake(inbox),
+        driver_work_wake: inbox_wake(inbox),
+        ..RenderSessionAttachOptions::new(DRIVER)
+    };
+    // SAFETY: the context's objects are leaked for the process, and the ring's
+    // images live as long as the `Arc` the session's owner keeps.
+    let (session, attached) = unsafe { map.attach_vulkan_borrowed_texture(&descriptor, &options) }
+        .map_err(|error| error.to_string())?;
+    drive(inbox, Some(&session), attached)?;
+    Ok((session, ring))
+}
+
+/// Attaches a ring of textures on the window's own Metal device, so frames
+/// reach the screen without a readback; see `shared`.
+#[cfg(all(shared_frames, feature = "metal"))]
+fn attach_shared(
+    map: &MapHandle,
+    size: (u32, u32),
+    inbox: &Arc<Inbox>,
+) -> Result<(RenderSessionHandle, Arc<super::shared::Ring>), String> {
+    use super::shared::{Producer, Ring};
+    use maplibre_native_ffi::{MetalBorrowedTexture, MetalBorrowedTextureDescriptor};
+
+    let ring = Ring::new(
+        &Producer {
+            device: metal_device(),
+        },
+        size.0,
+        size.1,
+    )?;
+    let textures = ring
+        .textures()
+        .into_iter()
+        .map(MetalBorrowedTexture::new)
+        .collect();
+    let descriptor = MetalBorrowedTextureDescriptor::new(
+        LogicalExtent::new(size.0, size.1, 1.0),
+        ring.width(),
+        ring.height(),
+        textures,
+    );
+    let options = RenderSessionAttachOptions {
+        frame_wake: inbox_wake(inbox),
+        driver_work_wake: inbox_wake(inbox),
+        ..RenderSessionAttachOptions::new(DRIVER)
+    };
+    // SAFETY: the textures are on the device the map renders with, and live as
+    // long as the `Arc` the session's owner keeps.
+    let (session, attached) = unsafe { map.attach_metal_borrowed_texture(&descriptor, &options) }
+        .map_err(|error| error.to_string())?;
+    drive(inbox, Some(&session), attached)?;
+    Ok((session, ring))
 }
 
 /// Attaches an OpenGL owned-texture render target, drawn through EGL.
 ///
 /// Shared ownership: this thread owns an EGL context and keeps it current, and
-/// the session creates its own in the same share group. That is the
-/// configuration `maplibre-native-ffi` exercises for owned textures on Linux.
-/// `get_proc_address` is left null, as it is there — the session resolves its
-/// entry points through the display it is handed.
+/// the session creates its own in the same share group, with its driver work
+/// serviced from here. That is the configuration `maplibre-native-ffi`
+/// exercises for owned textures on Linux. `get_proc_address` is left null, as
+/// it is there — the session resolves its entry points through the display it
+/// is handed.
 #[cfg(feature = "opengl")]
-fn attach_render_target(
+fn attach_owned_texture(
     map: &MapHandle,
-    size: (u32, u32),
-) -> maplibre_native_ffi::Result<RenderSessionHandle> {
+    extent: LogicalExtent,
+    options: &RenderSessionAttachOptions,
+) -> maplibre_native_ffi::Result<(RenderSessionHandle, NativeFuture<()>)> {
     let egl = egl_context();
-    let extent = RenderTargetExtent::new(size.0, size.1, 1.0);
-    // SAFETY: every address below names an object leaked in
-    // `create_egl_context`, so all of them outlive this session.
-    let pointer = |address: usize| unsafe { NativePointer::from_address(address) };
-    let context = EglContextDescriptor::new(
-        pointer(egl.display),
-        pointer(egl.config),
-        pointer(egl.context),
-    );
-    map.attach_ref()?
-        .attach_opengl_owned_texture(&OpenGLOwnedTextureDescriptor::new(
-            extent,
-            OpenGLContextDescriptor::Egl(context),
-        ))
+    let pointer = |address: usize| address as *mut std::ffi::c_void;
+    let context = OpenGlContextDescriptor {
+        ownership: OpenGlContextOwnership::Shared,
+        data: OpenGlContextDescriptorData::Egl(EglContextDescriptor {
+            share_context: pointer(egl.context),
+            ..EglContextDescriptor::new(pointer(egl.display), pointer(egl.config))
+        }),
+    };
+    // SAFETY: every address names an object leaked in `create_egl_context`, so
+    // all of them outlive this session, and the context is current here.
+    unsafe {
+        map.attach_open_gl_owned_texture(
+            &OpenGlOwnedTextureDescriptor::new(extent, context),
+            options,
+        )
+    }
 }
 
 /// The EGL handles a render target borrows, as plain addresses for the same
@@ -1701,21 +2618,29 @@ fn create_egl_context() -> Result<EglContext, Box<dyn std::error::Error>> {
     };
 
     // Deliberate, as on the Vulkan path: the render target borrows these for as
-    // long as the thread runs, and tearing them down under a live session would
-    // be a use-after-free.
-    std::mem::forget(egl);
+    // long as the thread runs, and unloading libEGL under a live session would
+    // be a use-after-free. `egl` itself is only a table of entry points into it.
     std::mem::forget(lib);
     Ok(handles)
 }
 
 /// The handles a Vulkan render target borrows.
 ///
-/// Held as plain addresses because `NativePointer` is deliberately `!Send`, and
-/// this lives in a static. The instance and device behind them are leaked, so
+/// Held as plain addresses because raw pointers are not `Send`, and this lives
+/// in a static. The instance and device behind them are leaked, so
 /// they stay valid for the process — the render target borrows them and a map
 /// may outlive any one session.
 #[cfg(feature = "vulkan")]
 struct VulkanContext {
+    /// The same objects as the addresses below, for creating the images a
+    /// shared ring renders into.
+    #[cfg(target_os = "linux")]
+    ash_instance: ash::Instance,
+    #[cfg(target_os = "linux")]
+    ash_device: ash::Device,
+    /// Whether the device can export memory, which sharing frames needs.
+    #[cfg(target_os = "linux")]
+    exports_memory: bool,
     instance: usize,
     physical_device: usize,
     device: usize,
@@ -1746,7 +2671,7 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
     let app_info = vk::ApplicationInfo::default()
         .application_name(&name)
         .engine_name(&name)
-        .api_version(vk::API_VERSION_1_0);
+        .api_version(vk::API_VERSION_1_1);
     let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
     // SAFETY: instance_info borrows app_info, which outlives this call.
     let instance = unsafe { entry.create_instance(&instance_info, None)? };
@@ -1772,7 +2697,28 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
     let queue_info = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(graphics_queue_family_index)
         .queue_priorities(&priorities)];
-    let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+    // Exporting memory is what lets the window's device show frames without a
+    // readback; see `shared`. Version 1.1 brings the rest of it in core.
+    #[cfg(target_os = "linux")]
+    let exports_memory = {
+        // SAFETY: physical_device came from this instance.
+        let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .unwrap_or_default();
+        extensions.iter().any(|extension| {
+            extension.extension_name_as_c_str() == Ok(ash::khr::external_memory_fd::NAME)
+        })
+    };
+    #[cfg(target_os = "linux")]
+    let enabled: Vec<*const std::ffi::c_char> = if exports_memory {
+        vec![ash::khr::external_memory_fd::NAME.as_ptr()]
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let enabled: Vec<*const std::ffi::c_char> = Vec::new();
+    let device_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_info)
+        .enabled_extension_names(&enabled);
     // SAFETY: physical_device and the queue family were taken from this instance.
     let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
         Ok(device) => device,
@@ -1788,6 +2734,12 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
     // Every handle and function pointer below is kept valid by leaking the
     // entry, instance and device at the end of this function.
     let context = VulkanContext {
+        #[cfg(target_os = "linux")]
+        ash_instance: instance.clone(),
+        #[cfg(target_os = "linux")]
+        ash_device: device.clone(),
+        #[cfg(target_os = "linux")]
+        exports_memory,
         instance: instance.handle().as_raw() as usize,
         physical_device: physical_device.as_raw() as usize,
         device: device.handle().as_raw() as usize,
@@ -1799,8 +2751,8 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
 
     // Deliberate: the render target borrows these for as long as the process
     // runs, and destroying them under a live session would be a use-after-free.
-    std::mem::forget(device);
-    std::mem::forget(instance);
+    // `ash::Device` and `ash::Instance` destroy nothing when dropped, so only
+    // the loader, which would unload the library, needs keeping.
     std::mem::forget(entry);
     Ok(context)
 }
@@ -1809,7 +2761,7 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
 /// Leaked deliberately: it outlives every map, and the render target only
 /// borrows the pointer.
 #[cfg(feature = "metal")]
-fn metal_device() -> NativePointer {
+pub(super) fn metal_device() -> *mut std::ffi::c_void {
     use objc2::rc::Retained;
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
@@ -1823,8 +2775,8 @@ fn metal_device() -> NativePointer {
         std::mem::forget(device);
         address
     });
-    // SAFETY: the device is leaked, so the address stays valid for the process.
-    unsafe { NativePointer::from_address(address) }
+    // The device is leaked, so the address stays valid for the process.
+    address as *mut std::ffi::c_void
 }
 
 /// Where a pinch has zoomed to, from the zoom it started at and the gesture's
@@ -1958,14 +2910,14 @@ fn render_scale() -> f64 {
 }
 
 impl MapCamera {
-    /// This camera with whatever the map reported filled in.
-    fn with(self, reported: &CameraOptions) -> Self {
+    /// The camera the map reported.
+    fn reported(camera: &Camera) -> Self {
         Self {
-            lat: reported.center.map_or(self.lat, |center| center.latitude),
-            lon: reported.center.map_or(self.lon, |center| center.longitude),
-            zoom: reported.zoom.unwrap_or(self.zoom),
-            bearing: reported.bearing.unwrap_or(self.bearing),
-            pitch: reported.pitch.unwrap_or(self.pitch),
+            lat: camera.center.latitude,
+            lon: camera.center.longitude,
+            zoom: camera.zoom,
+            bearing: camera.bearing,
+            pitch: camera.pitch,
         }
     }
 }
@@ -2035,12 +2987,13 @@ fn decode_entity(name: &str) -> String {
 
 /// The camera as MapLibre Native's FFI wants it.
 fn camera_options(camera: MapCamera) -> CameraOptions {
-    let mut options = CameraOptions::default();
-    options.center = Some(LatLng::new(camera.lat, camera.lon));
-    options.zoom = Some(camera.zoom);
-    options.bearing = Some(camera.bearing);
-    options.pitch = Some(camera.pitch);
-    options
+    CameraOptions {
+        center: Some(LatLng::new(camera.lat, camera.lon)),
+        zoom: Some(camera.zoom),
+        bearing: Some(camera.bearing),
+        pitch: Some(camera.pitch),
+        ..Default::default()
+    }
 }
 
 fn clamp_zoom(zoom: f64) -> f64 {
@@ -2106,6 +3059,30 @@ mod tests {
         let mut controller = CameraController::default();
         controller.jump_for_test(lon, lat, zoom);
         controller
+    }
+
+    #[test]
+    fn bundled_sources_are_local_only_when_downloaded() {
+        let style: serde_json::Value = serde_json::from_str(&bundled_style()).unwrap();
+        let sources = style["sources"].as_object().unwrap();
+        assert_eq!(sources.len(), 3);
+        for (id, source) in sources {
+            let url = source["url"].as_str().unwrap();
+            if let Some(path) = url.strip_prefix(LOCAL_PMTILES) {
+                let root = asset_root().expect("local only where there is an asset root");
+                assert!(Path::new(root).join(path).is_file(), "{id}: {url}");
+            } else {
+                let name = url.strip_prefix(REMOTE_PMTILES).expect(url);
+                let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("pmtiles")
+                    .join(name);
+                assert!(
+                    asset_root().is_none() || !local.is_file(),
+                    "{id} went to the server with {} on disk",
+                    local.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2830,6 +3807,65 @@ mod tests {
             "{}x{} — still: {still:.1} fps, camera only: {camera:.1} fps, camera + {} bands: {playing:.1} fps",
             size.0, size.1, BINS,
         );
+    }
+
+    /// Splits a frame into the phases `Engine::render` times, plus the pump
+    /// the render thread runs between frames, for a still map and a turning
+    /// camera. What is left of the frame interval is the test loop itself.
+    #[test]
+    fn report_frame_phases() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            return;
+        }
+        let size = probe_size();
+        let mut engine = Engine::new(size);
+        let warm_up = Instant::now();
+        while warm_up.elapsed() < SETTLE_DEADLINE {
+            engine.pump(Some(SETTLE_PUMP));
+            engine.mark_dirty();
+            engine.render().expect("warm-up frame");
+        }
+
+        const BUDGET: Duration = Duration::from_secs(5);
+        let mut measure = |label: &str, turn: bool| {
+            for counter in &PHASE_NANOS {
+                counter.store(0, Ordering::Relaxed);
+            }
+            let mut pump = Duration::ZERO;
+            let mut frames = 0u32;
+            let started = Instant::now();
+            while started.elapsed() < BUDGET {
+                if turn {
+                    engine.apply(Command::Camera(MapCamera {
+                        bearing: f64::from(frames) * 2.0,
+                        ..MapCamera::default()
+                    }));
+                }
+                let pumped = Instant::now();
+                engine.pump(Some(PUMP_BUDGET));
+                pump += pumped.elapsed();
+                engine.mark_dirty();
+                if engine.render().is_some() {
+                    frames += 1;
+                }
+            }
+            let frames_f = f64::from(frames.max(1));
+            let ms = |nanos: u64| nanos as f64 / 1e6 / frames_f;
+            let [wait, read, copy] = PHASE_NANOS
+                .each_ref()
+                .map(|counter| ms(counter.load(Ordering::Relaxed)));
+            let frame = started.elapsed().as_secs_f64() * 1e3 / frames_f;
+            eprintln!(
+                "{}x{} {label:<7} {:5.1} fps | frame {frame:6.2} ms = wait {wait:6.2} + read {read:6.2} + copy {copy:5.2} + pump {:5.2} + rest {:5.2}",
+                size.0,
+                size.1,
+                1e3 / frame,
+                pump.as_secs_f64() * 1e3 / frames_f,
+                frame - wait - read - copy - pump.as_secs_f64() * 1e3 / frames_f,
+            );
+        };
+        measure("still", false);
+        measure("camera", true);
     }
 
     #[test]

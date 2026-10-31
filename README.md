@@ -20,18 +20,30 @@ A rendering backend has to be named — `opengl`, `vulkan` or `metal`. See
 
 Debug builds work but render the map at a few frames per second, so use `--release` for
 anything you actually want to look at. The toolchain is pinned by `rust-toolchain.toml`
-and rustup will fetch it on first build; the pin is not a preference, and the file says
-what breaks without it.
+and rustup will fetch it on first build; the file says why it once had to match the FFI's
+own toolchain and no longer does.
+
+To read the map's tiles from disk rather than from tile.openstreetmap.jp, fetch the
+archives first:
+
+```bash
+./download-pmtiles.sh                    # planet, takeshima and hoppo into pmtiles/
+./download-pmtiles.sh takeshima hoppo    # just these
+```
+
+`planet.pmtiles` is about 85 GB. An interrupted download resumes, and an archive that
+matches the server's size and date is skipped, so running it again is how to pick up a
+newer planet. Without the archives the map reads them from the server, as before.
 
 ### Prerequisites
 
 `maplibre-native-ffi` downloads a prebuilt native artifact rather than building MapLibre
 Native from source, so there is no C++ toolchain to set up and a clean build takes about a
-minute. What is still needed is the system libraries the Rust crates link against and the
-one that generates the FFI bindings. On Debian and Raspberry Pi OS:
+minute. What is still needed is the system libraries the Rust crates link against. On
+Debian and Raspberry Pi OS:
 
 ```bash
-sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang libclang-dev
+sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev
 ```
 
 | Package | Wanted by |
@@ -40,9 +52,10 @@ sudo apt install libfontconfig-dev libasound2-dev libudev-dev libssl-dev clang l
 | `libasound2-dev` | ALSA, which `rodio` plays through |
 | `libudev-dev` | `gilrs`, to enumerate gamepads |
 | `libssl-dev` | OpenSSL, pulled in through `ureq`'s `native-tls` |
-| `clang`, `libclang-dev` | `bindgen`, which generates the FFI bindings from the native library's C header at build time |
 
-That is the list a Raspberry Pi OS image needed in practice.
+That is the list a Raspberry Pi OS image needed in practice. It used to include `clang` and
+`libclang-dev` for `bindgen`, which the FFI crate ran at build time; the crates.io release
+ships its bindings pre-generated, so nothing on a Linux build runs `bindgen` any more.
 
 ### iOS
 
@@ -54,49 +67,31 @@ simulator needs nothing beyond the target:
 cargo build --release --features metal --target=aarch64-apple-ios-sim
 ```
 
-The device triple needs the native library built from source, because
-`maplibre-native-ffi` publishes a prebuilt artifact for `ios-simulator-arm64` and none for
-`aarch64-apple-ios`.
+The device builds the same way, with `--target=aarch64-apple-ios`: `maplibre-native-ffi`
+publishes a prebuilt artifact for both triples, and the crate pins it by version and
+checksum.
 
-What gets built is **maplibre-native-ffi**, not MapLibre Native. MapLibre Native arrives as
-that repository's `third_party/maplibre-native` submodule, with five patches from
-`patches/maplibre-native/` applied on top, and `MAPLIBRE_NATIVE_C_INSTALL_DIR` points at
-the prefix holding the FFI project's own C API — `include/maplibre_native_c.h` and
-`lib/libmaplibre-native-c.a`. A standalone MapLibre Native checkout has neither.
+To link a native library built from source instead — to try a patch to MapLibre Native,
+say — check out the [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)
+tag matching the version in `Cargo.toml` (`v0.202610.3` at the time of writing), build its
+`ios-arm64-metal` preset, and name the install prefix in `MAPLIBRE_NATIVE_FFI_LOCAL_BUILD`
+(an absolute path). The crate's build script checks that the prefix was built for the
+target and backend being built. A prefix from a different tag is how the C API and the
+Rust crate drift apart.
 
-Clone it beside this one and check out the commit `Cargo.lock` resolves
-`maplibre-native-ffi` to. The build script feeds the prefix's headers straight to bindgen
-when the variable is set, with no version check of its own, so a prefix built from a
-different commit is how the C API and the Rust crate drift apart:
+The deployment target, iOS 15.0, comes from `.cargo/config.toml` and has to match
+`deploymentTarget` in `project.yml`. Rust's default for the triple predates
+`___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so without it
+the link fails on an undefined symbol. The archive itself is built for 14.3, but Xcode 27
+refuses anything below 15.0 for the app.
 
-```bash
-git -C ../maplibre-native-ffi checkout --detach <the rev from Cargo.lock>
-# Checks out the pinned submodule and applies the patches. The submodule is marked
-# `update = none` so that Cargo skips it, so plain `git submodule update` will not do.
-bash ../maplibre-native-ffi/.mise/bin/sync-submodules
-cmake --workflow --preset ios-arm64-metal   # run from ../maplibre-native-ffi
-```
-
-That needs CMake and Ninja, takes a few minutes, and installs into
-`build/ios-arm64-metal/install`. Then:
-
-```bash
-MAPLIBRE_NATIVE_C_INSTALL_DIR=$PWD/../maplibre-native-ffi/build/ios-arm64-metal/install \
-  cargo build --release --features metal --target=aarch64-apple-ios
-```
-
-Set that variable on the command itself and nowhere else. The build script reads it for
-whatever target is being built, so exporting it in a shell profile silently points a macOS
-or simulator build at the iOS device archive.
-
-The deployment target comes from `.cargo/config.toml`. Rust's default for the triple
-predates `___chkstk_darwin`'s arrival in libSystem, which the native archive calls, so
-without it the link fails on an undefined symbol.
+Built with the iOS 27 SDK, an app has to adopt the scene life cycle or UIKit stops it at
+launch. `project.yml` declares a single scene with no delegate, which is all it takes:
+winit 0.30 has no scene support, but its window still shows.
 
 `project.yml` and `build_for_ios_with_cargo.bash` drive the app bundle, following the same
 guide. `xcodegen generate` writes the Xcode project and the `Info.plist`; the script picks
-the triple from what Xcode is building and supplies the device prefix above, defaulting to
-the sibling checkout and taking `MAPLIBRE_NATIVE_C_INSTALL_DIR` as an override.
+the triple from what Xcode is building.
 
 To put it on a device, with the device connected and `DEVELOPMENT_TEAM` in `project.yml`
 set to yours:
@@ -139,23 +134,18 @@ ABI=x86_64 ./build_for_android.sh      # what an emulator on an Intel host wants
 adb install -r target/release/apk/OSMSoundDemo.apk
 ```
 
-It needs the Android SDK and NDK, plus `cargo-apk`, `cargo-about`, CMake and Ninja; it
-checks for each and says what is missing rather than failing deep inside a build. Set
+It needs the Android SDK and NDK, plus `cargo-apk`; it checks for each and says what is missing rather than failing deep inside a build. Set
 `ANDROID_HOME` if the SDK is not at `~/Library/Android/sdk` — note that is the directory
 holding `platform-tools` and `ndk`, one below the `~/Library/Android` Android Studio shows.
 
-Three things the script settles that are easy to trip over:
+Two things the script settles that are easy to trip over:
 
-**The native library is built from source**, which is what takes the minutes. The published
-`android-arm64` artifact does not match the Rust binding this app pins — its header renamed
-`MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND` while the binding still asks for
-the old name, so the download does not compile. `FFI_DIR` points at the checkout, which has
-to sit at the commit `Cargo.lock` resolves `maplibre-native-ffi` to.
-
-**Two Rust toolchains are in play.** The FFI checkout carries no `rust-toolchain.toml`, so
-cargo run from there picks the default one, which has no Android target and fails with
-"can't find crate for `std`". The script pins both halves to the channel in this project's
-`rust-toolchain.toml`, which is also the version the FFI repo pins for itself.
+**The native library is downloaded**, as everywhere else. It used to be built from source,
+because the published `android-arm64` artifact was a floating snapshot of upstream's latest
+commit while the binding came from the commit `Cargo.lock` pinned, and the two drifted
+apart — the snapshot once renamed `MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND`
+under a binding that still asked for the old name. The binding now comes from crates.io and
+pins its artifact by version and checksum, so that cannot happen.
 
 **bindgen has to be told the triple separately.** `cargo-apk` sets a bare `clang` as the C
 compiler and passes the API version in `CFLAGS`, which bindgen does not read; the NDK's
@@ -184,15 +174,18 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 
 | Variable | Effect |
 | --- | --- |
-| `MAPLIBRE_STYLE_URL` | Override the initial style URL |
+| `MAPLIBRE_STYLE_URL` | Load this style URL instead of the bundled `style/style.json` |
 | `MAPLIBRE_FLY_MS` | Fly-to duration in ms (default: 1.5–6 s, scaled by distance) |
 | `OSM_SOUND_DEMO_WINDOWED` | Set to open in a window rather than full screen |
 | `OSM_SOUND_DEMO_HOME` | `lon,lat` for Locate Me, answering without the network. Longitude first, as MapLibre and GeoJSON order a position |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
+| `OSM_SOUND_DEMO_MUSIC` | The directory Local Music reads, instead of `~/Music`. On macOS Local Music is off unless this is set |
+| `OSM_SOUND_DEMO_TILE_LOD` | `default` puts MapLibre Native's own tile LOD back in place of the distance-based one the app sets, to A/B what it buys — see [Frame rate](#frame-rate) |
 | `OSM_SOUND_DEMO_PREFETCH` | Override MapLibre Native's `prefetch_zoom_delta`; `0` turns prefetching off. Unset by default, and measuring says leave it that way — see [Tile prefetching](#tile-prefetching) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
+| `OSM_SOUND_DEMO_READBACK` | Linux with `vulkan`, or macOS: read frames back instead of sharing them with the window, to compare — see [Shared frames](#shared-frames) |
 | `OSM_SOUND_DEMO_RENDER_SCALE` | Render the map at this fraction of its on-screen size and let Slint scale it up (default 1.0, floor 0.25). The single biggest thing you can trade for frame rate — see [Frame rate](#frame-rate) |
 
 ## Controls
@@ -304,6 +297,81 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
   contract is meant to be filled by its own C++ backend, so there was nothing left to
   track.
 
+### Window renderer
+
+On macOS the window is drawn with Slint's Skia renderer rather than its default, FemtoVG.
+FemtoVG draws through OpenGL there, which holds a 120 Hz display to 60: on an M2 Pro's
+built-in display, full screen and playing, FemtoVG showed 61–65 fps while the render
+thread finished 74–75, and Skia showed 72–76 of 72–77. Skia draws through wgpu's Metal
+backend, so the map's frames can be shared with it too; see [Shared frames](#shared-frames).
+Linux uses Skia for that reason alone; other platforms keep Slint's default.
+`SLINT_BACKEND=winit-femtovg` puts FemtoVG back to compare.
+
+### Shared frames
+
+On Linux with the `vulkan` feature the map's frames are not read back at all. Skia draws
+the window through wgpu's Vulkan backend, and the map renders into a ring of five images
+on its own Vulkan device whose memory is exported as file descriptors. The window's
+device imports that memory once per ring, wraps each image as a `wgpu::Texture`, and
+hands it to Slint as a `slint::Image`. Each frame used to cost a 9 MB readback, a copy
+into a pixel buffer and an upload for the window renderer to make again; now it costs
+none of them. The code is in `src/map/shared.rs`.
+
+At 1920x1200 on the AMD RENOIR integrated GPU, on AC power with the performance profile,
+playing from Local Music, one build run three ways:
+
+| Window | Frames | fps |
+| --- | --- | --- |
+| Skia over wgpu (default) | shared | 74–80 |
+| Skia over wgpu (`OSM_SOUND_DEMO_READBACK=1`) | read back | 46–48 |
+| FemtoVG (`SLINT_BACKEND=winit-femtovg`) | read back | 46–48 |
+
+Skia on its own changes nothing here: the display is 60 Hz, so the macOS reason does not
+apply, and what held the frame rate down was the readback. These are frames handed to
+Slint; the display still shows at most 60 of them a second, but there is now headroom
+for the heavy moments.
+
+The two are separate devices because they cannot share one: this GPU has a single
+graphics queue, MapLibre Native submits to it from its own thread, and wgpu offers no
+lock to take around its own submissions. Some details that cost time to find:
+
+- **A shown frame stays acquired.** The session never draws into an image whose frame is
+  acquired, so the UI holds each frame until the GPU has finished every draw that
+  sampled it, through `Queue::on_submitted_work_done` registered after each draw. A
+  frame dropped without `release` is discarded, which quarantines its slot for good.
+- **A resize gets a new session.** A ring's images have a fixed size, and both replacing
+  them and detaching are refused while a frame is acquired, which the one on screen
+  always is. The old session is disposed of instead, its ring is marked so the UI hands
+  its frames back at once (nothing draws into them any more, and the image stays on
+  screen because the window's device holds its own reference to the memory), and the
+  map takes the new session once the old one has retired.
+- **Shutting down hands every frame back first,** or the session would never retire and
+  closing the map would wait out its timeout.
+- The images are passed between the devices without a queue family ownership transfer.
+  RADV shows them correctly, but strictly the Vulkan spec asks for one.
+
+On macOS the same holds with Metal, and more simply. Skia draws the window through wgpu's
+Metal backend, and the map renders into a ring of five textures made on that very device
+— the system default, which both sides pick — so each is wrapped for wgpu as it is,
+with nothing to export or import. Metal takes command buffers from any number of queues,
+so MapLibre Native and wgpu each keep their own, and a Metal frame only becomes
+acquirable once its GPU work has completed, so no fence crosses between them either.
+Acquiring, releasing and resizing work as on Linux. If the window turns out to draw on
+another device, frames are read back instead.
+
+On an M2 Pro's built-in 120 Hz display, full screen, playing from Local Music:
+
+| Window | Frames | fps |
+| --- | --- | --- |
+| Skia over wgpu (default) | shared | 166–218 |
+| Skia over wgpu (`OSM_SOUND_DEMO_READBACK=1`) | read back | 105–121 |
+
+As on Linux these are frames handed to Slint, so past 120 they are headroom rather than
+anything the display shows.
+
+If the window turns out not to be drawn with Vulkan, the map switches back to reading
+frames back.
+
 ### Rendering backend
 
 The map runs on [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)'s
@@ -324,58 +392,104 @@ There is no default, because defaulting to one would silently break the platform
 not suit; naming none, or naming two, stops the build with a message rather than a linker
 error.
 
-**On this hardware OpenGL is several times faster than Vulkan.** Measured at 1920x1200 in
-release on an AMD RENOIR integrated GPU, with `report_playing_frame_rate`:
+**On AC power Vulkan is well ahead of OpenGL.** Measured at 1920x1200 in release on an AMD
+RENOIR integrated GPU with `report_playing_frame_rate`, on AC with the `performance`
+platform profile, taking turns between the backends for three runs each:
 
 | Backend | still | camera only | camera + 16 bands |
 | --- | --- | --- | --- |
-| `opengl` | 19.8 fps | 27.3 fps | **25.1 fps** |
-| `vulkan` | 6.5 fps | 6.5 fps | 5.8 fps |
+| `opengl` | 33.9 fps | 35.8 fps | 28.9 fps |
+| `vulkan` | 64.9 fps | 63.6 fps | **48.4 fps** |
 
-The whole app agrees: about 20 fps against Vulkan's 5.9, both read with
-`OSM_SOUND_DEMO_FPS=1`. Whether that gap is this GPU's Vulkan driver or something the
-binding does on the Vulkan path has not been chased down; the numbers are simply what
-this machine does, and worth re-measuring on other hardware before reading anything
-general into them.
+Background load moves these too: with another application busy on one core, the same
+build gave Vulkan 44.9 fps for camera + 16 bands and OpenGL 29.0, so measure on an
+otherwise idle machine and read the rows against each other rather than the cells
+exactly.
+
+Most of Vulkan's lead comes from the order in which the render thread queues its work.
+The session runs driver work in the order it arrives, and the thread used to arm the
+next frame demand before asking for the readback of the frame it had just been handed.
+Whenever an update was already waiting, that demand drew a whole frame first, about
+10 ms, while the readback itself takes about 3.5 ms. The demand is now armed only after
+the readback is queued, so the next frame draws while this one is copied out for Slint.
+That took Vulkan from 32 to about 53 fps for camera + 16 bands when it went in. OpenGL
+gains nothing from it, because its driver work runs on the render thread anyway.
+
+Earlier measurements had Vulkan far behind: 17.8, 25.3 and 23.0 fps against OpenGL's
+36.2, 35.3 and 30.3, and before the switch to distance-based tile LOD (see
+[Frame rate](#frame-rate)) 5.8 fps against 25.1 for camera + 16 bands. Their power state
+was not recorded, and that gap did not come back on AC. In the slow state, sampling the
+stacks put almost half of MapLibre Native's render thread in the `memcmp` that
+`mln::vulkan::BufferResource::update` runs against a buffer mapped from uncached memory;
+on AC that call never showed up. So write down whether the machine is on battery, and its
+platform profile (`/sys/firmware/acpi/platform_profile`), next to any numbers, and compare
+the backends within one session rather than against this table.
 
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
 creates the device, attaches an *owned texture* render target at the map's size, and reads
-the frame back with
-`read_premultiplied_rgba8_into` for Slint. The binding downloads a prebuilt native
-artifact, so a clean build takes well under a minute rather than compiling MapLibre Native
-from source.
+the frame back as premultiplied RGBA8 with `RenderSessionHandle::read_texture` for Slint.
+The binding downloads a prebuilt native artifact, so a clean build takes well under a
+minute rather than compiling MapLibre Native from source.
 
 The device is created once and leaked on purpose: a render target borrows those handles,
-and a map outlives any one session. On the Vulkan side the handles are held as plain
-addresses rather than `NativePointer`, which is deliberately `!Send` and so cannot live in
-a static.
+and a map outlives any one session. The handles are held as plain addresses, since raw
+pointers are not `Send` and the Vulkan ones live in a static.
 
-The map runs in `MapMode::Continuous`, and the render thread drives it with
-`RuntimeHandle::pump` plus `drain_events`. Those events are what tell it whether to draw
-again — `MapRenderUpdateAvailable`, and `needs_repaint` on `MapRenderFrameFinished` — and
-when the style has loaded, which is when the band layers can be added.
+The map runs in `MapMode::Continuous` on the runtime's own worker threads. Commands go in
+without waiting, and what comes back arrives on callbacks: the runtime's event handler
+says when the style has loaded, which is when the band layers can be added, and a camera
+transition's end handler says when a flight has landed. The render thread keeps one frame
+demand armed with `FrameDemandFlag::WAIT_FOR_UPDATE`, so every update the map publishes —
+tiles arriving, a flight stepping — is drawn without being asked for; `needs_repaint` on a
+frame result, set during a paint transition, is answered with a repaint. On OpenGL the
+session shares the render thread's EGL context and its driver work is serviced there; on
+Vulkan and Metal it drives itself.
 
 
 ### Frame rate
 
-Two things cost this demo its frame rate, and both are measurable with
-`report_playing_frame_rate` (see the environment table above for how to run it). Numbers
-are Vulkan, release, on an AMD RENOIR integrated GPU.
+What costs this demo its frame rate is measurable with `report_playing_frame_rate` (see
+the environment table above for how to run it). Numbers are release builds on an AMD
+RENOIR integrated GPU.
 
-**The pixels.** Everything the map does scales with the area it covers, tile layout
-included, and on a large display that dominates:
+Almost all of a frame is MapLibre Native drawing on the GPU. Sending the camera and the
+band updates costs microseconds, and the readback and copy for Slint about 6 ms at
+960x640 — what a background-only style costs end to end.
 
-| Render size | camera only | camera + 16 bands |
-| --- | --- | --- |
-| 1920x1200 | 14.0 fps | 8.2 fps |
-| 1440x900 | 19.4 fps | 11.3 fps |
-| 1280x800 | 23.9 fps | 14.8 fps |
-| 960x600 | 33.6 fps | 28.2 fps |
+**The tile LOD.** By default MapLibre Native draws every visible tile at the camera's
+zoom. At a pitch of 70° that fills the ground with z16 tiles right up to the horizon,
+where they are too small to read and show as noise; on OpenGL at 960x640 a frame took
+31 ms at 70° against 10 ms at 45°. `TileLodMode::Distance` draws coarser tiles further
+away, and the app sets it. The foreground is identical either way — only the horizon
+changes, and reads better for it. `OSM_SOUND_DEMO_TILE_LOD=default` puts the old mode
+back for comparison. Camera + 16 bands:
 
-`OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate here at the cost of a soft, upscaled map.
-It is 1.0 by default: a Mac on Metal does not need it, and nobody should have the map go
-blurry without asking.
+| Render size | `opengl` default | `opengl` distance | `vulkan` default | `vulkan` distance |
+| --- | --- | --- | --- | --- |
+| 1920x1200 | 15.5 fps | **30.3 fps** | 14.9 fps | **23.0 fps** |
+| 1440x900 | 21.9 fps | **42.4 fps** | 12.9 fps | **29.1 fps** |
+| 1280x800 | 23.9 fps | **56.4 fps** | 13.9 fps | **30.2 fps** |
+| 960x600 | 20.0 fps | **48.6 fps** | 15.8 fps | **40.4 fps** |
+
+One run each, and runs vary — 960x600 coming out below 1280x800 on OpenGL is that noise,
+and a Vulkan run at 1920x1200 once gave 32 fps where two repeats gave 23 — so read the
+columns against each other rather than the cells exactly. The machine's power state was
+not recorded for these runs either (see [Rendering backend](#rendering-backend)), so the
+Vulkan columns in particular describe one state of the machine, not Vulkan in general.
+
+**The pixels.** Everything the map does scales with the area it covers, so after the LOD
+the render size is the next thing to trade. `OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate
+at the cost of a soft, upscaled map.
+
+**The buildings.** With no band layers at all a frame at 960x640 on OpenGL took 17 ms
+(default LOD); the first fill-extrusion layer adds about 10 ms and each further visible one
+about 0.3 ms. Drawing them at opacity 1.0 rather than 0.6 saved another 7 ms, since a
+translucent extrusion is drawn in two passes, but the see-through look is the web demo's
+and is kept.
+
+`OSM_SOUND_DEMO_RENDER_SCALE` is 1.0 by default: a Mac on Metal does not need it, and
+nobody should have the map go blurry without asking.
 
 **The band layers — under the old bindings.** Rewriting one made MapLibre Native re-run
 tile layout for the building source, and what mattered was whether a pass touched the
@@ -416,22 +530,23 @@ arrive first. The higher frame rate at `0` and `8` is not a win — it is the ma
 less, and at `8` drawing almost nothing: asking for zoom-8 tiles under a zoom-16 camera
 floods the connection and starves the tiles actually being looked at.
 
-`set_tile_options` also carries the LOD controls (`lod_min_radius`, `lod_scale`,
-`lod_pitch_threshold`, `lod_zoom_shift`, `lod_mode`). Those go untested here; at a pitch of
-85° the horizon covers a lot of distant tiles, so they are the next thing to measure if
-this ever needs more frame rate.
+`set_tile_options` also carries the LOD controls. `lod_mode` is set to `Distance`, which
+is worth two to three times the frame rate at this pitch — see [Frame rate](#frame-rate).
+The finer knobs (`lod_min_radius`, `lod_scale`, `lod_pitch_threshold`, `lod_zoom_shift`)
+are left at MapLibre Native's defaults and untested.
 
 
 ### Differences from the web demo
 
 Some of these are deliberate, some are limits of the current Rust bindings.
 
-- **Rendering runs on its own thread.** MapLibre Native drives its work through its own
-  run loop, which on macOS is the process CoreFoundation run loop; pumping that from
-  inside a Slint callback re-enters winit's event handling and aborts. The UI thread only
-  posts camera and band updates and picks up finished frames.
+- **Rendering runs on its own thread.** Reading a frame back blocks until it lands, and on
+  OpenGL the render session's driver work has to run on the thread whose EGL context it
+  shares; neither belongs in a Slint callback. The UI thread only posts camera and band
+  updates and picks up finished frames.
 - **Fly-to is MapLibre Native's own.** `Fly To` hands the camera over with
-  `MapHandle::fly_to` and follows along until the transition-finished event; MapLibre picks
+  a `CameraUpdateMode::Fly` camera update and follows along until the transition's end
+  handler fires; MapLibre picks
   the duration from the distance, as the web demo's `flyTo` did, unless `MAPLIBRE_FLY_MS`
   says otherwise. Anything that moves the camera — a drag, the sticks, an effect — cancels
   the flight. As in the web demo, the building animation pauses during a fly.
@@ -440,8 +555,27 @@ Some of these are deliberate, some are limits of the current Rust bindings.
 - **Pitch opens at 70°**, as the web demo did, and goes to 85°. MapLibre Native clamps at
   60° unless `BoundOptions::max_pitch` is raised first — asking for more without that
   silently gives 60 back.
-- **Vector tiles come from the style's own source**, not from `planet.pmtiles` — there is no
-  `pmtiles://` protocol to register on the native side.
+- **Vector tiles come from `planet.pmtiles`**, as in the web demo. The style is
+  tile.openstreetmap.jp's toner-ja, bundled as `style/style.json` with its three sources —
+  `openmaptiles`, `takeshima` and `hoppo` — pointed at `pmtiles://asset://pmtiles/*.pmtiles`.
+  MapLibre Native reads PMTiles itself, so there is no protocol to register as the web
+  demo had to. `asset://` is the way to write a relative path here: the style is handed over
+  as JSON, so nothing resolves a URL against its location, and `file://` takes what follows
+  it as a path from the working directory. `asset://` resolves against the runtime's asset
+  path, which the desktop build sets to this project. An archive that is not there — not
+  downloaded yet, or on Android and iOS, where the asset path is not this project — is read
+  from `https://tile.openstreetmap.jp/static/` instead; the check runs on every style load.
+- **Glyphs and the sprite are compiled in.** `style/fonts` (`migu1c-regular` and
+  `migu2m-regular`) and `style/sprites` are copied from
+  [osmfj/tileserver-gl-site](https://github.com/osmfj/tileserver-gl-site), which is what
+  tile.openstreetmap.jp serves them from. The style still names that server, and
+  `src/map/bundled.rs` answers those URLs from the copies before they reach the network, so
+  anything not bundled — or a style from `MAPLIBRE_STYLE_URL` — is fetched as before. The
+  city and primary-road labels asked for Nunito and Noto Sans; the repository has no Nunito
+  (the server substitutes another font) and Noto Sans is about 35 MB a weight, so both use
+  `migu1c-regular` here. Migu is under the IPA Font License Agreement v1.0; the license
+  texts are in `style/fonts/licenses`, described in `style/fonts/LICENSE.md`, and have to go
+  with any build that is handed out.
 - **Locate Me asks a service, not the OS.** The web demo asked the browser, which asks the
   OS; CoreLocation on macOS would mean shipping an app bundle with a usage description. So
   the button looks the machine up by its public address instead — **pressing it sends that
@@ -476,6 +610,33 @@ On macOS the input is behind the microphone permission, and a binary started fro
 terminal inherits that terminal's grant. Without it the device opens and delivers silence
 rather than failing, so a flat skyline with a device named in the status line means the
 permission, not the routing.
+
+### Local Music
+
+The **Local Music** button switches from Otherman's catalogue to the albums under
+`~/Music` (or `OSM_SOUND_DEMO_MUSIC`): the release dropdown lists albums, the dropdown
+beside it the album's tracks, and Go To Release becomes Open Folder. Picking a track plays
+it; the transport, auto-advance and the D-pad work as they do for releases. Switching back
+stops what is playing, and each side keeps the release or album it had.
+
+The directory is scanned in the background at startup, and the button only appears once it
+has found something to play. `src/library.rs` reads FLAC, MP3 and AAC tags with
+[lofty](https://github.com/Serial-ATA/lofty-rs) — headers only, which put 1215 FLAC files
+into 98 albums in about 30 ms here — and groups tracks by album artist (or artist) and
+album, falling back to the directory for untagged files. Tracks sort by disc, track number
+and file name.
+
+Playback is the same rodio player and tap as a streamed track, reading the file directly,
+so the skyline follows a local track exactly as it follows a stream. That is also why this
+does not go through mpd, which was the other option: mpd plays to its own output, past the
+analyser, and getting its samples back means configuring a FIFO output (or running VJ mode
+off a monitor input) on top of setting up mpd and its database.
+
+It is for Linux. The phones have no music directory to list, and macOS's `~/Music` is
+Music.app's library — its own database and layout — so there it stays off unless
+`OSM_SOUND_DEMO_MUSIC` names a plain directory of FLAC, MP3 or AAC files. AAC is read from
+`.m4a` or `.aac` files, as AAC-LC: Bandcamp's AAC downloads are MP4 files under either
+name. ALAC is not decoded.
 
 ### The effects
 
@@ -595,6 +756,16 @@ of them fell on the same bin and read the same level for ever. Even at 2048 the 
 bands are one bin wide each, so a pure bass tone spreads over its neighbours; that is the
 resolution talking, and `a_low_tone_stays_in_the_low_bands` pins down what it does. The
 FFT costs 8.6 µs a frame, against a 16.7 ms budget at 60 fps.
+
+The edges are in hertz, so they are worked out for the rate of what is playing: a bin is
+`rate / 2048` Hz. They used to assume 44.1 kHz for everything, which is what Otherman's
+MP3s are, but Local Music's FLACs are as often 48 kHz — every band about 9% high — and
+occasionally 96 kHz, an octave high. The range stays 30 Hz to 22.05 kHz at any rate. A file
+at 88.2 kHz or above is also averaged down by a whole factor before the analyser sees it,
+2 for 96 kHz and 4 for 192, because at 96 kHz a 2048-point window would be 47 Hz a bin and
+the bottom bands would run together; only the analyser's copy is averaged, not what plays.
+`a_tone_lands_in_the_same_band_whatever_the_rate` checks a tone from 50 Hz to 12 kHz lands
+in the same band at 44.1, 48, 88.2, 96 and 192 kHz.
 
 
 ### The band animation

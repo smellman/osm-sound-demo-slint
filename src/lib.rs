@@ -24,6 +24,7 @@ compile_error!("only one rendering backend can be enabled at a time");
 mod app;
 mod audio;
 mod gamepad;
+mod library;
 mod locate;
 mod map;
 mod otherman;
@@ -95,18 +96,7 @@ fn init_maplibre(android: &slint::android::AndroidApp) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     // SAFETY: both pointers are live for the length of the call, which is all
-    // the C API borrows them for. The middle argument is for JNI adapters and
-    // is documented as ignorable by direct callers.
-    let status = unsafe {
-        maplibre_native_ffi_sys::mln_android_init(
-            env.get_raw().cast(),
-            std::ptr::null_mut(),
-            activity.cast(),
-        )
-    };
-    if status == maplibre_native_ffi_sys::MLN_STATUS_OK {
-        Ok(())
-    } else {
-        Err(format!("mln_android_init returned {status}"))
-    }
+    // the C API borrows them for.
+    unsafe { maplibre_native_ffi::init_android(env.get_raw().cast(), activity.cast()) }
+        .map_err(|error| format!("mln_android_init failed: {error}"))
 }

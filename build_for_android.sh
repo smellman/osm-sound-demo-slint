@@ -9,12 +9,11 @@
 # the crate carries a `[lib]` alongside its binary. `cargo-apk` builds the
 # library and wraps it in an APK.
 #
-# The native MapLibre library is built from source rather than downloaded. The
-# published `android-arm64` artifact does not match the Rust binding this app
-# pins: its header renamed `MLN_LOG_EVENT_OPENGL` to `MLN_LOG_EVENT_GRAPHICS_BACKEND`
-# while the binding still asks for the old name, so the download does not
-# compile at all. Building the library ourselves from the same commit the
-# binding comes from keeps the two in step. That is what takes the minutes.
+# The native MapLibre library is downloaded, as on every other target. It used
+# to be built from source here, because the published `android-arm64` artifact
+# was a floating snapshot that drifted away from the git-pinned binding. The
+# binding now comes from crates.io and pins its artifact by version and
+# checksum, so the two cannot drift.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,12 +31,6 @@ esac
 # below that; it has to match `min_sdk_version` in Cargo.toml, which is what
 # cargo-apk compiles the Rust against.
 API="${API:-26}"
-PRESET="android-${ABI/arm64-v8a/arm64}-egl"
-PRESET="${PRESET/x86_64/x64}"
-
-# Where the MapLibre Native FFI checkout is. It has to sit at the commit
-# Cargo.lock resolves `maplibre-native-ffi` to; see the note at the top.
-FFI_DIR="${FFI_DIR:-$here/../maplibre-native-ffi}"
 
 # --- the SDK -----------------------------------------------------------------
 
@@ -65,9 +58,6 @@ NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
 [[ -d "$NDK" ]] || { echo "error: no NDK at $NDK" >&2; exit 1; }
 export ANDROID_NDK_HOME="$NDK"
 export ANDROID_NDK_ROOT="$NDK"
-# The CMake preset builds its toolchain path out of this.
-export MLN_FFI_ANDROID_NDK_VERSION="$NDK_VERSION"
-
 # The prebuilt directory is named for the host the toolchain was built on, which
 # on Apple silicon is still the x86_64 one.
 TOOLCHAIN="$(echo "$NDK"/toolchains/llvm/prebuilt/*)"
@@ -90,12 +80,10 @@ export "CARGO_TARGET_${upper_target}_LINKER=$TOOLCHAIN/bin/${CLANG_ARCH}${API}-c
 # CFLAGS, so without this the C compiles and the bindings do not.
 export "BINDGEN_EXTRA_CLANG_ARGS_${RUST_TARGET//-/_}=--target=${CLANG_ARCH}${API} --sysroot=$TOOLCHAIN/sysroot"
 
-# The native build compiles a Rust support layer for Android, and it runs cargo
-# from the FFI checkout, which carries no rust-toolchain.toml — so it would pick
-# up the default toolchain, which has no Android target installed and fails with
-# "can't find crate for `std`". This app's pin is the toolchain that does have
-# them, and it is the same version the FFI repo pins for itself, so it is the
-# right one for both halves of the build.
+# This app's pin, named outright so the preflight below checks the targets of
+# the toolchain that will build, wherever the script is run from. It has to
+# match the one the downloaded native library was built with; see
+# rust-toolchain.toml.
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(sed -n 's/^ *channel *= *"\(.*\)".*/\1/p' "$here/rust-toolchain.toml" | head -1)}"
 [[ -n "$RUSTUP_TOOLCHAIN" ]] ||
   { echo "error: no channel in rust-toolchain.toml; set RUSTUP_TOOLCHAIN" >&2; exit 1; }
@@ -110,32 +98,10 @@ need() {
     missing=1
   fi
 }
-need cmake "install it, or use the one in the Android SDK"
-need ninja "brew install ninja"
 need cargo-apk "cargo install cargo-apk"
-need cargo-about "cargo install cargo-about  (the native build's Rust layer needs it)"
 rustup target list --installed | grep -qx "$RUST_TARGET" ||
   { echo "error: rustup +$RUSTUP_TOOLCHAIN target add $RUST_TARGET" >&2; missing=1; }
-[[ -d "$FFI_DIR" ]] ||
-  { echo "error: no maplibre-native-ffi checkout at $FFI_DIR (set FFI_DIR)" >&2; missing=1; }
 (( missing == 0 )) || exit 1
-
-# --- the native library ------------------------------------------------------
-
-INSTALL_DIR="$FFI_DIR/build/$PRESET/install"
-if [[ -f "$INSTALL_DIR/lib/libmaplibre-native-c.a" && -z "${REBUILD_NATIVE:-}" ]]; then
-  echo "==> native library already built: $INSTALL_DIR"
-else
-  echo "==> building MapLibre Native for $PRESET (several minutes)"
-  # The submodules carry MapLibre Native itself and the patches this repo keeps
-  # against it; without them CMake configures against an empty directory.
-  bash "$FFI_DIR/.mise/bin/sync-submodules"
-  # The native build compiles a Rust support layer for Android and that layer
-  # needs a patched rustls-platform-verifier, which this script fetches.
-  bash "$FFI_DIR/.mise/bin/sync-rustls-platform-verifier"
-  (cd "$FFI_DIR" && cmake --workflow --preset "$PRESET")
-fi
-export MAPLIBRE_NATIVE_C_INSTALL_DIR="$INSTALL_DIR"
 
 # --- the signing key ---------------------------------------------------------
 
@@ -155,8 +121,9 @@ fi
 
 echo "==> building the APK for $ABI"
 cd "$here"
-# OpenGL is the only backend the FFI publishes for Android, and one has to be
-# named because the crate has no default.
+# OpenGL, which is what the app's EGL path drives on Android (the FFI also
+# publishes a Vulkan artifact), and one has to be named because the crate has
+# no default.
 cargo apk build --release --lib --features opengl --target "$RUST_TARGET" "$@"
 
 echo

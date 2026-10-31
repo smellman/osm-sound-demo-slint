@@ -15,14 +15,15 @@ crate-type = ["lib", "cdylib"]
 # cannot be resolved per target the way it used to be — and defaulting to one
 # of them would silently break the platforms it does not suit.
 #
-#     cargo run --release --features opengl     # Linux, the fast path here
-#     cargo run --release --features vulkan     # Linux, for comparison
+#     cargo run --release --features vulkan     # Linux, the faster one here
+#     cargo run --release --features opengl     # Linux
 #     cargo run --release --features metal      # macOS and iOS
 #     ./build_for_android.sh                    # Android, which is opengl
 #
-# OpenGL, not Vulkan, on this machine: at 1920x1200 in release on an AMD RENOIR
-# integrated GPU the app runs at about 20 fps on OpenGL against 5.9 on Vulkan.
-# See "Rendering backend" in the README for the breakdown.
+# On Linux, Vulkan is the faster of the two. At 1920x1200 in release on an AMD
+# RENOIR integrated GPU, on AC power, it draws camera + 16 bands at about 48 fps
+# against OpenGL's 29; runs in an unrecorded power state once had it far behind.
+# See "Rendering backend" in the README for the numbers and the caveat.
 #
 # Enabling two is refused at compile time rather than left to the linker.
 vulkan = ["maplibre-native-ffi/vulkan", "dep:ash"]
@@ -38,21 +39,24 @@ linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
 # support at all, so there `Gilrs::new` returns `NotImplemented` and no pad is
 # ever seen. See gilrs-core/src/platform/ios in the branch below.
 gilrs = { git = "https://gitlab.com/smellman/gilrs.git", branch = "ios-game-controller-backend" }
-rodio = { version = "0.22", default-features = false, features = ["playback", "recording", "symphonia-mp3"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "symphonia-mp3", "symphonia-flac", "symphonia-aac", "symphonia-isomp4"] }
 rustfft = "6"
+# Tags for Local Music. Only the headers are read, so the library scan stays
+# quick on a large collection; the audio itself goes through rodio.
+lofty = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slint = "1.16"
+slint = "1.18"
 ureq = { version = "3", features = ["json"] }
 
 # The FFI hands the graphics plumbing to the caller: the map draws through a
 # device this app creates, so each backend brings the crate that creates one.
-maplibre-native-ffi = { git = "https://github.com/maplibre/maplibre-native-ffi" }
+maplibre-native-ffi = "0.202610.3"
 ash = { version = "0.38", optional = true }
 # EGL, for the OpenGL backend. `glutin_egl_sys` is bindings only, so the
 # library itself is opened by hand.
 glutin_egl_sys = { version = "0.7", optional = true }
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 # Metal is every Apple platform, not just macOS: the same `metal` feature builds
 # for iOS and the simulator (see "iOS" in the README), so gating these on
@@ -60,6 +64,24 @@ libloading = { version = "0.8", optional = true }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = { version = "0.5", optional = true }
 objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
+
+# Skia draws the window on macOS: FemtoVG goes through OpenGL there, which is
+# held to 60 Hz on a 120 Hz display. `app::run` selects it; see "Window
+# renderer" in the README. It draws through wgpu's Metal backend, and
+# `unstable-wgpu-30` lets it take the map's frames as wgpu textures, rendered
+# on the same device — see "Shared frames". wgpu-hal names Metal objects with
+# objc2 0.6 and objc2-metal 0.3, so the ring is made with those.
+[target.'cfg(target_os = "macos")'.dependencies]
+slint = { version = "1.18", features = ["renderer-skia", "unstable-wgpu-30"] }
+objc2-v06 = { package = "objc2", version = "0.6" }
+objc2-metal-v03 = { package = "objc2-metal", version = "0.3", features = ["MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
+
+# Skia draws the window on Linux as well, and `unstable-wgpu-30` lets it take
+# the map's frames as wgpu textures: with the `vulkan` feature the map renders
+# into images the window's device imports, so nothing is read back. See
+# "Shared frames" in the README.
+[target.'cfg(target_os = "linux")'.dependencies]
+slint = { version = "1.18", features = ["renderer-skia", "unstable-wgpu-30"] }
 
 # The audio session iOS needs before it will make a sound. cpal pulls this crate
 # in already but never sets a category or activates the session, so the app does
@@ -76,13 +98,12 @@ objc2-v06 = { package = "objc2", version = "0.6" }
 # Android's windowing and lifecycle come from android-activity, which Slint
 # drives for us; the feature is only meaningful on that target.
 [target.'cfg(target_os = "android")'.dependencies]
-slint = { version = "1.16", features = ["backend-android-activity-06"] }
+slint = { version = "1.18", features = ["backend-android-activity-06"] }
 # MapLibre Native does its own HTTP on Android and will not touch HTTPS until
 # `mln_android_init` has handed it a JVM and a Context — without that the style
 # never loads and the map stays black while the rest of the app works. The
-# binding keeps its `sys` crate private and wraps no such call, so the raw one
-# is used directly; `jni` and `ndk-context` are what produce the two arguments.
-maplibre-native-ffi-sys = { git = "https://github.com/maplibre/maplibre-native-ffi" }
+# binding wraps that call as `init_android`; `jni` and `ndk-context` are what
+# produce the two arguments.
 jni = "0.21"
 ndk-context = "0.1"
 
@@ -128,4 +149,10 @@ name = "android.permission.INTERNET"
 name = "android.permission.RECORD_AUDIO"
 
 [build-dependencies]
-slint-build = "1.16"
+slint-build = "1.18"
+
+# A Metal-only probe of the FFI on its own; the attach call it makes exists only
+# in a `metal` build.
+[[example]]
+name = "ffi_smoke"
+required-features = ["metal"]

@@ -8,10 +8,14 @@ use slint::ComponentHandle;
 use crate::AppWindow;
 use crate::MapAdapter;
 
+// The style's glyphs and sprite, compiled in.
+mod bundled;
 // Android answers MapLibre Native's own requests itself; see the module.
 #[cfg(target_os = "android")]
 mod fetch;
 mod renderer;
+#[cfg(shared_frames)]
+mod shared;
 pub use renderer::{CameraBoost, Light, MapLibre, SLICE_MODES, SLICES, create_map};
 
 /// Publishes the newest rendered frame and the camera state to the UI, and
@@ -19,20 +23,26 @@ pub use renderer::{CameraBoost, Light, MapLibre, SLICE_MODES, SLICES, create_map
 pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
     let adapter = ui.global::<MapAdapter>();
 
-    let frame = map.take_frame();
+    map.tidy_shared();
+    let mut frame = map.take_frame();
     // Every frame carries it, so only touch the property when it changes.
     if let Some(attribution) = frame.as_ref().and_then(|frame| frame.attribution.as_ref())
         && ui.get_attribution() != attribution.as_str()
     {
         ui.set_attribution(attribution.into());
     }
-    if let Some(frame) = &frame {
-        let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-            &frame.rgba,
-            frame.width,
-            frame.height,
-        );
-        adapter.set_frame(slint::Image::from_rgba8(pixels));
+    if let Some(frame) = &mut frame {
+        // A shared frame is already on the GPU the window draws with.
+        #[cfg(shared_frames)]
+        let image = match frame.shared.take() {
+            Some(shared) => map.show_shared(shared),
+            None => Some(pixel_image(frame)),
+        };
+        #[cfg(not(shared_frames))]
+        let image = Some(pixel_image(frame));
+        if let Some(image) = image {
+            adapter.set_frame(image);
+        }
     }
 
     let camera = map.camera();
@@ -168,4 +178,14 @@ pub fn init(ui: &AppWindow, map: &Rc<RefCell<MapLibre>>) {
             }
         }
     });
+}
+
+/// A read-back frame, copied into a buffer Slint uploads itself.
+fn pixel_image(frame: &renderer::Frame) -> slint::Image {
+    let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &frame.rgba,
+        frame.width,
+        frame.height,
+    );
+    slint::Image::from_rgba8(pixels)
 }

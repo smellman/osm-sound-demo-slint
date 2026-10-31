@@ -1,24 +1,20 @@
-# Pinned to match the toolchain `maplibre-native-ffi` builds its prebuilt
-# artifacts with — its own `mise.toml` sets `rust_version = "1.95.0"`.
+# Pinned so every machine builds with the same rustc, and currently matching the
+# toolchain `maplibre-native-ffi` builds its prebuilt artifacts with — its own
+# `.config/mise.toml` pins `core:rust` to "1.99.1".
 #
-# This is not a preference. `libmln_ffi_platform.a`, which ships inside the
-# prebuilt native install and which `maplibre-native-ffi-sys` links statically,
-# is a Rust crate built as `crate-type = ["staticlib"]`, so it carries a whole
-# copy of the Rust runtime — std, compiler_builtins and the rest, 590 objects.
-# Linking that into a Rust binary puts two copies of std on the link line. When
-# both were built by the same rustc the symbol names match and the linker
-# resolves everything from the first archive, so nothing collides. When they
-# differ, both get pulled in and the link fails on the symbols that are not
-# hash-mangled:
+# This used to be a hard constraint. Up to the git snapshots this app used
+# before moving to the crates.io release, the prebuilt shipped
+# `libmln_ffi_platform.a`, a Rust `staticlib` carrying a whole copy of std, and
+# `maplibre-native-ffi-sys` linked it into this binary next to our own std. With
+# two different rustc versions the non-mangled symbols collided:
 #
 #     rust-lld: error: duplicate symbol: rust_eh_personality
-#       >>> std-d1237ef7159db0a2 ... in libmaplibre_native_ffi_sys-*.rlib
-#       >>> std-2e38004a9ef1deab ... in .../libstd-2e38004a9ef1deab.rlib
 #
-# So a rustup update breaks the build until this pin catches up with whatever
-# `maplibre-native-ffi` is pinned to. The way off this pin is to build the
-# native side locally against the current toolchain and point
-# `MAPLIBRE_NATIVE_C_INSTALL_DIR` at it, rather than taking the prebuilt.
+# Since v0.202610.3 the platform layer is the `maplibre-native-ffi-platform`
+# crate, which Cargo builds with this toolchain, and no prebuilt in the release
+# index lists a Rust archive among its link libraries. So this pin can now move
+# on its own; if the duplicate-symbol error ever comes back after an FFI update,
+# this is the first place to look.
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
