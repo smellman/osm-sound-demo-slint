@@ -39,7 +39,7 @@ linuxkms-noseat = ["slint/backend-linuxkms-noseat"]
 # support at all, so there `Gilrs::new` returns `NotImplemented` and no pad is
 # ever seen. See gilrs-core/src/platform/ios in the branch below.
 gilrs = { git = "https://gitlab.com/smellman/gilrs.git", branch = "ios-game-controller-backend" }
-rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "symphonia-mp3", "symphonia-flac"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "recording", "symphonia-mp3", "symphonia-flac", "symphonia-aac", "symphonia-isomp4"] }
 rustfft = "6"
 # Tags for Local Music. Only the headers are read, so the library scan stays
 # quick on a large collection; the audio itself goes through rodio.

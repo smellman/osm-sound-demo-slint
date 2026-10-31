@@ -546,7 +546,7 @@ it; the transport, auto-advance and the D-pad work as they do for releases. Swit
 stops what is playing, and each side keeps the release or album it had.
 
 The directory is scanned in the background at startup, and the button only appears once it
-has found something to play. `src/library.rs` reads FLAC and MP3 tags with
+has found something to play. `src/library.rs` reads FLAC, MP3 and AAC tags with
 [lofty](https://github.com/Serial-ATA/lofty-rs) — headers only, which put 1215 FLAC files
 into 98 albums in about 30 ms here — and groups tracks by album artist (or artist) and
 album, falling back to the directory for untagged files. Tracks sort by disc, track number
@@ -559,9 +559,10 @@ analyser, and getting its samples back means configuring a FIFO output (or runni
 off a monitor input) on top of setting up mpd and its database.
 
 It is for Linux. The phones have no music directory to list, and macOS's `~/Music` is
-Music.app's library — its own database and layout, mostly AAC and ALAC, which rodio is not
-built to decode here — so there it stays off unless `OSM_SOUND_DEMO_MUSIC` names a plain
-directory of FLAC or MP3 files.
+Music.app's library — its own database and layout — so there it stays off unless
+`OSM_SOUND_DEMO_MUSIC` names a plain directory of FLAC, MP3 or AAC files. AAC is read from
+`.m4a` or `.aac` files, as AAC-LC: Bandcamp's AAC downloads are MP4 files under either
+name. ALAC is not decoded.
 
 ### The effects
 

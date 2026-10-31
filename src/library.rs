@@ -19,7 +19,9 @@ use lofty::probe::Probe;
 const MUSIC_VAR: &str = "OSM_SOUND_DEMO_MUSIC";
 
 /// What rodio is built to decode here; see the `rodio` features in Cargo.toml.
-const PLAYABLE: [&str; 2] = ["flac", "mp3"];
+/// Bandcamp's AAC downloads are MP4 files whether they are named `.m4a` or
+/// `.aac`; the decoder goes by the content, so both are listed.
+const PLAYABLE: [&str; 4] = ["aac", "flac", "m4a", "mp3"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalTrack {
@@ -260,6 +262,8 @@ mod tests {
         assert!(is_playable(Path::new("a/01 Song.flac")));
         assert!(is_playable(Path::new("a/01 Song.FLAC")));
         assert!(is_playable(Path::new("a/01 Song.mp3")));
+        assert!(is_playable(Path::new("a/01 Song.m4a")));
+        assert!(is_playable(Path::new("a/mix.aac")));
         assert!(!is_playable(Path::new("a/cover.jpg")));
         assert!(!is_playable(Path::new("a/notes.txt")));
         assert!(!is_playable(Path::new("a/flac")));
