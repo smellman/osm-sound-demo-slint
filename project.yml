@@ -41,6 +41,16 @@ targets:
                 - ImageRespectSafeAreaInsets: false
             NSMicrophoneUsageDescription:
                 VJ mode drives the buildings and the style's light from what it hears.
+            # An app built with the iOS 27 SDK has to adopt the scene life
+            # cycle, or UIKit stops it at launch with a SIGTRAP in
+            # _UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption.
+            # winit 0.30 knows nothing of scenes, but declaring one with no
+            # delegate is enough: its window still shows.
+            UIApplicationSceneManifest:
+                UIApplicationSupportsMultipleScenes: false
+                UISceneConfigurations:
+                    UIWindowSceneSessionRoleApplication:
+                        - UISceneConfigurationName: Default Configuration
     sources: []
     postCompileScripts:
       - script: |

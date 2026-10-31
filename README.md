@@ -85,6 +85,10 @@ The deployment target, iOS 15.0, comes from `.cargo/config.toml` and has to matc
 the link fails on an undefined symbol. The archive itself is built for 14.3, but Xcode 27
 refuses anything below 15.0 for the app.
 
+Built with the iOS 27 SDK, an app has to adopt the scene life cycle or UIKit stops it at
+launch. `project.yml` declares a single scene with no delegate, which is all it takes:
+winit 0.30 has no scene support, but its window still shows.
+
 `project.yml` and `build_for_ios_with_cargo.bash` drive the app bundle, following the same
 guide. `xcodegen generate` writes the Xcode project and the `Info.plist`; the script picks
 the triple from what Xcode is building.
