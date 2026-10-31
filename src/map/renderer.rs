@@ -1159,12 +1159,18 @@ impl Engine {
                         self.applied = [None; SLICES];
                         self.applied_light = None;
                     }
+                    // Waited for, so the session's generation has moved on before
+                    // anything else is read from it: `collect_results` then
+                    // tells the frames drawn before the resize by theirs.
                     if !shared
                         && let Some(attached) = &self.map
                         && let Err(error) = attached
                             .session
-                            .discarding()
                             .resize(LogicalExtent::new(width, height, 1.0))
+                            .map_err(|error| error.to_string())
+                            .and_then(|resized| {
+                                drive(&self.inbox, Some(&attached.session), resized)
+                            })
                     {
                         eprintln!("resizing the render target failed: {error}");
                         // Fall back to a rebuild, which at least recovers when
@@ -1329,11 +1335,25 @@ impl Engine {
                 return;
             }
         };
+        // A frame drawn before the session's target last changed — a demand
+        // armed before a resize can finish after it — has nothing left to
+        // read back: the session answers with INVALID_STATE.
+        let generation = if results.is_empty() {
+            0
+        } else {
+            match attached.session.get_snapshot() {
+                Ok(snapshot) => snapshot.generation,
+                Err(error) => {
+                    eprintln!("reading the render session's state failed: {error}");
+                    0
+                }
+            }
+        };
         for result in results {
             if self.armed == Some(result.token) {
                 self.armed = None;
             }
-            if result.disposition != RenderResult::Rendered {
+            if result.disposition != RenderResult::Rendered || result.generation < generation {
                 continue;
             }
             // A paint transition still running. A camera transition does not set
