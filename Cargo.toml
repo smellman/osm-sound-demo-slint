@@ -21,7 +21,7 @@ crate-type = ["lib", "cdylib"]
 #     ./build_for_android.sh                    # Android, which is opengl
 #
 # OpenGL, not Vulkan, on this machine: at 1920x1200 in release on an AMD RENOIR
-# integrated GPU the app runs at about 20 fps on OpenGL against 5.9 on Vulkan.
+# integrated GPU the renderer draws about 35 fps on OpenGL against 25 on Vulkan.
 # See "Rendering backend" in the README for the breakdown.
 #
 # Enabling two is refused at compile time rather than left to the linker.

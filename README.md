@@ -174,6 +174,7 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 | `OSM_SOUND_DEMO_HOME` | `lon,lat` for Locate Me, answering without the network. Longitude first, as MapLibre and GeoJSON order a position |
 | `OSM_SOUND_DEMO_INPUT` | VJ mode's input device, matched on a substring of its name |
 | `OSM_SOUND_DEMO_MUSIC` | The directory Local Music reads, instead of `~/Music`. On macOS Local Music is off unless this is set |
+| `OSM_SOUND_DEMO_TILE_LOD` | `default` puts MapLibre Native's own tile LOD back in place of the distance-based one the app sets, to A/B what it buys — see [Frame rate](#frame-rate) |
 | `OSM_SOUND_DEMO_PREFETCH` | Override MapLibre Native's `prefetch_zoom_delta`; `0` turns prefetching off. Unset by default, and measuring says leave it that way — see [Tile prefetching](#tile-prefetching) |
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
@@ -309,19 +310,20 @@ There is no default, because defaulting to one would silently break the platform
 not suit; naming none, or naming two, stops the build with a message rather than a linker
 error.
 
-**On this hardware OpenGL is several times faster than Vulkan.** Measured at 1920x1200 in
-release on an AMD RENOIR integrated GPU, with `report_playing_frame_rate`:
+**On this hardware OpenGL is faster than Vulkan.** Measured at 1920x1200 in release on an
+AMD RENOIR integrated GPU, with `report_playing_frame_rate`:
 
 | Backend | still | camera only | camera + 16 bands |
 | --- | --- | --- | --- |
-| `opengl` | 19.8 fps | 27.3 fps | **25.1 fps** |
-| `vulkan` | 6.5 fps | 6.5 fps | 5.8 fps |
+| `opengl` | 36.2 fps | 35.3 fps | **30.3 fps** |
+| `vulkan` | 17.8 fps | 25.3 fps | 23.0 fps |
 
-The whole app agrees: about 20 fps against Vulkan's 5.9, both read with
-`OSM_SOUND_DEMO_FPS=1`. Whether that gap is this GPU's Vulkan driver or something the
-binding does on the Vulkan path has not been chased down; the numbers are simply what
-this machine does, and worth re-measuring on other hardware before reading anything
-general into them.
+The gap used to be far wider — 25.1 fps against 5.8 for camera + 16 bands — before the
+app switched MapLibre Native to distance-based tile LOD (see [Frame rate](#frame-rate)),
+which helped Vulkan the most. Whether what remains is this GPU's Vulkan driver or
+something the binding does on the Vulkan path has not been chased down; the numbers are
+simply what this machine does, and worth re-measuring on other hardware before reading
+anything general into them.
 
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
@@ -347,23 +349,45 @@ Vulkan and Metal it drives itself.
 
 ### Frame rate
 
-Two things cost this demo its frame rate, and both are measurable with
-`report_playing_frame_rate` (see the environment table above for how to run it). Numbers
-are Vulkan, release, on an AMD RENOIR integrated GPU.
+What costs this demo its frame rate is measurable with `report_playing_frame_rate` (see
+the environment table above for how to run it). Numbers are release builds on an AMD
+RENOIR integrated GPU.
 
-**The pixels.** Everything the map does scales with the area it covers, tile layout
-included, and on a large display that dominates:
+Almost all of a frame is MapLibre Native drawing on the GPU. Sending the camera and the
+band updates costs microseconds, and the readback and copy for Slint about 6 ms at
+960x640 — what a background-only style costs end to end.
 
-| Render size | camera only | camera + 16 bands |
-| --- | --- | --- |
-| 1920x1200 | 14.0 fps | 8.2 fps |
-| 1440x900 | 19.4 fps | 11.3 fps |
-| 1280x800 | 23.9 fps | 14.8 fps |
-| 960x600 | 33.6 fps | 28.2 fps |
+**The tile LOD.** By default MapLibre Native draws every visible tile at the camera's
+zoom. At a pitch of 70° that fills the ground with z16 tiles right up to the horizon,
+where they are too small to read and show as noise; on OpenGL at 960x640 a frame took
+31 ms at 70° against 10 ms at 45°. `TileLodMode::Distance` draws coarser tiles further
+away, and the app sets it. The foreground is identical either way — only the horizon
+changes, and reads better for it. `OSM_SOUND_DEMO_TILE_LOD=default` puts the old mode
+back for comparison. Camera + 16 bands:
 
-`OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate here at the cost of a soft, upscaled map.
-It is 1.0 by default: a Mac on Metal does not need it, and nobody should have the map go
-blurry without asking.
+| Render size | `opengl` default | `opengl` distance | `vulkan` default | `vulkan` distance |
+| --- | --- | --- | --- | --- |
+| 1920x1200 | 15.5 fps | **30.3 fps** | 14.9 fps | **23.0 fps** |
+| 1440x900 | 21.9 fps | **42.4 fps** | 12.9 fps | **29.1 fps** |
+| 1280x800 | 23.9 fps | **56.4 fps** | 13.9 fps | **30.2 fps** |
+| 960x600 | 20.0 fps | **48.6 fps** | 15.8 fps | **40.4 fps** |
+
+One run each, and runs vary — 960x600 coming out below 1280x800 on OpenGL is that noise,
+and a Vulkan run at 1920x1200 once gave 32 fps where two repeats gave 23 — so read the
+columns against each other rather than the cells exactly.
+
+**The pixels.** Everything the map does scales with the area it covers, so after the LOD
+the render size is the next thing to trade. `OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate
+at the cost of a soft, upscaled map.
+
+**The buildings.** With no band layers at all a frame at 960x640 on OpenGL took 17 ms
+(default LOD); the first fill-extrusion layer adds about 10 ms and each further visible one
+about 0.3 ms. Drawing them at opacity 1.0 rather than 0.6 saved another 7 ms, since a
+translucent extrusion is drawn in two passes, but the see-through look is the web demo's
+and is kept.
+
+`OSM_SOUND_DEMO_RENDER_SCALE` is 1.0 by default: a Mac on Metal does not need it, and
+nobody should have the map go blurry without asking.
 
 **The band layers — under the old bindings.** Rewriting one made MapLibre Native re-run
 tile layout for the building source, and what mattered was whether a pass touched the
@@ -404,10 +428,10 @@ arrive first. The higher frame rate at `0` and `8` is not a win — it is the ma
 less, and at `8` drawing almost nothing: asking for zoom-8 tiles under a zoom-16 camera
 floods the connection and starves the tiles actually being looked at.
 
-`set_tile_options` also carries the LOD controls (`lod_min_radius`, `lod_scale`,
-`lod_pitch_threshold`, `lod_zoom_shift`, `lod_mode`). Those go untested here; at a pitch of
-85° the horizon covers a lot of distant tiles, so they are the next thing to measure if
-this ever needs more frame rate.
+`set_tile_options` also carries the LOD controls. `lod_mode` is set to `Distance`, which
+is worth two to three times the frame rate at this pitch — see [Frame rate](#frame-rate).
+The finer knobs (`lod_min_radius`, `lod_scale`, `lod_pitch_threshold`, `lod_zoom_shift`)
+are left at MapLibre Native's defaults and untested.
 
 
 ### Differences from the web demo

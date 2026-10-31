@@ -32,7 +32,7 @@ use maplibre_native_ffi::{
     CameraUpdateMode, FrameDemand, FrameDemandFlag, LatLng, LogicalExtent, MapHandle, MapMode,
     MapOptions, MapTileOptions, NativeFuture, RenderDriverKind, RenderFrameResult, RenderResult,
     RenderSessionAttachOptions, RenderSessionHandle, RuntimeEvent, RuntimeEventFlag,
-    RuntimeEventHandler, RuntimeEventType, RuntimeHandle, RuntimeOptions, Wake,
+    RuntimeEventHandler, RuntimeEventType, RuntimeHandle, RuntimeOptions, TileLodMode, Wake,
 };
 #[cfg(feature = "opengl")]
 use maplibre_native_ffi::{
@@ -133,6 +133,31 @@ fn prefetch_zoom_delta() -> Option<u32> {
         std::env::var("OSM_SOUND_DEMO_PREFETCH")
             .ok()
             .and_then(|value| value.trim().parse().ok())
+    })
+}
+
+/// How MapLibre Native picks the zoom of the tiles it draws.
+///
+/// `Distance` draws coarser tiles the further they are from the camera. The
+/// default draws every visible tile at the camera's zoom, which at the pitch this
+/// app sits at fills the ground up to the horizon with z16 tiles: about a third
+/// of the frame rate goes on detail too far away to read, and it shows as noise
+/// along the horizon. At 70° and 960x640 a frame takes 11 ms with `Distance`
+/// against 32 ms without, on OpenGL; the foreground is identical.
+///
+/// `OSM_SOUND_DEMO_TILE_LOD=default` puts MapLibre Native's own mode back, which
+/// is how to A/B it.
+fn tile_lod_mode() -> TileLodMode {
+    static MODE: OnceLock<TileLodMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("OSM_SOUND_DEMO_TILE_LOD")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("default") => TileLodMode::Default,
+            _ => TileLodMode::Distance,
+        }
     })
 }
 
@@ -1403,14 +1428,13 @@ impl Engine {
         if let Err(error) = map.discarding().set_bounds(&bounds) {
             eprintln!("raising the pitch bound failed: {error}");
         }
-        if let Some(prefetch_zoom_delta) = prefetch_zoom_delta() {
-            let options = MapTileOptions {
-                prefetch_zoom_delta: Some(prefetch_zoom_delta),
-                ..Default::default()
-            };
-            if let Err(error) = map.discarding().set_tile_options(&options) {
-                eprintln!("setting the tile options failed: {error}");
-            }
+        let options = MapTileOptions {
+            lod_mode: Some(tile_lod_mode()),
+            prefetch_zoom_delta: prefetch_zoom_delta(),
+            ..Default::default()
+        };
+        if let Err(error) = map.discarding().set_tile_options(&options) {
+            eprintln!("setting the tile options failed: {error}");
         }
         if let Err(error) = set_style(&map, self.style_url.as_deref()) {
             eprintln!("style load failed: {error}");
