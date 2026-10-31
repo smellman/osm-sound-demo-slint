@@ -973,11 +973,7 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             match state.source {
                 Source::Otherman => {
                     if let Some(release) = state.release.as_ref() {
-                        open_in_browser(&format!(
-                            "{}{}",
-                            otherman::RELEASE_LINK_BASE,
-                            release.id
-                        ));
+                        open_in_browser(&format!("{}{}", otherman::RELEASE_LINK_BASE, release.id));
                     }
                 }
                 // The file manager, by way of the same opener.

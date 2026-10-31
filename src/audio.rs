@@ -697,7 +697,10 @@ mod tests {
     fn edges_rise_and_stay_inside_the_spectrum_at_every_rate() {
         for rate in [8_000, 22_050, 44_100, 48_000, 88_200, 96_000, 192_000] {
             let edges = band_edges(rate);
-            assert!(edges.windows(2).all(|pair| pair[0] < pair[1]), "{rate}: {edges:?}");
+            assert!(
+                edges.windows(2).all(|pair| pair[0] < pair[1]),
+                "{rate}: {edges:?}"
+            );
             assert!(edges[BINS] <= WINDOW / 2, "{rate}: {edges:?}");
         }
     }

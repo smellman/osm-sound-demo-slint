@@ -55,10 +55,11 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, files);
-        } else if path
-            .extension()
-            .is_some_and(|extension| BUNDLED_EXTENSIONS.iter().any(|bundled| extension == *bundled))
-        {
+        } else if path.extension().is_some_and(|extension| {
+            BUNDLED_EXTENSIONS
+                .iter()
+                .any(|bundled| extension == *bundled)
+        }) {
             files.push(path);
         }
     }
