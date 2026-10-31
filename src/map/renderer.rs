@@ -1534,9 +1534,7 @@ impl Engine {
         loop {
             match attached.session.acquire_frame() {
                 Ok(Some(handle)) => {
-                    let slot = handle
-                        .view()
-                        .and_then(|view| super::shared::slot(&view));
+                    let slot = handle.view().and_then(|view| super::shared::slot(&view));
                     let slot = match slot {
                         Ok(slot) => slot as usize,
                         Err(error) => {

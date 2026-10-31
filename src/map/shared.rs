@@ -37,7 +37,6 @@ pub use vulkan::*;
 /// the GPU to finish sampling them, and one may sit in the frame channel.
 pub const RING_DEPTH: usize = 5;
 
-
 /// A frame drawn into a slot of a ring, acquired so the session leaves the
 /// slot alone until it is dropped.
 pub struct SharedFrame {

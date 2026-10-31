@@ -405,10 +405,10 @@ pub(super) fn import(
             // which is what RESOURCE stands for.
             unsafe {
                 window_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                        hal_texture,
-                        &descriptor,
-                        wgpu::TextureUses::RESOURCE,
-                    )
+                    hal_texture,
+                    &descriptor,
+                    wgpu::TextureUses::RESOURCE,
+                )
             }
         })
         .collect())
