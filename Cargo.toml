@@ -15,14 +15,15 @@ crate-type = ["lib", "cdylib"]
 # cannot be resolved per target the way it used to be — and defaulting to one
 # of them would silently break the platforms it does not suit.
 #
-#     cargo run --release --features opengl     # Linux, the fast path here
-#     cargo run --release --features vulkan     # Linux, for comparison
+#     cargo run --release --features opengl     # Linux
+#     cargo run --release --features vulkan     # Linux
 #     cargo run --release --features metal      # macOS and iOS
 #     ./build_for_android.sh                    # Android, which is opengl
 #
-# OpenGL, not Vulkan, on this machine: at 1920x1200 in release on an AMD RENOIR
-# integrated GPU the renderer draws about 35 fps on OpenGL against 25 on Vulkan.
-# See "Rendering backend" in the README for the breakdown.
+# On Linux either will do. At 1920x1200 in release on an AMD RENOIR integrated
+# GPU, on AC power, Vulkan draws camera + 16 bands at about 32 fps against
+# OpenGL's 30; runs in an unrecorded power state once had Vulkan far behind.
+# See "Rendering backend" in the README for the numbers and the caveat.
 #
 # Enabling two is refused at compile time rather than left to the linker.
 vulkan = ["maplibre-native-ffi/vulkan", "dep:ash"]

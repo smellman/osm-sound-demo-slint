@@ -310,20 +310,24 @@ There is no default, because defaulting to one would silently break the platform
 not suit; naming none, or naming two, stops the build with a message rather than a linker
 error.
 
-**On this hardware OpenGL is faster than Vulkan.** Measured at 1920x1200 in release on an
-AMD RENOIR integrated GPU, with `report_playing_frame_rate`:
+**On AC power Vulkan is slightly ahead of OpenGL.** Measured at 1920x1200 in release on
+an AMD RENOIR integrated GPU with `report_playing_frame_rate`, on AC with the `performance`
+platform profile, taking turns between the backends for three runs each:
 
 | Backend | still | camera only | camera + 16 bands |
 | --- | --- | --- | --- |
-| `opengl` | 36.2 fps | 35.3 fps | **30.3 fps** |
-| `vulkan` | 17.8 fps | 25.3 fps | 23.0 fps |
+| `opengl` | 33.0 fps | 33.7 fps | 29.9 fps |
+| `vulkan` | 36.8 fps | 37.9 fps | **32.1 fps** |
 
-The gap used to be far wider — 25.1 fps against 5.8 for camera + 16 bands — before the
-app switched MapLibre Native to distance-based tile LOD (see [Frame rate](#frame-rate)),
-which helped Vulkan the most. Whether what remains is this GPU's Vulkan driver or
-something the binding does on the Vulkan path has not been chased down; the numbers are
-simply what this machine does, and worth re-measuring on other hardware before reading
-anything general into them.
+Earlier measurements had Vulkan far behind: 17.8, 25.3 and 23.0 fps against OpenGL's
+36.2, 35.3 and 30.3, and before the switch to distance-based tile LOD (see
+[Frame rate](#frame-rate)) 5.8 fps against 25.1 for camera + 16 bands. Their power state
+was not recorded, and that gap did not come back on AC. In the slow state, sampling the
+stacks put almost half of MapLibre Native's render thread in the `memcmp` that
+`mln::vulkan::BufferResource::update` runs against a buffer mapped from uncached memory;
+on AC that call never showed up. So write down whether the machine is on battery, and its
+platform profile (`/sys/firmware/acpi/platform_profile`), next to any numbers, and compare
+the backends within one session rather than against this table.
 
 Unlike the older `maplibre_native` crate, this one hands the graphics plumbing to the
 caller: there is no headless renderer that makes its own device. `src/map/renderer.rs`
@@ -374,7 +378,9 @@ back for comparison. Camera + 16 bands:
 
 One run each, and runs vary — 960x600 coming out below 1280x800 on OpenGL is that noise,
 and a Vulkan run at 1920x1200 once gave 32 fps where two repeats gave 23 — so read the
-columns against each other rather than the cells exactly.
+columns against each other rather than the cells exactly. The machine's power state was
+not recorded for these runs either (see [Rendering backend](#rendering-backend)), so the
+Vulkan columns in particular describe one state of the machine, not Vulkan in general.
 
 **The pixels.** Everything the map does scales with the area it covers, so after the LOD
 the render size is the next thing to trade. `OSM_SOUND_DEMO_RENDER_SCALE` buys frame rate
