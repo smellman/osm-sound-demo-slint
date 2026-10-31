@@ -179,7 +179,7 @@ Gamepads do not work: `gilrs` has no Android backend, as it had none for iOS.
 | `OSM_SOUND_DEMO_FPS` | Print `shown` and `rendered` frame rates to stderr every second. A gap between them means frames are being dropped at the channel; no gap means the render thread is the limit |
 | `OSM_SOUND_DEMO_RENDERER_TESTS` | Run the opt-in renderer tests, which need a GPU and the network |
 | `OSM_SOUND_DEMO_RENDER_SIZE` | Size the renderer probes measure at, `<width>x<height>` (default 960x640) |
-| `OSM_SOUND_DEMO_READBACK` | Linux with `vulkan`: read frames back instead of sharing them with the window, to compare — see [Shared frames](#shared-frames) |
+| `OSM_SOUND_DEMO_READBACK` | Linux with `vulkan`, or macOS: read frames back instead of sharing them with the window, to compare — see [Shared frames](#shared-frames) |
 | `OSM_SOUND_DEMO_RENDER_SCALE` | Render the map at this fraction of its on-screen size and let Slint scale it up (default 1.0, floor 0.25). The single biggest thing you can trade for frame rate — see [Frame rate](#frame-rate) |
 
 ## Controls
@@ -296,8 +296,9 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
 On macOS the window is drawn with Slint's Skia renderer rather than its default, FemtoVG.
 FemtoVG draws through OpenGL there, which holds a 120 Hz display to 60: on an M2 Pro's
 built-in display, full screen and playing, FemtoVG showed 61–65 fps while the render
-thread finished 74–75, and Skia showed 72–76 of 72–77. Linux uses Skia too, for the
-reason in [Shared frames](#shared-frames); other platforms keep Slint's default.
+thread finished 74–75, and Skia showed 72–76 of 72–77. Skia draws through wgpu's Metal
+backend, so the map's frames can be shared with it too; see [Shared frames](#shared-frames).
+Linux uses Skia for that reason alone; other platforms keep Slint's default.
 `SLINT_BACKEND=winit-femtovg` puts FemtoVG back to compare.
 
 ### Shared frames
@@ -342,6 +343,25 @@ lock to take around its own submissions. Some details that cost time to find:
   closing the map would wait out its timeout.
 - The images are passed between the devices without a queue family ownership transfer.
   RADV shows them correctly, but strictly the Vulkan spec asks for one.
+
+On macOS the same holds with Metal, and more simply. Skia draws the window through wgpu's
+Metal backend, and the map renders into a ring of five textures made on that very device
+— the system default, which both sides pick — so each is wrapped for wgpu as it is,
+with nothing to export or import. Metal takes command buffers from any number of queues,
+so MapLibre Native and wgpu each keep their own, and a Metal frame only becomes
+acquirable once its GPU work has completed, so no fence crosses between them either.
+Acquiring, releasing and resizing work as on Linux. If the window turns out to draw on
+another device, frames are read back instead.
+
+On an M2 Pro's built-in 120 Hz display, full screen, playing from Local Music:
+
+| Window | Frames | fps |
+| --- | --- | --- |
+| Skia over wgpu (default) | shared | 166–218 |
+| Skia over wgpu (`OSM_SOUND_DEMO_READBACK=1`) | read back | 105–121 |
+
+As on Linux these are frames handed to Slint, so past 120 they are headroom rather than
+anything the display shows.
 
 If the window turns out not to be drawn with Vulkan, the map switches back to reading
 frames back.

@@ -1263,19 +1263,29 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
 }
 
 /// Draws the window with Skia on macOS, where FemtoVG's OpenGL keeps a 120 Hz
-/// display at 60. `SLINT_BACKEND` still wins, so the two can be compared.
+/// display at 60. It draws through wgpu's Metal backend, so the map's frames
+/// can be shown as textures instead of read back — see "Shared frames" in the
+/// README. `OSM_SOUND_DEMO_READBACK` keeps Skia but reads frames back, to
+/// compare; `SLINT_BACKEND` overrides the lot.
 ///
 /// Returns whether the map should share its frames with the window rather than
-/// have them read back, which only Linux does.
+/// have them read back.
 #[cfg(target_os = "macos")]
 fn select_window_renderer() -> Result<bool, slint::PlatformError> {
     if std::env::var_os("SLINT_BACKEND").is_some() {
         return Ok(false);
     }
-    slint::BackendSelector::new()
-        .renderer_name("skia".to_owned())
-        .select()
-        .map(|()| false)
+    let selector = slint::BackendSelector::new().renderer_name("skia".to_owned());
+    #[cfg(feature = "metal")]
+    if std::env::var_os("OSM_SOUND_DEMO_READBACK").is_none() {
+        let mut settings = slint::wgpu_30::WGPUSettings::default();
+        settings.backends = slint::wgpu_30::wgpu::Backends::METAL;
+        return selector
+            .require_wgpu_30(slint::wgpu_30::WGPUConfiguration::Automatic(settings))
+            .select()
+            .map(|()| true);
+    }
+    selector.select().map(|()| false)
 }
 
 /// Draws the window with Skia on Linux too. With the `vulkan` feature it draws

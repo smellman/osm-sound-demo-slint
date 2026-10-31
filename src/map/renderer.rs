@@ -298,7 +298,7 @@ pub struct Frame {
     pub rgba: Vec<u8>,
     /// The frame as a texture the window's device can sample, in place of
     /// `rgba`, when frames are shared rather than read back.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     pub shared: Option<super::shared::SharedFrame>,
     /// The style's attribution, once its sources have reported one. Sent on
     /// the frame it changes and `None` on every other.
@@ -332,8 +332,8 @@ enum Command {
     /// How many of the slices to show; one of [`SLICE_MODES`].
     Slices(usize),
     /// Stop sharing frames and read them back instead: the window turned out
-    /// not to be drawn with Vulkan.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    /// not to be drawn on a device that can take them.
+    #[cfg(shared_frames)]
     ReadBack,
 }
 
@@ -481,9 +481,9 @@ pub struct MapLibre {
     /// The zoom a pinch started from, while one is in progress.
     pinch_from: Option<f64>,
     /// Puts shared frames on screen and hands them back once drawn.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     bridge: Rc<RefCell<super::shared::Bridge>>,
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     read_back_requested: bool,
 }
 
@@ -513,9 +513,9 @@ impl MapLibre {
             flight_id: 0,
             slices: SLICE_MODES[0],
             pinch_from: None,
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             bridge: Rc::default(),
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             read_back_requested: false,
         }
     }
@@ -523,9 +523,9 @@ impl MapLibre {
     /// Lets shared frames reach `window`, which has to be told when each draw
     /// is submitted before the frames it showed can be handed back.
     pub fn attach_window(&self, window: &slint::Window) {
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         super::shared::Bridge::attach(&self.bridge, window);
-        #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+        #[cfg(not(shared_frames))]
         let _ = window;
     }
 
@@ -533,13 +533,13 @@ impl MapLibre {
     /// `Bridge::let_go_of_disposed`. Called on every tick, since the new
     /// session cannot start until they are.
     pub fn tidy_shared(&mut self) {
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         self.bridge.borrow_mut().let_go_of_disposed();
     }
 
     /// The image to show for a shared frame, or `None` if it cannot be shown,
     /// in which case the frame is handed straight back.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     pub fn show_shared(&mut self, frame: super::shared::SharedFrame) -> Option<slint::Image> {
         let mut bridge = self.bridge.borrow_mut();
         if bridge.refused() {
@@ -814,7 +814,7 @@ impl Drop for MapLibre {
         // Shared frames are handed back first, both the ones on screen and any
         // still in the channel, or their session would never retire and the
         // map's teardown would wait out its timeout for them.
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         self.bridge.borrow_mut().let_go_of_all();
         if let Some(handle) = self.render_thread.take() {
             while !handle.is_finished() {
@@ -1041,17 +1041,17 @@ struct Engine {
     pixels: Vec<u8>,
     /// Render into a ring of images the window's device shares, rather than
     /// reading frames back.
-    #[cfg_attr(not(all(feature = "vulkan", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(shared_frames), allow(dead_code))]
     share: bool,
     /// Rings of disposed sessions, kept until those sessions have retired.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     retired: Vec<(Arc<super::shared::Ring>, Instant)>,
     /// A map waiting for its old session to retire before it takes a new one.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     unattached: Option<Unattached>,
 }
 
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(shared_frames)]
 struct Unattached {
     map: MapHandle,
     layers: bool,
@@ -1070,17 +1070,17 @@ struct Attached {
     /// referring to them can be added.
     style_loaded: bool,
     /// The images the session renders into, when frames are shared.
-    #[cfg_attr(not(all(feature = "vulkan", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(shared_frames), allow(dead_code))]
     ring: SharedRing,
 }
 
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(shared_frames)]
 type SharedRing = Option<Arc<super::shared::Ring>>;
-#[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+#[cfg(not(shared_frames))]
 type SharedRing = ();
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(shared_frames)]
 type SharedSlot = Option<super::shared::SharedFrame>;
-#[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+#[cfg(not(shared_frames))]
 type SharedSlot = ();
 
 impl Engine {
@@ -1113,16 +1113,16 @@ impl Engine {
             next_token: FIRST_TOKEN,
             pixels: Vec::new(),
             share: false,
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             retired: Vec::new(),
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             unattached: None,
         }
     }
 
     fn apply(&mut self, command: Command) {
         match command {
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             Command::ReadBack => {
                 if self.share {
                     self.share = false;
@@ -1145,14 +1145,14 @@ impl Engine {
                     // network left the map blank.
                     // The session sizes the map to its target, so this is all
                     // a resize takes.
-                    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+                    #[cfg(shared_frames)]
                     let shared = self
                         .map
                         .as_ref()
                         .is_some_and(|attached| attached.ring.is_some());
-                    #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+                    #[cfg(not(shared_frames))]
                     let shared = false;
-                    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+                    #[cfg(shared_frames)]
                     if shared && let Err(error) = self.reattach() {
                         eprintln!("replacing the shared render target failed: {error}");
                         self.map = None;
@@ -1417,7 +1417,7 @@ impl Engine {
         };
 
         phase(PHASE_WAIT, &mut clock);
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         if let Some(ring) = self.map.as_ref()?.ring.clone() {
             let shared = self.acquire_shared(ring);
             self.dirty = false;
@@ -1506,13 +1506,13 @@ impl Engine {
         }
 
         let (width, height) = self.size;
-        #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+        #[cfg(not(shared_frames))]
         let () = shared;
         Frame {
             width,
             height,
             rgba,
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             shared,
             attribution,
             camera,
@@ -1523,7 +1523,7 @@ impl Engine {
 
     /// Takes the newest frame the session drew into the shared ring, handing
     /// back any older ones nobody will show, and arms the next demand.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     fn acquire_shared(
         &mut self,
         ring: Arc<super::shared::Ring>,
@@ -1536,7 +1536,7 @@ impl Engine {
                 Ok(Some(handle)) => {
                     let slot = handle
                         .view()
-                        .and_then(|view| view.get_vulkan_texture().map(|frame| frame.slot));
+                        .and_then(|view| super::shared::slot(&view));
                     let slot = match slot {
                         Ok(slot) => slot as usize,
                         Err(error) => {
@@ -1601,7 +1601,7 @@ impl Engine {
 
     /// Brings up the runtime, map and render session, and loads the style.
     fn ensure_map(&mut self) -> Option<()> {
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         if self.unattached.is_some() {
             self.attach_unattached();
             if self.map.is_none() && self.unattached.is_some() {
@@ -1713,14 +1713,14 @@ impl Engine {
     /// Attaches the session the map renders through: a shared ring when
     /// frames are shared, otherwise a texture this thread reads back.
     fn attach_target(&self, map: &MapHandle) -> Result<(RenderSessionHandle, SharedRing), String> {
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         if self.share {
             return attach_shared(map, self.size, &self.inbox)
                 .map(|(session, ring)| (session, Some(ring)));
         }
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         return attach_render_target(map, self.size, &self.inbox).map(|session| (session, None));
-        #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+        #[cfg(not(shared_frames))]
         attach_render_target(map, self.size, &self.inbox).map(|session| (session, ()))
     }
 
@@ -1729,7 +1729,7 @@ impl Engine {
     /// place and detaching are refused while a frame is acquired, which the
     /// one on screen always is. Disposing is not: the old session retires once
     /// the UI hands its last frame back, and its ring is kept until then.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     fn reattach(&mut self) -> Result<(), String> {
         let Some(attached) = self.map.take() else {
             return Ok(());
@@ -1763,7 +1763,7 @@ impl Engine {
     /// Attaches a new session to a map whose old one was disposed of, once the
     /// old one has retired. Until then the map refuses it, and this is tried
     /// again on the next pass; past [`NATIVE_TIMEOUT`] the map is rebuilt.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     fn attach_unattached(&mut self) {
         let Some(unattached) = self.unattached.take() else {
             return;
@@ -1793,7 +1793,7 @@ impl Engine {
 
     /// Lets go of rings whose session has been disposed of, once no frame of
     /// them is left on screen and the session has had time to retire.
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(shared_frames)]
     fn prune_retired(&mut self) {
         self.retired.retain(|(ring, since)| {
             Arc::strong_count(ring) > 1 || since.elapsed() < NATIVE_TIMEOUT
@@ -2039,7 +2039,7 @@ impl Engine {
             // A shared ring may still have a frame out, which detaching
             // refuses; disposing waits for it instead, and closing the map
             // below waits for that. The ring outlives both.
-            #[cfg(all(feature = "vulkan", target_os = "linux"))]
+            #[cfg(shared_frames)]
             let session = match ring {
                 Some(_) => {
                     if let Err((_, error)) = session.dispose() {
@@ -2049,7 +2049,7 @@ impl Engine {
                 }
                 None => Some(session),
             };
-            #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+            #[cfg(not(shared_frames))]
             let (session, _) = (Some(session), ring);
             if let Some(session) = session {
                 // Detaching is driver work like any other, so it is serviced here;
@@ -2076,7 +2076,7 @@ impl Engine {
                     .and_then(|released| drive(&self.inbox, None, released)),
             );
         }
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         if let Some(Unattached { map, .. }) = self.unattached.take() {
             report(
                 "closing the map",
@@ -2118,11 +2118,15 @@ fn render_thread(
     on_frame: &dyn Fn(),
 ) {
     let mut engine = Engine::new(size);
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(all(shared_frames, feature = "vulkan"))]
     {
         engine.share = share && vulkan_context().exports_memory;
     }
-    #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+    #[cfg(all(shared_frames, feature = "metal"))]
+    {
+        engine.share = share;
+    }
+    #[cfg(not(shared_frames))]
     let _ = share;
     loop {
         // Only park when there is nothing to draw.
@@ -2152,7 +2156,7 @@ fn render_thread(
         // The runtime has to turn whether or not a frame is wanted: that is how
         // tile loads finish and how the map says it wants another one.
         engine.pump(Some(PUMP_BUDGET));
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         engine.prune_retired();
         if !engine.wants_frame() {
             continue;
@@ -2264,7 +2268,7 @@ fn vulkan_context_descriptor(
 
 /// Attaches a ring of images the window's device imports, so frames reach
 /// the screen without a readback; see `shared`.
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(all(shared_frames, feature = "vulkan"))]
 fn attach_shared(
     map: &MapHandle,
     size: (u32, u32),
@@ -2309,6 +2313,48 @@ fn attach_shared(
     // SAFETY: the context's objects are leaked for the process, and the ring's
     // images live as long as the `Arc` the session's owner keeps.
     let (session, attached) = unsafe { map.attach_vulkan_borrowed_texture(&descriptor, &options) }
+        .map_err(|error| error.to_string())?;
+    drive(inbox, Some(&session), attached)?;
+    Ok((session, ring))
+}
+
+/// Attaches a ring of textures on the window's own Metal device, so frames
+/// reach the screen without a readback; see `shared`.
+#[cfg(all(shared_frames, feature = "metal"))]
+fn attach_shared(
+    map: &MapHandle,
+    size: (u32, u32),
+    inbox: &Arc<Inbox>,
+) -> Result<(RenderSessionHandle, Arc<super::shared::Ring>), String> {
+    use super::shared::{Producer, Ring};
+    use maplibre_native_ffi::{MetalBorrowedTexture, MetalBorrowedTextureDescriptor};
+
+    let ring = Ring::new(
+        &Producer {
+            device: metal_device(),
+        },
+        size.0,
+        size.1,
+    )?;
+    let textures = ring
+        .textures()
+        .into_iter()
+        .map(MetalBorrowedTexture::new)
+        .collect();
+    let descriptor = MetalBorrowedTextureDescriptor::new(
+        LogicalExtent::new(size.0, size.1, 1.0),
+        ring.width(),
+        ring.height(),
+        textures,
+    );
+    let options = RenderSessionAttachOptions {
+        frame_wake: inbox_wake(inbox),
+        driver_work_wake: inbox_wake(inbox),
+        ..RenderSessionAttachOptions::new(DRIVER)
+    };
+    // SAFETY: the textures are on the device the map renders with, and live as
+    // long as the `Arc` the session's owner keeps.
+    let (session, attached) = unsafe { map.attach_metal_borrowed_texture(&descriptor, &options) }
         .map_err(|error| error.to_string())?;
     drive(inbox, Some(&session), attached)?;
     Ok((session, ring))
@@ -2697,7 +2743,7 @@ fn create_vulkan_context() -> Result<VulkanContext, Box<dyn std::error::Error>> 
 /// Leaked deliberately: it outlives every map, and the render target only
 /// borrows the pointer.
 #[cfg(feature = "metal")]
-fn metal_device() -> *mut std::ffi::c_void {
+pub(super) fn metal_device() -> *mut std::ffi::c_void {
     use objc2::rc::Retained;
     use objc2_metal::MTLCreateSystemDefaultDevice;
 

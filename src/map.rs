@@ -14,7 +14,7 @@ mod bundled;
 #[cfg(target_os = "android")]
 mod fetch;
 mod renderer;
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(shared_frames)]
 mod shared;
 pub use renderer::{CameraBoost, Light, MapLibre, SLICE_MODES, SLICES, create_map};
 
@@ -33,12 +33,12 @@ pub fn push_state(ui: &AppWindow, map: &mut MapLibre) -> bool {
     }
     if let Some(frame) = &mut frame {
         // A shared frame is already on the GPU the window draws with.
-        #[cfg(all(feature = "vulkan", target_os = "linux"))]
+        #[cfg(shared_frames)]
         let image = match frame.shared.take() {
             Some(shared) => map.show_shared(shared),
             None => Some(pixel_image(frame)),
         };
-        #[cfg(not(all(feature = "vulkan", target_os = "linux")))]
+        #[cfg(not(shared_frames))]
         let image = Some(pixel_image(frame));
         if let Some(image) = image {
             adapter.set_frame(image);

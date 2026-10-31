@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 fn main() {
     slint_build::compile("ui/app.slint").expect("Slint build failed");
     bundle_style_resources();
+    shared_frames_cfg();
+}
+
+/// Sets `shared_frames` where the map's frames can reach the window as
+/// textures rather than being read back: Vulkan on Linux, Metal on macOS.
+/// See `src/map/shared.rs`.
+fn shared_frames_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(shared_frames)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let feature = |name: &str| std::env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
+    if (os == "linux" && feature("VULKAN")) || (os == "macos" && feature("METAL")) {
+        println!("cargo::rustc-cfg=shared_frames");
+    }
 }
 
 /// Writes the table `src/map/bundled.rs` includes: the glyph ranges under

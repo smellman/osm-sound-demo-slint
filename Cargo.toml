@@ -67,9 +67,14 @@ objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
 
 # Skia draws the window on macOS: FemtoVG goes through OpenGL there, which is
 # held to 60 Hz on a 120 Hz display. `app::run` selects it; see "Window
-# renderer" in the README.
+# renderer" in the README. It draws through wgpu's Metal backend, and
+# `unstable-wgpu-30` lets it take the map's frames as wgpu textures, rendered
+# on the same device — see "Shared frames". wgpu-hal names Metal objects with
+# objc2 0.6 and objc2-metal 0.3, so the ring is made with those.
 [target.'cfg(target_os = "macos")'.dependencies]
-slint = { version = "1.18", features = ["renderer-skia"] }
+slint = { version = "1.18", features = ["renderer-skia", "unstable-wgpu-30"] }
+objc2-v06 = { package = "objc2", version = "0.6" }
+objc2-metal-v03 = { package = "objc2-metal", version = "0.3", features = ["MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
 
 # Skia draws the window on Linux as well, and `unstable-wgpu-30` lets it take
 # the map's frames as wgpu textures: with the `vulkan` feature the map renders
