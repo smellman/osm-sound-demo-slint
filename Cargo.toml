@@ -15,14 +15,14 @@ crate-type = ["lib", "cdylib"]
 # cannot be resolved per target the way it used to be — and defaulting to one
 # of them would silently break the platforms it does not suit.
 #
+#     cargo run --release --features vulkan     # Linux, the faster one here
 #     cargo run --release --features opengl     # Linux
-#     cargo run --release --features vulkan     # Linux
 #     cargo run --release --features metal      # macOS and iOS
 #     ./build_for_android.sh                    # Android, which is opengl
 #
-# On Linux either will do. At 1920x1200 in release on an AMD RENOIR integrated
-# GPU, on AC power, Vulkan draws camera + 16 bands at about 32 fps against
-# OpenGL's 30; runs in an unrecorded power state once had Vulkan far behind.
+# On Linux, Vulkan is the faster of the two. At 1920x1200 in release on an AMD
+# RENOIR integrated GPU, on AC power, it draws camera + 16 bands at about 48 fps
+# against OpenGL's 29; runs in an unrecorded power state once had it far behind.
 # See "Rendering backend" in the README for the numbers and the caveat.
 #
 # Enabling two is refused at compile time rather than left to the linker.

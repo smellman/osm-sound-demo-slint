@@ -310,14 +310,28 @@ There is no default, because defaulting to one would silently break the platform
 not suit; naming none, or naming two, stops the build with a message rather than a linker
 error.
 
-**On AC power Vulkan is slightly ahead of OpenGL.** Measured at 1920x1200 in release on
-an AMD RENOIR integrated GPU with `report_playing_frame_rate`, on AC with the `performance`
+**On AC power Vulkan is well ahead of OpenGL.** Measured at 1920x1200 in release on an AMD
+RENOIR integrated GPU with `report_playing_frame_rate`, on AC with the `performance`
 platform profile, taking turns between the backends for three runs each:
 
 | Backend | still | camera only | camera + 16 bands |
 | --- | --- | --- | --- |
-| `opengl` | 33.0 fps | 33.7 fps | 29.9 fps |
-| `vulkan` | 36.8 fps | 37.9 fps | **32.1 fps** |
+| `opengl` | 33.9 fps | 35.8 fps | 28.9 fps |
+| `vulkan` | 64.9 fps | 63.6 fps | **48.4 fps** |
+
+Background load moves these too: with another application busy on one core, the same
+build gave Vulkan 44.9 fps for camera + 16 bands and OpenGL 29.0, so measure on an
+otherwise idle machine and read the rows against each other rather than the cells
+exactly.
+
+Most of Vulkan's lead comes from the order in which the render thread queues its work.
+The session runs driver work in the order it arrives, and the thread used to arm the
+next frame demand before asking for the readback of the frame it had just been handed.
+Whenever an update was already waiting, that demand drew a whole frame first, about
+10 ms, while the readback itself takes about 3.5 ms. The demand is now armed only after
+the readback is queued, so the next frame draws while this one is copied out for Slint.
+That took Vulkan from 32 to about 53 fps for camera + 16 bands when it went in. OpenGL
+gains nothing from it, because its driver work runs on the render thread anyway.
 
 Earlier measurements had Vulkan far behind: 17.8, 25.3 and 23.0 fps against OpenGL's
 36.2, 35.3 and 30.3, and before the switch to distance-based tile LOD (see
