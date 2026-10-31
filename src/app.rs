@@ -278,6 +278,7 @@ impl State {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    select_window_renderer()?;
     let ui = AppWindow::new()?;
     // Full screen by default; `OSM_SOUND_DEMO_WINDOWED` is for running it
     // alongside other work.
@@ -1258,6 +1259,23 @@ fn step_track(ui: &AppWindow, state: &Rc<RefCell<State>>, delta: isize) {
         stop(ui, state);
         start(ui, state);
     }
+}
+
+/// Draws the window with Skia on macOS, where FemtoVG's OpenGL keeps a 120 Hz
+/// display at 60. `SLINT_BACKEND` still wins, so the two can be compared.
+#[cfg(target_os = "macos")]
+fn select_window_renderer() -> Result<(), slint::PlatformError> {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return Ok(());
+    }
+    slint::BackendSelector::new()
+        .renderer_name("skia".to_owned())
+        .select()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn select_window_renderer() -> Result<(), slint::PlatformError> {
+    Ok(())
 }
 
 fn connect_tick(ui: &AppWindow, state: &Rc<RefCell<State>>) {

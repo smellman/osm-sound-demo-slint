@@ -290,6 +290,14 @@ MP3 from archive.org ──► StreamingRead ──► rodio Decoder ──► d
   contract is meant to be filled by its own C++ backend, so there was nothing left to
   track.
 
+### Window renderer
+
+On macOS the window is drawn with Slint's Skia renderer rather than its default, FemtoVG.
+FemtoVG draws through OpenGL there, which holds a 120 Hz display to 60: on an M2 Pro's
+built-in display, full screen and playing, FemtoVG showed 61–65 fps while the render
+thread finished 74–75, and Skia showed 72–76 of 72–77. Other platforms keep Slint's
+default. `SLINT_BACKEND=winit-femtovg` puts FemtoVG back to compare.
+
 ### Rendering backend
 
 The map runs on [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)'s
