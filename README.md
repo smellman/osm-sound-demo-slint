@@ -226,6 +226,7 @@ its tile cache properly rather than being cut off mid-write.
 | VJ Mode | Follow an input device instead of a track |
 | ◀◀ / ▶ / ▶▶ | Previous track, play & stop, next track |
 | Vol | Output volume |
+| Wave | Wave mode on or off — see [the effects](#the-effects) |
 | Release dropdown | Load a release; the first one loads on startup |
 | Go To Release | Open the release page in your browser |
 
@@ -242,6 +243,7 @@ line. Anything the pad does, the mouse can still do.
 | B | The orbit |
 | Y | Switch how the skyline is coloured — see [the effects](#the-effects) |
 | X | Switch how finely the skyline is cut, 16 slices or 64 |
+| R3 (right stick pressed in) | Wave mode on or off |
 | L1 / R1 | Fly to the previous / next city (the dropdown follows) |
 | L2 / R2 | Volume down / up (the slider follows) |
 | Left stick | Pan |
@@ -710,6 +712,21 @@ per-layer overhead rather than drawing anything twice.
 and the resting buildings are grey, so the map is monochrome until something colours it.
 Coloured subpixels go from 0.0% to 84.0% when the palette goes on and back down when it
 comes off, and the frame carries 682 distinct shades rather than one per band.
+
+**R3 — wave mode.** The web demo's wave mode: instead of by height, the buildings are cut
+into 24 rings 80 m wide around the centre of the map, the outermost taking everything
+beyond, and the beat — the mean of the four lowest bands — travels outwards through them
+at 50 ms a ring, with a ripple running across the rings on top. The web demo added a
+second set of layers for the rings; here the first 24 of the sixty-four slice layers are
+refiltered instead, for the same reason the slices are hidden rather than removed. Each
+ring is a `distance` filter from the centre, which MapLibre Native evaluates against
+building polygons as well as points and lines; `wave_rings_cut_the_buildings_by_distance`
+holds that.
+
+Moving the map moves the centre, once the camera has drifted more than 20 m from it and
+stayed put for 0.3 s — refiltering re-runs tile layout, so it waits for the map to settle,
+as the web demo waited for `moveend`. The slice setting is kept, and comes back when wave
+mode goes off.
 
 ### Streaming, not downloading
 

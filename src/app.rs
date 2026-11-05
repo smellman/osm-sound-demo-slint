@@ -476,6 +476,21 @@ fn toggle_slices(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     notify(ui, format!("skyline: {next} slices"));
 }
 
+/// Wave mode, the web demo's: the buildings are cut into rings around the
+/// map's centre rather than by height, and the beat travels outwards through
+/// them. The slice setting is kept for when it is turned off.
+fn toggle_wave(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let map = state.borrow().map.clone();
+    let on = {
+        let mut map = map.borrow_mut();
+        let on = !map.wave();
+        map.set_wave(on);
+        on
+    };
+    ui.set_wave(on);
+    notify(ui, if on { "skyline: wave" } else { "skyline: by height" });
+}
+
 /// Switches between the two ways the skyline is coloured.
 ///
 /// **Lit** is the web demo's: one light over the whole scene, its colour and
@@ -616,6 +631,7 @@ fn run_action(ui: &AppWindow, state: &Rc<RefCell<State>>, action: Action) {
         Action::Orbit => state.borrow_mut().orbit_started = Some(Instant::now()),
         Action::ToggleLight => toggle_light(ui, state),
         Action::ToggleSlices => toggle_slices(ui, state),
+        Action::ToggleWave => toggle_wave(ui, state),
     }
 }
 
@@ -895,6 +911,16 @@ fn connect_transport(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             };
             if let Some(action) = face_button_action(&button) {
                 run_action(&ui, &state, action);
+            }
+        }
+    });
+
+    ui.on_toggle_wave({
+        let ui_handle = ui.as_weak();
+        let state = Rc::clone(state);
+        move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                toggle_wave(&ui, &state);
             }
         }
     });

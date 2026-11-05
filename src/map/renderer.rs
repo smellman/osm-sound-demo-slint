@@ -27,6 +27,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::wave::{self, Wave};
 use maplibre_native_ffi::{
     AnimationOptions, BoundOptions, Camera, CameraOptions, CameraTransitionHandler, CameraUpdate,
     CameraUpdateMode, FrameDemand, FrameDemandFlag, LatLng, LogicalExtent, MapHandle, MapMode,
@@ -331,6 +332,9 @@ enum Command {
     Palette(Option<Box<[f64; SLICES]>>),
     /// How many of the slices to show; one of [`SLICE_MODES`].
     Slices(usize),
+    /// Cut the buildings into rings around this centre, longitude first,
+    /// instead of into height slices; `None` goes back to the slices.
+    Wave(Option<(f64, f64)>),
     /// Stop sharing frames and read them back instead: the window turned out
     /// not to be drawn on a device that can take them.
     #[cfg(shared_frames)]
@@ -478,6 +482,8 @@ pub struct MapLibre {
     flight_id: u64,
     /// How many height slices the skyline is shown at; one of [`SLICE_MODES`].
     slices: usize,
+    /// Wave mode, while it is on.
+    wave: Option<Wave>,
     /// The zoom a pinch started from, while one is in progress.
     pinch_from: Option<f64>,
     /// Puts shared frames on screen and hands them back once drawn.
@@ -512,6 +518,7 @@ impl MapLibre {
             flying: false,
             flight_id: 0,
             slices: SLICE_MODES[0],
+            wave: None,
             pinch_from: None,
             #[cfg(shared_frames)]
             bridge: Rc::default(),
@@ -757,6 +764,20 @@ impl MapLibre {
     /// `height_gain` scales the whole skyline, which the drop effect uses to
     /// make it jump.
     pub fn apply_levels(&mut self, levels: &[f32; BINS], height_gain: f64) {
+        if let Some(wave) = &mut self.wave {
+            let camera = self.controller.effective();
+            let recentred = wave.follow((camera.lon, camera.lat));
+            let heights = wave.heights(levels);
+            if recentred.is_some() {
+                self.send(Command::Wave(recentred));
+            }
+            let mut bands = [Band::default(); SLICES];
+            for (band, height) in bands.iter_mut().zip(heights) {
+                band.height = height * height_gain;
+            }
+            self.send(Command::Bands(Box::new(bands)));
+            return;
+        }
         let shown = self.slices;
         let sampled = slice_levels(levels, shown);
         let mut bands = [Band::default(); SLICES];
@@ -786,6 +807,24 @@ impl MapLibre {
         self.send(Command::Slices(slices));
     }
 
+    /// Whether wave mode is on.
+    pub fn wave(&self) -> bool {
+        self.wave.is_some()
+    }
+
+    /// Turns wave mode on, centred where the camera is, or off.
+    pub fn set_wave(&mut self, on: bool) {
+        if on == self.wave.is_some() {
+            return;
+        }
+        self.wave = on.then(|| {
+            let camera = self.controller.effective();
+            Wave::new((camera.lon, camera.lat))
+        });
+        let centre = self.wave.as_ref().map(Wave::centre);
+        self.send(Command::Wave(centre));
+    }
+
     /// Sets the style's light, as the web demo's `map.setLight` did.
     pub fn set_light(&mut self, light: Light) {
         self.send(Command::Light(light));
@@ -799,6 +838,9 @@ impl MapLibre {
 
     /// Resets every band back to the flat, unlit state used when nothing plays.
     pub fn reset_levels(&mut self) {
+        if let Some(wave) = &mut self.wave {
+            wave.reset();
+        }
         self.send(Command::Bands(Box::new([Band::default(); SLICES])));
         self.send(Command::Light(Light::default()));
     }
@@ -1006,9 +1048,12 @@ struct Engine {
     /// A hue per band, so the skyline is coloured by height instead of lit.
     palette: Option<Box<[f64; SLICES]>>,
     applied_palette: Option<Option<Box<[f64; SLICES]>>>,
-    /// How many slices are shown, and what the style has been told.
+    /// How many slices are shown, and where the rings are centred in wave
+    /// mode; together, the layout. `applied_layout` is what the style has been
+    /// told.
     slices: usize,
-    applied_slices: Option<usize>,
+    wave: Option<(f64, f64)>,
+    applied_layout: Option<Layout>,
     /// The transition the map is running, if any.
     flight_id: Option<u64>,
     /// The last fly-to taken on, kept after `flight_id` is cleared so a frame
@@ -1099,7 +1144,8 @@ impl Engine {
             palette: None,
             applied_palette: None,
             slices: SLICE_MODES[0],
-            applied_slices: None,
+            wave: None,
+            applied_layout: None,
             flight_id: None,
             last_flight: None,
             pending_fly: None,
@@ -1194,7 +1240,7 @@ impl Engine {
                         attached.style_loaded = false;
                         self.applied_light = None;
                         self.applied_palette = None;
-                        self.applied_slices = None;
+                        self.applied_layout = None;
                         self.attribution = None;
                         self.attribution_attempts = 0;
                     }
@@ -1239,6 +1285,10 @@ impl Engine {
             }
             Command::Slices(slices) => {
                 self.slices = slices;
+                self.mark_dirty();
+            }
+            Command::Wave(centre) => {
+                self.wave = centre;
                 self.mark_dirty();
             }
             Command::Light(light) => {
@@ -1852,14 +1902,14 @@ impl Engine {
                 attached.layers = true;
             }
             self.applied = [None; SLICES];
-            self.applied_slices = None;
+            self.applied_layout = None;
         }
 
         self.sync_slices();
 
         let Some(attached) = &self.map else { return };
-        let step = SLICES / self.slices;
-        for slice in (0..SLICES).step_by(step) {
+        let layout = self.layout();
+        for slice in (0..SLICES).filter(|&slice| layout.shows(slice)) {
             let target = self.bands[slice];
             if self.applied[slice].is_some_and(|applied| applied.close_to(target)) {
                 continue;
@@ -1879,21 +1929,23 @@ impl Engine {
         self.sync_palette();
     }
 
-    /// Shows the skyline at the slice count that was asked for.
+    /// Shows the skyline at the slice count that was asked for, or as rings
+    /// in wave mode.
     ///
     /// The layer set never changes; what changes is which layers are visible
-    /// and how much height each covers. A shown layer is widened to span the
-    /// slices hidden behind it, so the skyline stays whole either way.
+    /// and what each one's filter takes. A shown slice is widened to span the
+    /// slices hidden behind it, so the skyline stays whole either way; in wave
+    /// mode the first [`wave::RINGS`] layers take a ring each instead.
     fn sync_slices(&mut self) {
-        if self.applied_slices == Some(self.slices) {
+        let layout = self.layout();
+        if self.applied_layout == Some(layout) {
             return;
         }
         let Some(attached) = &self.map else { return };
 
-        let step = SLICES / self.slices;
         for slice in 0..SLICES {
             let id = building_layer_id(slice);
-            let shown = slice.is_multiple_of(step);
+            let shown = layout.shows(slice);
             // Style-spec JSON, so the strings keep their quotes.
             let visibility = if shown { r#""visible""# } else { r#""none""# };
             if let Err(error) =
@@ -1908,7 +1960,7 @@ impl Engine {
             if !shown {
                 continue;
             }
-            let filter = building_layer_filter(slice, step);
+            let filter = layout.filter(slice);
             if let Err(error) = attached.map.discarding().set_style_layer_property(
                 &id,
                 "filter",
@@ -1921,7 +1973,14 @@ impl Engine {
         // A layer that was hidden kept whatever height it had, and a shown one
         // now covers a different span, so nothing that was applied still holds.
         self.applied = [None; SLICES];
-        self.applied_slices = Some(self.slices);
+        self.applied_layout = Some(layout);
+    }
+
+    fn layout(&self) -> Layout {
+        match self.wave {
+            Some(centre) => Layout::Rings(centre),
+            None => Layout::Slices(self.slices),
+        }
     }
 
     /// Recolours the band layers when the palette has changed.
@@ -1929,7 +1988,8 @@ impl Engine {
     /// Sixteen property sets, and only on a change — the palette is switched by
     /// hand rather than animated, so this does nothing on almost every frame.
     fn sync_palette(&mut self) {
-        if self.applied_slices == Some(self.slices)
+        let layout = self.layout();
+        if self.applied_layout == Some(layout)
             && self
                 .applied_palette
                 .as_ref()
@@ -1939,8 +1999,7 @@ impl Engine {
         }
         let Some(attached) = &self.map else { return };
 
-        let step = SLICES / self.slices;
-        for slice in (0..SLICES).step_by(step) {
+        for slice in (0..SLICES).filter(|&slice| layout.shows(slice)) {
             let color = match &self.palette {
                 Some(hues) => hsl_to_hex(hues[slice], PALETTE_SATURATION, PALETTE_LIGHTNESS),
                 None => BUILDING_COLOR.to_owned(),
@@ -2814,6 +2873,32 @@ fn slice_levels(levels: &[f32; BINS], shown: usize) -> Vec<f32> {
         .collect()
 }
 
+/// What the building layers are cut by: height, into a number of slices, or
+/// distance, into rings around a centre.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Layout {
+    Slices(usize),
+    Rings((f64, f64)),
+}
+
+impl Layout {
+    /// Whether layer `slice` is drawn.
+    fn shows(self, slice: usize) -> bool {
+        match self {
+            Layout::Slices(slices) => slice.is_multiple_of(SLICES / slices),
+            Layout::Rings(_) => slice < wave::RINGS,
+        }
+    }
+
+    /// The filter layer `slice` draws with, when it is shown.
+    fn filter(self, slice: usize) -> serde_json::Value {
+        match self {
+            Layout::Slices(slices) => building_layer_filter(slice, SLICES / slices),
+            Layout::Rings(centre) => wave::ring_filter(slice, centre),
+        }
+    }
+}
+
 fn building_layer_id(slice: usize) -> String {
     format!("3d-buildings-{slice}")
 }
@@ -3539,6 +3624,68 @@ mod tests {
             ratio > 0.05,
             "raising every band barely changed the image ({ratio})"
         );
+    }
+
+    /// Opt-in: confirms the rings' `distance` filters reach the buildings —
+    /// that MapLibre Native evaluates them against building polygons — and
+    /// that they cut the buildings by distance: raising the outer rings changes
+    /// a different part of the image from raising the inner ones.
+    #[test]
+    fn wave_rings_cut_the_buildings_by_distance() {
+        if std::env::var_os("OSM_SOUND_DEMO_RENDERER_TESTS").is_none() {
+            eprintln!("skipped: set OSM_SOUND_DEMO_RENDERER_TESTS=1 to run");
+            return;
+        }
+
+        let mut engine = Engine::new((480, 360));
+        let settle = |engine: &mut Engine| {
+            let started = Instant::now();
+            let mut last = None;
+            while started.elapsed() < SETTLE_DEADLINE {
+                engine.pump(Some(SETTLE_PUMP));
+                engine.mark_dirty();
+                last = engine.render();
+            }
+            last.expect("a frame renders")
+        };
+        let changed = |a: &Frame, b: &Frame| {
+            let changed = a
+                .rgba
+                .iter()
+                .zip(b.rgba.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            changed as f64 / a.rgba.len() as f64
+        };
+        let raised = |rings: std::ops::Range<usize>| {
+            let mut bands = [Band::default(); SLICES];
+            for band in &mut bands[rings] {
+                band.height = 220.0;
+            }
+            Command::Bands(Box::new(bands))
+        };
+
+        let camera = MapCamera::default();
+        engine.apply(Command::Wave(Some((camera.lon, camera.lat))));
+        let flat = settle(&mut engine);
+
+        engine.apply(raised(0..3));
+        let inner = settle(&mut engine);
+        engine.apply(raised(3..wave::RINGS));
+        let outer = settle(&mut engine);
+
+        let inner_changed = changed(&flat, &inner);
+        let outer_changed = changed(&flat, &outer);
+        let between = changed(&inner, &outer);
+        eprintln!(
+            "inner rings: {:.1}%, outer rings: {:.1}%, between them: {:.1}%",
+            inner_changed * 100.0,
+            outer_changed * 100.0,
+            between * 100.0
+        );
+        assert!(inner_changed > 0.02, "the inner rings drew nothing ({inner_changed})");
+        assert!(outer_changed > 0.02, "the outer rings drew nothing ({outer_changed})");
+        assert!(between > 0.02, "the inner and outer rings drew the same ({between})");
     }
 
     /// Opt-in: confirms a palette actually reaches the buildings.

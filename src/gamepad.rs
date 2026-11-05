@@ -35,6 +35,8 @@ pub enum Action {
     ToggleLight,
     /// X — how finely the skyline is cut into height slices.
     ToggleSlices,
+    /// R3, the right stick pressed in — wave mode on or off.
+    ToggleWave,
     /// D-pad left — previous track.
     PreviousTrack,
     /// D-pad right — next track.
@@ -59,6 +61,7 @@ pub fn action_for_button(button: Button) -> Option<Action> {
         Button::East => Some(Action::Orbit),
         Button::North => Some(Action::ToggleLight),
         Button::West => Some(Action::ToggleSlices),
+        Button::RightThumb => Some(Action::ToggleWave),
         Button::DPadLeft => Some(Action::PreviousTrack),
         Button::DPadRight => Some(Action::NextTrack),
         Button::DPadUp => Some(Action::PreviousRelease),
@@ -226,6 +229,10 @@ mod tests {
         assert_eq!(action_for_button(Button::North), Some(Action::ToggleLight));
         assert_eq!(action_for_button(Button::West), Some(Action::ToggleSlices));
         assert_eq!(
+            action_for_button(Button::RightThumb),
+            Some(Action::ToggleWave)
+        );
+        assert_eq!(
             action_for_button(Button::DPadLeft),
             Some(Action::PreviousTrack)
         );
@@ -307,7 +314,6 @@ mod tests {
             Button::RightTrigger2,
             Button::Mode,
             Button::LeftThumb,
-            Button::RightThumb,
             Button::Unknown,
         ] {
             assert_eq!(action_for_button(button), None, "{button:?}");

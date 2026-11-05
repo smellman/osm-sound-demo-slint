@@ -14,6 +14,7 @@ mod bundled;
 #[cfg(target_os = "android")]
 mod fetch;
 mod renderer;
+mod wave;
 #[cfg(shared_frames)]
 mod shared;
 pub use renderer::{CameraBoost, Light, MapLibre, SLICE_MODES, SLICES, create_map};
