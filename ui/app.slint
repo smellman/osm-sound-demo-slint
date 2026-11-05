@@ -162,6 +162,7 @@ export component AppWindow inherits Window {
     in property <bool> busy: false;
     in property <bool> has-release: false;
     in property <bool> vj: false;
+    in property <bool> wave: false;
     // Local Music: offered once the music directory has been scanned and held
     // something; `local` is whether it is the source now.
     in property <bool> local-available: false;
@@ -192,6 +193,7 @@ export component AppWindow inherits Window {
     callback open-project();
     callback locate-me();
     callback toggle-vj();
+    callback toggle-wave();
     // One of "a", "b", "x", "y" — the gamepad's face buttons, from the keyboard.
     callback face-button(/* button */ string);
     callback quit();
@@ -387,6 +389,7 @@ export component AppWindow inherits Window {
                             + "Developed by Taro Matsuzawa (smellman).\n\n"
                             + "Gamepad (Xbox layout): Start plays, Select stops, L1/R1 fly between cities, "
                             + "A drops, B orbits, X cuts the skyline finer, Y switches the colouring, "
+                            + "R3 (right stick press) turns wave mode on, "
                             + "D-pad picks track and release, "
                             + "L2/R2 set volume.\n"
                             + "Escape leaves full screen, F toggles it, Q quits. "
@@ -462,6 +465,15 @@ export component AppWindow inherits Window {
                         value <=> root.volume;
                         changed value => {
                             root.volume-changed(self.value / 100);
+                        }
+                    }
+
+                    // Next to the volume, where the web demo put it.
+                    Button {
+                        text: "Wave";
+                        primary: root.wave;
+                        clicked => {
+                            root.toggle-wave();
                         }
                     }
 
