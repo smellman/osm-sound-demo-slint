@@ -27,6 +27,14 @@ case "$ABI" in
   x86_64)    RUST_TARGET=x86_64-linux-android;  CLANG_ARCH=x86_64-linux-android ;;
   *) echo "error: unsupported ABI $ABI (try arm64-v8a or x86_64)" >&2; exit 1 ;;
 esac
+# The map's graphics backend: `opengl` (the default) draws through EGL,
+# `vulkan` through the Vulkan loader. The FFI publishes an Android artifact for
+# each, and the crate has no default, so one is always named.
+BACKEND="${BACKEND:-opengl}"
+case "$BACKEND" in
+  opengl|vulkan) ;;
+  *) echo "error: unsupported BACKEND $BACKEND (try opengl or vulkan)" >&2; exit 1 ;;
+esac
 # 26 because cpal plays through AAudio and `libaaudio.so` is not in a sysroot
 # below that; it has to match `min_sdk_version` in Cargo.toml, which is what
 # cargo-apk compiles the Rust against.
@@ -119,12 +127,9 @@ fi
 
 # --- the APK -----------------------------------------------------------------
 
-echo "==> building the APK for $ABI"
+echo "==> building the APK for $ABI with $BACKEND"
 cd "$here"
-# OpenGL, which is what the app's EGL path drives on Android (the FFI also
-# publishes a Vulkan artifact), and one has to be named because the crate has
-# no default.
-cargo apk build --release --lib --features opengl --target "$RUST_TARGET" "$@"
+cargo apk build --release --lib --features "$BACKEND" --target "$RUST_TARGET" "$@"
 
 echo
 echo "APK:"

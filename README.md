@@ -131,6 +131,7 @@ One script does the whole thing:
 ```bash
 ./build_for_android.sh                 # arm64-v8a, what a phone runs
 ABI=x86_64 ./build_for_android.sh      # what an emulator on an Intel host wants
+BACKEND=vulkan ./build_for_android.sh  # the map on Vulkan rather than OpenGL
 adb install -r target/release/apk/OSMSoundDemo.apk
 ```
 
