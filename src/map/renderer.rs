@@ -3681,9 +3681,18 @@ mod tests {
             outer_changed * 100.0,
             between * 100.0
         );
-        assert!(inner_changed > 0.02, "the inner rings drew nothing ({inner_changed})");
-        assert!(outer_changed > 0.02, "the outer rings drew nothing ({outer_changed})");
-        assert!(between > 0.02, "the inner and outer rings drew the same ({between})");
+        assert!(
+            inner_changed > 0.02,
+            "the inner rings drew nothing ({inner_changed})"
+        );
+        assert!(
+            outer_changed > 0.02,
+            "the outer rings drew nothing ({outer_changed})"
+        );
+        assert!(
+            between > 0.02,
+            "the inner and outer rings drew the same ({between})"
+        );
     }
 
     /// Opt-in: confirms a palette actually reaches the buildings.

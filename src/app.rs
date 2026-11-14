@@ -488,7 +488,14 @@ fn toggle_wave(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         on
     };
     ui.set_wave(on);
-    notify(ui, if on { "skyline: wave" } else { "skyline: by height" });
+    notify(
+        ui,
+        if on {
+            "skyline: wave"
+        } else {
+            "skyline: by height"
+        },
+    );
 }
 
 /// Switches between the two ways the skyline is coloured.
