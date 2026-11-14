@@ -2826,10 +2826,8 @@ pub(super) fn metal_device() -> *mut std::ffi::c_void {
 
     static DEVICE: OnceLock<usize> = OnceLock::new();
     let address = *DEVICE.get_or_init(|| {
-        // SAFETY: MTLCreateSystemDefaultDevice returns a retained-compatible
-        // Objective-C object.
-        let device = unsafe { Retained::retain(MTLCreateSystemDefaultDevice()) }
-            .expect("MTLCreateSystemDefaultDevice returned nil");
+        let device =
+            MTLCreateSystemDefaultDevice().expect("MTLCreateSystemDefaultDevice returned nil");
         let address = Retained::as_ptr(&device) as usize;
         std::mem::forget(device);
         address
@@ -3683,9 +3681,18 @@ mod tests {
             outer_changed * 100.0,
             between * 100.0
         );
-        assert!(inner_changed > 0.02, "the inner rings drew nothing ({inner_changed})");
-        assert!(outer_changed > 0.02, "the outer rings drew nothing ({outer_changed})");
-        assert!(between > 0.02, "the inner and outer rings drew the same ({between})");
+        assert!(
+            inner_changed > 0.02,
+            "the inner rings drew nothing ({inner_changed})"
+        );
+        assert!(
+            outer_changed > 0.02,
+            "the outer rings drew nothing ({outer_changed})"
+        );
+        assert!(
+            between > 0.02,
+            "the inner and outer rings drew the same ({between})"
+        );
     }
 
     /// Opt-in: confirms a palette actually reaches the buildings.

@@ -89,14 +89,15 @@ fn init_maplibre(android: &slint::android::AndroidApp) -> Result<(), String> {
 
     // SAFETY: the pointer comes from the activity this was called for, and the
     // VM outlives the process.
-    let vm = unsafe { JavaVM::from_raw(vm.cast()) }.map_err(|error| error.to_string())?;
+    let vm = unsafe { JavaVM::from_raw(vm.cast()) };
     // The call has to be made from a thread the JVM knows about.
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|error| error.to_string())?;
-
-    // SAFETY: both pointers are live for the length of the call, which is all
-    // the C API borrows them for.
-    unsafe { maplibre_native_ffi::init_android(env.get_raw().cast(), activity.cast()) }
-        .map_err(|error| format!("mln_android_init failed: {error}"))
+    vm.attach_current_thread(|env| {
+        // SAFETY: both pointers are live for the length of the call, which is
+        // all the C API borrows them for.
+        let initialized =
+            unsafe { maplibre_native_ffi::init_android(env.get_raw().cast(), activity.cast()) };
+        Ok::<_, jni::errors::Error>(initialized)
+    })
+    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("mln_android_init failed: {error}"))
 }

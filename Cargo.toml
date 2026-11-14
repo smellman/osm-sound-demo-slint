@@ -28,7 +28,7 @@ crate-type = ["lib", "cdylib"]
 # Enabling two is refused at compile time rather than left to the linker.
 vulkan = ["maplibre-native-ffi/vulkan", "dep:ash"]
 opengl = ["maplibre-native-ffi/opengl", "dep:glutin_egl_sys", "dep:libloading"]
-metal = ["maplibre-native-ffi/metal", "dep:objc2", "dep:objc2-metal"]
+metal = ["maplibre-native-ffi/metal", "dep:objc2-metal"]
 
 # Enable Slint's linuxkms backend (libseat-free variant) for console /
 # embedded Linux KMS targets (no X11/Wayland).
@@ -61,20 +61,21 @@ libloading = { version = "0.9", optional = true }
 # Metal is every Apple platform, not just macOS: the same `metal` feature builds
 # for iOS and the simulator (see "iOS" in the README), so gating these on
 # `target_os = "macos"` left `metal` naming dependencies that were not there.
+#
+# The same majors as wgpu-hal and the objc2-* frameworks below, so a Metal or
+# UIKit object passes between them as it is. objc2 is not optional: iOS's UIKit
+# calls need it whatever the backend, and winit pulls it in regardless.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-objc2 = { version = "0.5", optional = true }
-objc2-metal = { version = "0.2", features = ["MTLDevice"], optional = true }
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture"], optional = true }
 
 # Skia draws the window on macOS: FemtoVG goes through OpenGL there, which is
 # held to 60 Hz on a 120 Hz display. `app::run` selects it; see "Window
 # renderer" in the README. It draws through wgpu's Metal backend, and
 # `unstable-wgpu-30` lets it take the map's frames as wgpu textures, rendered
-# on the same device — see "Shared frames". wgpu-hal names Metal objects with
-# objc2 0.6 and objc2-metal 0.3, so the ring is made with those.
+# on the same device — see "Shared frames".
 [target.'cfg(target_os = "macos")'.dependencies]
 slint = { version = "1.18", features = ["renderer-skia", "unstable-wgpu-30"] }
-objc2-v06 = { package = "objc2", version = "0.6" }
-objc2-metal-v03 = { package = "objc2-metal", version = "0.3", features = ["MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
 
 # Skia draws the window on Linux as well, and `unstable-wgpu-30` lets it take
 # the map's frames as wgpu textures: with the `vulkan` feature the map renders
@@ -91,9 +92,6 @@ objc2-avf-audio = { version = "0.3", features = ["AVAudioSession", "AVAudioSessi
 # Handing a URL to Safari, which on iOS is UIKit's job rather than a subprocess'.
 objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIResponder", "block2"] }
 objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSDictionary"] }
-# UIKit is on objc2 0.6 while objc2-metal 0.2 pins 0.5, so rather than disturb
-# the renderer the two majors sit side by side under different names.
-objc2-v06 = { package = "objc2", version = "0.6" }
 
 # Android's windowing and lifecycle come from android-activity, which Slint
 # drives for us; the feature is only meaningful on that target.
@@ -104,7 +102,7 @@ slint = { version = "1.18", features = ["backend-android-activity-06"] }
 # never loads and the map stays black while the rest of the app works. The
 # binding wraps that call as `init_android`; `jni` and `ndk-context` are what
 # produce the two arguments.
-jni = "0.21"
+jni = "0.22"
 ndk-context = "0.1"
 
 # What cargo-apk writes into the APK's manifest. INTERNET is not optional: the

@@ -43,7 +43,11 @@ pub fn ring_filter(ring: usize, centre: (f64, f64)) -> serde_json::Value {
         serde_json::json!([">=", ["distance", point], inner]),
     ];
     if ring < RINGS - 1 {
-        filter.push(serde_json::json!(["<", ["distance", point], inner + RING_WIDTH]));
+        filter.push(serde_json::json!([
+            "<",
+            ["distance", point],
+            inner + RING_WIDTH
+        ]));
     }
     serde_json::Value::Array(filter)
 }

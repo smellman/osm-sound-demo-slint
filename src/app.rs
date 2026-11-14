@@ -488,7 +488,14 @@ fn toggle_wave(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         on
     };
     ui.set_wave(on);
-    notify(ui, if on { "skyline: wave" } else { "skyline: by height" });
+    notify(
+        ui,
+        if on {
+            "skyline: wave"
+        } else {
+            "skyline: by height"
+        },
+    );
 }
 
 /// Switches between the two ways the skyline is coloured.
@@ -1528,9 +1535,9 @@ fn step_to_next_after_end(ui: &AppWindow) {
 /// for the https links here.
 #[cfg(target_os = "ios")]
 fn open_in_browser(url: &str) {
+    use objc2::MainThreadMarker;
     use objc2_foundation::{NSDictionary, NSString, NSURL};
     use objc2_ui_kit::UIApplication;
-    use objc2_v06::MainThreadMarker;
 
     // UIKit insists on the main thread, which is where Slint runs callbacks.
     let Some(main_thread) = MainThreadMarker::new() else {

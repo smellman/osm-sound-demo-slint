@@ -185,9 +185,8 @@ fn metal_device() -> Result<*mut std::ffi::c_void, Box<dyn std::error::Error>> {
     use objc2::rc::Retained;
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
-    // SAFETY: MTLCreateSystemDefaultDevice returns a retained-compatible object.
-    let device = unsafe { Retained::retain(MTLCreateSystemDefaultDevice()) }
-        .ok_or("MTLCreateSystemDefaultDevice returned nil")?;
+    let device =
+        MTLCreateSystemDefaultDevice().ok_or("MTLCreateSystemDefaultDevice returned nil")?;
     // Leaked, so the pointer stays valid for as long as the session uses it.
     let pointer = Retained::as_ptr(&device) as *mut std::ffi::c_void;
     std::mem::forget(device);

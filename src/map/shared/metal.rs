@@ -6,21 +6,18 @@
 //! from any number of queues, so MapLibre Native and wgpu each submit to their
 //! own. Nor does a frame need a fence to cross between them: a Metal frame is
 //! only acquirable once its GPU work has completed.
-//!
-//! The textures are `objc2-metal` 0.3's, which is what wgpu-hal takes; the
-//! rest of the app is on 0.2, so the device crosses over as a pointer.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use maplibre_native_ffi::AcquiredFrameView;
-use objc2_metal_v03::{
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
-use objc2_v06::rc::Retained;
-use objc2_v06::runtime::ProtocolObject;
 use slint::wgpu_30::wgpu;
 
 use super::RING_DEPTH;
