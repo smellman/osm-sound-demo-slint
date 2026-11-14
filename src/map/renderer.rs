@@ -2826,10 +2826,8 @@ pub(super) fn metal_device() -> *mut std::ffi::c_void {
 
     static DEVICE: OnceLock<usize> = OnceLock::new();
     let address = *DEVICE.get_or_init(|| {
-        // SAFETY: MTLCreateSystemDefaultDevice returns a retained-compatible
-        // Objective-C object.
-        let device = unsafe { Retained::retain(MTLCreateSystemDefaultDevice()) }
-            .expect("MTLCreateSystemDefaultDevice returned nil");
+        let device =
+            MTLCreateSystemDefaultDevice().expect("MTLCreateSystemDefaultDevice returned nil");
         let address = Retained::as_ptr(&device) as usize;
         std::mem::forget(device);
         address
